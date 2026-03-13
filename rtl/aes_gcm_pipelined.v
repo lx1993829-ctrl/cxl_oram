@@ -1,14 +1,25 @@
 `timescale 1ns / 1ps
 //============================================================================
-// AES-GCM Pipelined - High Throughput Implementation
-// 
-// This module fully utilizes the 12-stage AES pipeline by:
-// 1. Feeding new blocks every cycle (not waiting for output)
-// 2. Using FIFOs to match AES latency
-// 3. Processing GHASH in parallel with AES
+// AES-GCM Pipelined - High Throughput with Automatic IV Rotation
+//
+// CHANGE FROM ORIGINAL:
+//   The IV is no longer static across operations. After each GCM operation
+//   completes, a 96-bit LFSR generates a new pseudo-random IV for the next
+//   operation. Additionally, if the 32-bit CTR counter wraps to 0 during
+//   a single (very large) operation, the module flags a counter-overflow
+//   error (since continuing with a wrapped counter would repeat keystream).
+//
+// New ports:
+//   iv_out       [95:0]  - Current/active IV (read back for decrypt pairing)
+//   iv_updated           - Pulses high for one cycle when IV changes
+//   counter_overflow     - Asserted if 32-bit counter wraps mid-operation
+//
+// IV lifecycle:
+//   1. First start: external 'iv' input seeds the LFSR and is used directly
+//   2. Each subsequent start (same key): LFSR-generated IV is used
+//   3. If key changes: external 'iv' re-seeds the LFSR
 //
 // Throughput: 1 block/cycle after 12-cycle initial latency
-//            = 12.8 Gbps @ 100MHz
 //============================================================================
 
 module aes_gcm_pipelined (
@@ -22,13 +33,13 @@ module aes_gcm_pipelined (
     input  wire [127:0] key,
     input  wire [95:0]  iv,
     
-    // Data interface - can accept 1 block per cycle
+    // Data interface
     input  wire [127:0] data_in,
     input  wire         data_valid,
     input  wire         data_last,
-    input  wire [3:0]   data_bytes_valid,  // 0 = 16 bytes
+    input  wire [3:0]   data_bytes_valid,
     
-    // Output interface - outputs 1 block per cycle (after latency)
+    // Output interface
     output wire [127:0] data_out,
     output wire         data_out_valid,
     output wire         data_out_last,
@@ -42,69 +53,120 @@ module aes_gcm_pipelined (
     // Status
     output wire         ready,
     output wire         busy,
-    output wire         input_ready  // Can accept new data this cycle
+    output wire         input_ready,
+    
+    // IV management (NEW)
+    output wire [95:0]  iv_out,
+    output reg          iv_updated,
+    output reg          counter_overflow
 );
 
     //=========================================================================
     // Parameters and Constants
     //=========================================================================
-    localparam FIFO_DEPTH = 16;  // Must be >= AES pipeline depth (12)
+    localparam FIFO_DEPTH = 16;
     localparam FIFO_ADDR_BITS = 4;
-    localparam GHASH_FIFO_DEPTH = 128;  // Large enough for big bursts
+    localparam GHASH_FIFO_DEPTH = 128;
     localparam GHASH_FIFO_ADDR_BITS = 7;
     
     localparam [3:0]
         ST_IDLE       = 4'd0,
-        ST_INIT_H     = 4'd1,   // Computing H = AES(K, 0)
-        ST_INIT_EY0   = 4'd2,   // Computing E(Y0) = AES(K, IV||1)
-        ST_WAIT_INIT  = 4'd3,   // Waiting for H and E(Y0)
-        ST_READY      = 4'd4,   // Ready to accept data
-        ST_PROCESSING = 4'd5,   // Processing data blocks
-        ST_DRAINING   = 4'd6,   // Draining pipeline (no more input)
-        ST_FINAL_GHASH= 4'd7,   // Final GHASH with length block
-        ST_COMPUTE_TAG= 4'd8,   // Computing final tag
+        ST_INIT_H     = 4'd1,
+        ST_INIT_EY0   = 4'd2,
+        ST_WAIT_INIT  = 4'd3,
+        ST_READY      = 4'd4,
+        ST_PROCESSING = 4'd5,
+        ST_DRAINING   = 4'd6,
+        ST_FINAL_GHASH= 4'd7,
+        ST_COMPUTE_TAG= 4'd8,
         ST_DONE       = 4'd9;
     
     reg [3:0] state;
     
     //=========================================================================
+    // IV LFSR - 96-bit pseudo-random generator
+    //
+    // Polynomial: x^96 + x^10 + x^9 + x^6 + 1  (maximal-length)
+    // Feedback: bit[95] ^ bit[9] ^ bit[8] ^ bit[5]
+    //
+    // We advance 96 steps per operation to ensure all bits are mixed.
+    // A maximal-length LFSR with XOR feedback will NEVER reach the
+    // all-zero state - the zero state is not part of the sequence.
+    //
+    // To avoid the zero-state trap, we also guard the seed: if the
+    // external IV is all-zero, we substitute a fixed non-zero seed.
+    //=========================================================================
+    reg [95:0] iv_lfsr;
+    reg [95:0] active_iv;         // IV being used for current operation
+    reg        iv_seeded;         // LFSR has been seeded at least once
+    
+    // Advance LFSR by 96 steps in one cycle (unrolled combinational chain)
+    // This uses a generate-style function to produce the final state
+    wire [95:0] lfsr_advanced;
+    
+    // Advance function: 96 single-bit LFSR shifts chained combinationally
+    function [95:0] advance_lfsr_96;
+        input [95:0] state_in;
+        reg [95:0] s;
+        reg fb;
+        integer step;
+        begin
+            s = state_in;
+            for (step = 0; step < 96; step = step + 1) begin
+                fb = s[95] ^ s[9] ^ s[8] ^ s[5];
+                s = {s[94:0], fb};
+            end
+            advance_lfsr_96 = s;
+        end
+    endfunction
+    
+    assign lfsr_advanced = advance_lfsr_96(iv_lfsr);
+    
+    // Safe seed: if external IV is all-zero, use a fixed non-zero value
+    wire [95:0] safe_seed = (iv == 96'b0) ? 96'hA5A5A5A5A5A5A5A5A5A5A5A5 : iv;
+    
+    // Output the active IV
+    assign iv_out = active_iv;
+    
+    //=========================================================================
     // Internal Registers
     //=========================================================================
     
-    // Key and IV registers
     reg [127:0] key_reg;
     reg [95:0]  iv_reg;
     reg         is_encrypt;
     reg [127:0] tag_in_reg;
     
-    // H key and E(Y0) for tag computation
     reg [127:0] h_key;
     reg [127:0] e_y0;
     reg         h_key_valid;
     reg         e_y0_valid;
     
-    // Counter for CTR mode
     reg [31:0]  counter;
     
-    // Length tracking (in bits)
     reg [63:0]  aad_len_bits;
     reg [63:0]  data_len_bits;
     
+    // H/E(Y0) caching
+    reg         h_e_y0_valid;
+    reg [127:0] last_key;
+    reg [95:0]  last_iv;
+    
     //=========================================================================
-    // FIFO for Plaintext/Ciphertext (to match AES pipeline latency)
+    // FIFO for Plaintext/Ciphertext
     //=========================================================================
     reg [127:0] data_fifo [0:FIFO_DEPTH-1];
     reg [3:0]   bytes_fifo [0:FIFO_DEPTH-1];
     reg         last_fifo [0:FIFO_DEPTH-1];
     reg [FIFO_ADDR_BITS-1:0] fifo_wr_ptr;
     reg [FIFO_ADDR_BITS-1:0] fifo_rd_ptr;
-    reg [FIFO_ADDR_BITS:0]   fifo_count;  // One extra bit for full detection
+    reg [FIFO_ADDR_BITS:0]   fifo_count;
     
     wire fifo_empty = (fifo_count == 0);
     wire fifo_full = (fifo_count == FIFO_DEPTH);
     
     //=========================================================================
-    // GHASH Pending FIFO (to handle AES outputs faster than GHASH can process)
+    // GHASH Pending FIFO
     //=========================================================================
     reg [127:0] ghash_pending_fifo [0:GHASH_FIFO_DEPTH-1];
     reg [GHASH_FIFO_ADDR_BITS-1:0] ghash_pending_wr_ptr;
@@ -114,17 +176,16 @@ module aes_gcm_pipelined (
     wire ghash_pending_empty = (ghash_pending_count == 0);
     wire ghash_pending_full = (ghash_pending_count == GHASH_FIFO_DEPTH);
     
-    // GHASH is busy if we just sent data (waiting for result)
     reg ghash_busy;
     
     //=========================================================================
     // Pipeline Tracking
     //=========================================================================
-    reg [4:0] blocks_in_aes;      // Blocks currently in AES pipeline
-    reg [4:0] blocks_sent;        // Total blocks sent to AES
-    reg [4:0] blocks_received;    // Total blocks received from AES
-    reg       last_block_sent;    // Last data block has been sent
-    reg       last_block_received;// Last data block has been received
+    reg [4:0] blocks_in_aes;
+    reg [4:0] blocks_sent;
+    reg [4:0] blocks_received;
+    reg       last_block_sent;
+    reg       last_block_received;
     
     //=========================================================================
     // AES Core Interface
@@ -134,9 +195,8 @@ module aes_gcm_pipelined (
     wire [127:0] aes_ciphertext;
     wire         aes_valid_out;
     
-    // Track initialization - after H and E(Y0) received, all outputs are DATA
     reg         init_complete;
-    reg [1:0]   init_outputs_remaining;  // Count down from 2 (H, E(Y0))
+    reg [1:0]   init_outputs_remaining;
     
     //=========================================================================
     // GHASH Interface
@@ -154,11 +214,6 @@ module aes_gcm_pipelined (
     reg [127:0] data_out_reg;
     reg         data_out_valid_reg;
     reg         data_out_last_reg;
-    // Add these registers at the top with other register declarations (around line 60-80)
-    reg         h_e_y0_valid;
-    reg [127:0] last_key;
-    reg [95:0]  last_iv;
-    
     
     assign data_out = data_out_reg;
     assign data_out_valid = data_out_valid_reg;
@@ -166,7 +221,6 @@ module aes_gcm_pipelined (
     
     assign ready = (state == ST_IDLE);
     assign busy = (state != ST_IDLE);
-    // Simple input_ready - just check if we can accept data
     assign input_ready = (state == ST_READY || state == ST_PROCESSING) && 
                          !fifo_full && 
                          !last_block_sent;
@@ -175,7 +229,6 @@ module aes_gcm_pipelined (
     // Module Instantiations
     //=========================================================================
     
-    // AES-128 Pipeline (12 stages, 1 block/cycle throughput)
     aes128_encrypt_pipeline_fpga aes_core (
         .clk(clk),
         .rst_n(rst_n),
@@ -187,7 +240,6 @@ module aes_gcm_pipelined (
         .valid_out(aes_valid_out)
     );
     
-    // Single-cycle GHASH
     ghash_single_cycle_fpga ghash_unit (
         .clk(clk),
         .rst_n(rst_n),
@@ -208,7 +260,7 @@ module aes_gcm_pipelined (
         input [3:0] valid_bytes;
         begin
             case (valid_bytes)
-                4'd0:  get_mask = 128'hFFFFFFFF_FFFFFFFF_FFFFFFFF_FFFFFFFF; // 16 bytes
+                4'd0:  get_mask = 128'hFFFFFFFF_FFFFFFFF_FFFFFFFF_FFFFFFFF;
                 4'd1:  get_mask = 128'hFF000000_00000000_00000000_00000000;
                 4'd2:  get_mask = 128'hFFFF0000_00000000_00000000_00000000;
                 4'd3:  get_mask = 128'hFFFFFF00_00000000_00000000_00000000;
@@ -239,9 +291,9 @@ module aes_gcm_pipelined (
             iv_reg <= 96'b0;
             is_encrypt <= 1'b1;
             tag_in_reg <= 128'b0;
-            h_e_y0_valid <= 1'b0;        // ? ADD THIS
-            last_key <= 128'b0;          // ? ADD THIS
-            last_iv <= 96'b0;            // ? ADD THIS
+            h_e_y0_valid <= 1'b0;
+            last_key <= 128'b0;
+            last_iv <= 96'b0;
             h_key <= 128'b0;
             e_y0 <= 128'b0;
             h_key_valid <= 1'b0;
@@ -274,6 +326,12 @@ module aes_gcm_pipelined (
             tag_out <= 128'b0;
             tag_valid <= 1'b0;
             tag_match <= 1'b0;
+            // IV LFSR init
+            iv_lfsr <= 96'b0;
+            active_iv <= 96'b0;
+            iv_seeded <= 1'b0;
+            iv_updated <= 1'b0;
+            counter_overflow <= 1'b0;
         end else if (enable) begin
             // Default: clear pulse signals
             if (ghash_start) $display("[%0t] [GCM-GHASH] ghash_start=1", $time);
@@ -283,21 +341,20 @@ module aes_gcm_pipelined (
             data_out_valid_reg <= 1'b0;
             data_out_last_reg <= 1'b0;
             tag_valid <= 1'b0;
+            iv_updated <= 1'b0;
             
             case (state)
-            /*
+
+                //=============================================================
+                // IDLE: Determine IV and start initialization
                 //=============================================================
                 ST_IDLE: begin
                     if (start) begin
                         // Capture inputs
-                        key_reg <= key;
-                        iv_reg <= iv;
                         is_encrypt <= encrypt;
                         tag_in_reg <= tag_in;
                         
-                        // Reset state
-                        h_key_valid <= 1'b0;
-                        e_y0_valid <= 1'b0;
+                        // Reset operational state
                         counter <= 32'd2;
                         aad_len_bits <= 64'b0;
                         data_len_bits <= 64'b0;
@@ -314,123 +371,105 @@ module aes_gcm_pipelined (
                         last_block_sent <= 1'b0;
                         last_block_received <= 1'b0;
                         init_complete <= 1'b0;
-                        init_outputs_remaining <= 2'd2;
+                        counter_overflow <= 1'b0;
                         
-                        // Start computing H = AES(K, 0)
-                        aes_plaintext <= 128'b0;
-                        aes_valid_in <= 1'b1;
+                        //=====================================================
+                        // IV Selection Logic
+                        //=====================================================
+                        // For ENCRYPT:
+                        //   - First operation or key change: use external IV,
+                        //     seed LFSR with it
+                        //   - Subsequent operations (same key): use LFSR IV
+                        //
+                        // For DECRYPT:
+                        //   - Always use the externally-provided IV
+                        //     (must match what encryptor used)
+                        //=====================================================
                         
-                        state <= ST_INIT_H;
+                        if (!encrypt) begin
+                            // DECRYPT: always use the provided IV
+                            key_reg <= key;
+                            iv_reg <= iv;
+                            active_iv <= iv;
+                            
+                            // Check if we need re-init
+                            if (!h_e_y0_valid || (key != last_key) || (iv != last_iv)) begin
+                                last_key <= key;
+                                last_iv <= iv;
+                                h_key_valid <= 1'b0;
+                                e_y0_valid <= 1'b0;
+                                h_e_y0_valid <= 1'b0;
+                                init_outputs_remaining <= 2'd2;
+                                aes_plaintext <= 128'b0;
+                                aes_valid_in <= 1'b1;
+                                state <= ST_INIT_H;
+                                $display("[%0t] [AES-GCM] DECRYPT: using provided IV=0x%024h", $time, iv);
+                            end else begin
+                                key_reg <= key;
+                                iv_reg <= iv;
+                                init_complete <= 1'b1;
+                                ghash_start <= 1'b1;
+                                state <= ST_READY;
+                                $display("[%0t] [AES-GCM] DECRYPT: reusing cached H/E(Y0), IV=0x%024h", $time, iv);
+                            end
+                        end
+                        else begin
+                            // ENCRYPT: determine IV
+                            if (!iv_seeded || (key != last_key)) begin
+                                // First operation or key changed: seed LFSR with safe IV
+                                iv_lfsr <= safe_seed;
+                                active_iv <= safe_seed;
+                                iv_reg <= safe_seed;
+                                iv_seeded <= 1'b1;
+                                $display("[%0t] [AES-GCM] ENCRYPT: seeding LFSR with IV=0x%024h", $time, safe_seed);
+                            end else begin
+                                // Subsequent operation, same key: use LFSR-generated IV
+                                active_iv <= iv_lfsr;
+                                iv_reg <= iv_lfsr;
+                                $display("[%0t] [AES-GCM] ENCRYPT: using LFSR IV=0x%024h", $time, iv_lfsr);
+                            end
+                            
+                            key_reg <= key;
+                            
+                            // Always need new H and E(Y0) since IV changed
+                            // (H only depends on key, but E(Y0) = AES(K, IV||1))
+                            // Optimization: if only IV changed (not key), we can
+                            // reuse H but must recompute E(Y0).
+                            // For simplicity & correctness, recompute both.
+                            last_key <= key;
+                            if (!iv_seeded || (key != last_key)) begin
+                                last_iv <= safe_seed;
+                            end else begin
+                                last_iv <= iv_lfsr;
+                            end
+                            h_key_valid <= 1'b0;
+                            e_y0_valid <= 1'b0;
+                            h_e_y0_valid <= 1'b0;
+                            init_outputs_remaining <= 2'd2;
+                            aes_plaintext <= 128'b0;
+                            aes_valid_in <= 1'b1;
+                            state <= ST_INIT_H;
+                        end
                     end
                 end
-              */
-              ST_IDLE: begin
-    if (start) begin
-        // Capture inputs
-        is_encrypt <= encrypt;
-        tag_in_reg <= tag_in;
-        
-        // Reset state (not H/E(Y0) related)
-        counter <= 32'd2;
-        aad_len_bits <= 64'b0;
-        data_len_bits <= 64'b0;
-        fifo_wr_ptr <= 0;
-        fifo_rd_ptr <= 0;
-        fifo_count <= 0;
-        ghash_pending_wr_ptr <= 0;
-        ghash_pending_rd_ptr <= 0;
-        ghash_pending_count <= 0;
-        ghash_busy <= 1'b0;
-        blocks_in_aes <= 0;
-        blocks_sent <= 0;
-        blocks_received <= 0;
-        last_block_sent <= 1'b0;
-        last_block_received <= 1'b0;
-        init_complete <= 1'b0;
-        
-        // Check if we need to re-initialize H and E(Y0)
-        if (!h_e_y0_valid || (key != last_key) || (iv != last_iv)) begin
-            // Need to initialize/re-initialize
-            $display("[%0t] [AES-GCM] Initializing H and E(Y0) for new key/IV", $time);
-            key_reg <= key;
-            iv_reg <= iv;
-            last_key <= key;
-            last_iv <= iv;
-            h_key_valid <= 1'b0;
-            e_y0_valid <= 1'b0;
-            h_e_y0_valid <= 1'b0;
-            init_outputs_remaining <= 2'd2;
-            
-            // Start computing H = AES(K, 0)
-            aes_plaintext <= 128'b0;
-            aes_valid_in <= 1'b1;
-            
-            state <= ST_INIT_H;
-        end else begin
-            // Already initialized - reuse cached H and E(Y0)
-            $display("[%0t] [AES-GCM] Reusing cached H and E(Y0)", $time);
-            key_reg <= key;
-            iv_reg <= iv;
-            
-            // Mark init as complete since we're reusing
-            init_complete <= 1'b1;  // ? ADD THIS - very important!
-            
-            // Initialize GHASH with cached H
-            ghash_start <= 1'b1;
-            
-            // Go directly to READY state
-            state <= ST_READY;  // ? This is correct for aes_gcm_pipelined
-        end
-    end
-end  
+                
                 //=============================================================
                 ST_INIT_H: begin
                     // Send E(Y0) = AES(K, IV || 0^31 || 1)
                     aes_plaintext <= {iv_reg, 32'h00000001};
                     aes_valid_in <= 1'b1;
-                    
                     state <= ST_WAIT_INIT;
                 end
-                /*
+                
                 //=============================================================
                 ST_WAIT_INIT: begin
-                    // Wait for H and E(Y0) from AES pipeline
-                    // First output is H, second is E(Y0)
                     if (aes_valid_out) begin
                         if (init_outputs_remaining == 2'd2) begin
-                            // First output: H
-                            h_key <= aes_ciphertext;
-                            h_key_valid <= 1'b1;
-                            init_outputs_remaining <= 2'd1;
-                        end else if (init_outputs_remaining == 2'd1) begin
-                            // Second output: E(Y0)
-                            e_y0 <= aes_ciphertext;
-                            e_y0_valid <= 1'b1;
-                            init_outputs_remaining <= 2'd0;
-                            init_complete <= 1'b1;
-                        end
-                    end
-                    
-                    // Both ready? Initialize GHASH with the computed H key
-                    if (h_key_valid && e_y0_valid) begin
-                        ghash_start <= 1'b1;  // Now h_key has the correct value
-                        state <= ST_READY;
-                    end
-                end
-                */
-                //=============================================================
-                ST_WAIT_INIT: begin
-                    // Wait for H and E(Y0) from AES pipeline
-                    // First output is H, second is E(Y0)
-                    if (aes_valid_out) begin
-                        if (init_outputs_remaining == 2'd2) begin
-                            // First output: H
                             h_key <= aes_ciphertext;
                             h_key_valid <= 1'b1;
                             init_outputs_remaining <= 2'd1;
                             $display("[%0t] [AES-GCM] H key computed: 0x%032h", $time, aes_ciphertext);
                         end else if (init_outputs_remaining == 2'd1) begin
-                            // Second output: E(Y0)
                             e_y0 <= aes_ciphertext;
                             e_y0_valid <= 1'b1;
                             init_outputs_remaining <= 2'd0;
@@ -439,199 +478,94 @@ end
                         end
                     end
                     
-                    // Both ready? Initialize GHASH with the computed H key
                     if (h_key_valid && e_y0_valid) begin
-                        h_e_y0_valid <= 1'b1;  // ? ADD THIS: Mark as valid for future reuse
-                        $display("[%0t] [AES-GCM] Initialization complete, marking H/E(Y0) as valid", $time);
+                        h_e_y0_valid <= 1'b1;
+                        $display("[%0t] [AES-GCM] Init complete, IV=0x%024h", $time, iv_reg);
                         ghash_start <= 1'b1;
                         state <= ST_READY;
                     end
                 end
+                
                 //=============================================================
                 ST_READY: begin
-                    // Ready to accept data
                     if (data_valid && !fifo_full) begin
-                        // Store in FIFO
                         data_fifo[fifo_wr_ptr] <= data_in;
                         bytes_fifo[fifo_wr_ptr] <= data_bytes_valid;
                         last_fifo[fifo_wr_ptr] <= data_last;
                         fifo_wr_ptr <= fifo_wr_ptr + 1;
                         fifo_count <= fifo_count + 1;
                         
-                        // Send counter block to AES
+                        // Counter overflow detection
+                        if (counter == 32'hFFFFFFFF) begin
+                            counter_overflow <= 1'b1;
+                            $display("[%0t] [AES-GCM] WARNING: 32-bit counter overflow!", $time);
+                        end
+                        
                         aes_plaintext <= {iv_reg, counter};
                         aes_valid_in <= 1'b1;
                         counter <= counter + 1;
                         blocks_in_aes <= blocks_in_aes + 1;
                         blocks_sent <= blocks_sent + 1;
                         
-                        // Track data length
-                        if (data_bytes_valid == 4'd0) begin
+                        if (data_bytes_valid == 4'd0)
                             data_len_bits <= data_len_bits + 64'd128;
-                        end else begin
+                        else
                             data_len_bits <= data_len_bits + {57'b0, data_bytes_valid, 3'b0};
-                        end
                         
-                        if (data_last) begin
+                        if (data_last)
                             last_block_sent <= 1'b1;
-                        end
                         
                         state <= ST_PROCESSING;
                     end else if (!data_valid && data_last) begin
-                        // No data, just compute tag
                         state <= ST_FINAL_GHASH;
                     end
                 end
                 
                 //=============================================================
                 ST_PROCESSING: begin
-                    //=========================================================
-                    // INPUT SIDE: Accept new data and feed AES pipeline
-                    //=========================================================
+                    // INPUT SIDE
                     if (data_valid && !fifo_full && !last_block_sent) begin
-                        // Store in FIFO
                         data_fifo[fifo_wr_ptr] <= data_in;
                         bytes_fifo[fifo_wr_ptr] <= data_bytes_valid;
                         last_fifo[fifo_wr_ptr] <= data_last;
                         fifo_wr_ptr <= fifo_wr_ptr + 1;
                         fifo_count <= fifo_count + 1;
                         
-                        // Send counter block to AES
+                        // Counter overflow detection
+                        if (counter == 32'hFFFFFFFF) begin
+                            counter_overflow <= 1'b1;
+                            $display("[%0t] [AES-GCM] WARNING: 32-bit counter overflow!", $time);
+                        end
+                        
                         aes_plaintext <= {iv_reg, counter};
                         aes_valid_in <= 1'b1;
                         counter <= counter + 1;
                         blocks_in_aes <= blocks_in_aes + 1;
                         blocks_sent <= blocks_sent + 1;
                         
-                        // Track data length
-                        if (data_bytes_valid == 4'd0) begin
+                        if (data_bytes_valid == 4'd0)
                             data_len_bits <= data_len_bits + 64'd128;
-                        end else begin
+                        else
                             data_len_bits <= data_len_bits + {57'b0, data_bytes_valid, 3'b0};
-                        end
                         
-                        if (data_last) begin
+                        if (data_last)
                             last_block_sent <= 1'b1;
-                        end
                     end
                     
-                    //=========================================================
-                    // OUTPUT SIDE: Handle AES outputs (all outputs are DATA after init)
-                    //=========================================================
+                    // OUTPUT SIDE
                     if (aes_valid_out && init_complete) begin
-                        // Get plaintext/ciphertext from FIFO
-                        // XOR with AES output to get ciphertext/plaintext
                         if (is_encrypt) begin
-                            // Encryption: CT = PT XOR AES(counter)
-                            if (bytes_fifo[fifo_rd_ptr] != 4'd0) begin
+                            if (bytes_fifo[fifo_rd_ptr] != 4'd0)
                                 data_out_reg <= (data_fifo[fifo_rd_ptr] ^ aes_ciphertext) & 
                                                get_mask(bytes_fifo[fifo_rd_ptr]);
-                            end else begin
+                            else
                                 data_out_reg <= data_fifo[fifo_rd_ptr] ^ aes_ciphertext;
-                            end
                         end else begin
-                            // Decryption: PT = CT XOR AES(counter)
-                            if (bytes_fifo[fifo_rd_ptr] != 4'd0) begin
+                            if (bytes_fifo[fifo_rd_ptr] != 4'd0)
                                 data_out_reg <= (data_fifo[fifo_rd_ptr] ^ aes_ciphertext) & 
                                                get_mask(bytes_fifo[fifo_rd_ptr]);
-                            end else begin
+                            else
                                 data_out_reg <= data_fifo[fifo_rd_ptr] ^ aes_ciphertext;
-                            end
-                        end
-                        
-                        data_out_valid_reg <= 1'b1;
-                        data_out_last_reg <= last_fifo[fifo_rd_ptr];
-                        
-                        // Queue ciphertext for GHASH (don't send directly - use pending FIFO)
-                        if (is_encrypt) begin
-                            // For encryption: GHASH the output (ciphertext)
-                            if (bytes_fifo[fifo_rd_ptr] != 4'd0) begin
-                                ghash_pending_fifo[ghash_pending_wr_ptr] <= 
-                                    (data_fifo[fifo_rd_ptr] ^ aes_ciphertext) & get_mask(bytes_fifo[fifo_rd_ptr]);
-                            end else begin
-                                ghash_pending_fifo[ghash_pending_wr_ptr] <= 
-                                    data_fifo[fifo_rd_ptr] ^ aes_ciphertext;
-                            end
-                        end else begin
-                            // For decryption: GHASH the input (ciphertext)
-                            if (bytes_fifo[fifo_rd_ptr] != 4'd0) begin
-                                ghash_pending_fifo[ghash_pending_wr_ptr] <= 
-                                    data_fifo[fifo_rd_ptr] & get_mask(bytes_fifo[fifo_rd_ptr]);
-                            end else begin
-                                ghash_pending_fifo[ghash_pending_wr_ptr] <= data_fifo[fifo_rd_ptr];
-                            end
-                        end
-                        ghash_pending_wr_ptr <= ghash_pending_wr_ptr + 1;
-                        ghash_pending_count <= ghash_pending_count + 1;
-                        
-                        // Update FIFO read pointer
-                        fifo_rd_ptr <= fifo_rd_ptr + 1;
-                        fifo_count <= fifo_count - 1;
-                        blocks_in_aes <= blocks_in_aes - 1;
-                        blocks_received <= blocks_received + 1;
-                        
-                        if (last_fifo[fifo_rd_ptr]) begin
-                            last_block_received <= 1'b1;
-                        end
-                    end
-                    
-                    //=========================================================
-                    // GHASH Processing: Send from pending FIFO when GHASH is ready
-                    //=========================================================
-                    if (!ghash_pending_empty && !ghash_busy) begin
-                        ghash_data <= ghash_pending_fifo[ghash_pending_rd_ptr];
-                        ghash_data_valid <= 1'b1;
-                        ghash_pending_rd_ptr <= ghash_pending_rd_ptr + 1;
-                        ghash_pending_count <= ghash_pending_count - 1;
-                        ghash_busy <= 1'b1;
-                    end
-                    
-                    // Clear ghash_busy when result is valid
-                    if (ghash_result_valid) begin
-                        ghash_busy <= 1'b0;
-                    end
-                    
-                    // Handle simultaneous GHASH pending write and read
-                    if (aes_valid_out && init_complete &&
-                        !ghash_pending_empty && !ghash_busy) begin
-                        ghash_pending_count <= ghash_pending_count; // No net change
-                    end
-                    
-                    // Adjust fifo_count for simultaneous read/write
-                    if (data_valid && !fifo_full && !last_block_sent &&
-                        aes_valid_out && init_complete) begin
-                        fifo_count <= fifo_count; // No net change
-                    end
-                    
-                    //=========================================================
-                    // State transitions
-                    //=========================================================
-                    if (last_block_sent && last_block_received && ghash_pending_empty && !ghash_busy) begin
-                        state <= ST_FINAL_GHASH;
-                    end else if (last_block_sent && !aes_valid_out) begin
-                        state <= ST_DRAINING;
-                    end
-                end
-                
-                //=============================================================
-                ST_DRAINING: begin
-                    // Drain remaining blocks from AES pipeline
-                    if (aes_valid_out && init_complete) begin
-                        // Same output handling as ST_PROCESSING
-                        if (is_encrypt) begin
-                            if (bytes_fifo[fifo_rd_ptr] != 4'd0) begin
-                                data_out_reg <= (data_fifo[fifo_rd_ptr] ^ aes_ciphertext) & 
-                                               get_mask(bytes_fifo[fifo_rd_ptr]);
-                            end else begin
-                                data_out_reg <= data_fifo[fifo_rd_ptr] ^ aes_ciphertext;
-                            end
-                        end else begin
-                            if (bytes_fifo[fifo_rd_ptr] != 4'd0) begin
-                                data_out_reg <= (data_fifo[fifo_rd_ptr] ^ aes_ciphertext) & 
-                                               get_mask(bytes_fifo[fifo_rd_ptr]);
-                            end else begin
-                                data_out_reg <= data_fifo[fifo_rd_ptr] ^ aes_ciphertext;
-                            end
                         end
                         
                         data_out_valid_reg <= 1'b1;
@@ -639,20 +573,18 @@ end
                         
                         // Queue for GHASH
                         if (is_encrypt) begin
-                            if (bytes_fifo[fifo_rd_ptr] != 4'd0) begin
+                            if (bytes_fifo[fifo_rd_ptr] != 4'd0)
                                 ghash_pending_fifo[ghash_pending_wr_ptr] <= 
                                     (data_fifo[fifo_rd_ptr] ^ aes_ciphertext) & get_mask(bytes_fifo[fifo_rd_ptr]);
-                            end else begin
+                            else
                                 ghash_pending_fifo[ghash_pending_wr_ptr] <= 
                                     data_fifo[fifo_rd_ptr] ^ aes_ciphertext;
-                            end
                         end else begin
-                            if (bytes_fifo[fifo_rd_ptr] != 4'd0) begin
+                            if (bytes_fifo[fifo_rd_ptr] != 4'd0)
                                 ghash_pending_fifo[ghash_pending_wr_ptr] <= 
                                     data_fifo[fifo_rd_ptr] & get_mask(bytes_fifo[fifo_rd_ptr]);
-                            end else begin
+                            else
                                 ghash_pending_fifo[ghash_pending_wr_ptr] <= data_fifo[fifo_rd_ptr];
-                            end
                         end
                         ghash_pending_wr_ptr <= ghash_pending_wr_ptr + 1;
                         ghash_pending_count <= ghash_pending_count + 1;
@@ -662,12 +594,11 @@ end
                         blocks_in_aes <= blocks_in_aes - 1;
                         blocks_received <= blocks_received + 1;
                         
-                        if (last_fifo[fifo_rd_ptr]) begin
+                        if (last_fifo[fifo_rd_ptr])
                             last_block_received <= 1'b1;
-                        end
                     end
                     
-                    // GHASH Processing: Send from pending FIFO when GHASH is ready
+                    // GHASH Processing
                     if (!ghash_pending_empty && !ghash_busy) begin
                         ghash_data <= ghash_pending_fifo[ghash_pending_rd_ptr];
                         ghash_data_valid <= 1'b1;
@@ -676,61 +607,137 @@ end
                         ghash_busy <= 1'b1;
                     end
                     
-                    // Clear ghash_busy when result is valid
-                    if (ghash_result_valid) begin
+                    if (ghash_result_valid)
                         ghash_busy <= 1'b0;
-                    end
                     
-                    // Handle simultaneous GHASH pending write and read
+                    // Simultaneous adjustments
                     if (aes_valid_out && init_complete &&
-                        !ghash_pending_empty && !ghash_busy) begin
-                        ghash_pending_count <= ghash_pending_count; // No net change
+                        !ghash_pending_empty && !ghash_busy)
+                        ghash_pending_count <= ghash_pending_count;
+                    
+                    if (data_valid && !fifo_full && !last_block_sent &&
+                        aes_valid_out && init_complete)
+                        fifo_count <= fifo_count;
+                    
+                    // State transitions
+                    if (last_block_sent && last_block_received && ghash_pending_empty && !ghash_busy)
+                        state <= ST_FINAL_GHASH;
+                    else if (last_block_sent && !aes_valid_out)
+                        state <= ST_DRAINING;
+                end
+                
+                //=============================================================
+                ST_DRAINING: begin
+                    if (aes_valid_out && init_complete) begin
+                        if (is_encrypt) begin
+                            if (bytes_fifo[fifo_rd_ptr] != 4'd0)
+                                data_out_reg <= (data_fifo[fifo_rd_ptr] ^ aes_ciphertext) & 
+                                               get_mask(bytes_fifo[fifo_rd_ptr]);
+                            else
+                                data_out_reg <= data_fifo[fifo_rd_ptr] ^ aes_ciphertext;
+                        end else begin
+                            if (bytes_fifo[fifo_rd_ptr] != 4'd0)
+                                data_out_reg <= (data_fifo[fifo_rd_ptr] ^ aes_ciphertext) & 
+                                               get_mask(bytes_fifo[fifo_rd_ptr]);
+                            else
+                                data_out_reg <= data_fifo[fifo_rd_ptr] ^ aes_ciphertext;
+                        end
+                        
+                        data_out_valid_reg <= 1'b1;
+                        data_out_last_reg <= last_fifo[fifo_rd_ptr];
+                        
+                        if (is_encrypt) begin
+                            if (bytes_fifo[fifo_rd_ptr] != 4'd0)
+                                ghash_pending_fifo[ghash_pending_wr_ptr] <= 
+                                    (data_fifo[fifo_rd_ptr] ^ aes_ciphertext) & get_mask(bytes_fifo[fifo_rd_ptr]);
+                            else
+                                ghash_pending_fifo[ghash_pending_wr_ptr] <= 
+                                    data_fifo[fifo_rd_ptr] ^ aes_ciphertext;
+                        end else begin
+                            if (bytes_fifo[fifo_rd_ptr] != 4'd0)
+                                ghash_pending_fifo[ghash_pending_wr_ptr] <= 
+                                    data_fifo[fifo_rd_ptr] & get_mask(bytes_fifo[fifo_rd_ptr]);
+                            else
+                                ghash_pending_fifo[ghash_pending_wr_ptr] <= data_fifo[fifo_rd_ptr];
+                        end
+                        ghash_pending_wr_ptr <= ghash_pending_wr_ptr + 1;
+                        ghash_pending_count <= ghash_pending_count + 1;
+                        
+                        fifo_rd_ptr <= fifo_rd_ptr + 1;
+                        fifo_count <= fifo_count - 1;
+                        blocks_in_aes <= blocks_in_aes - 1;
+                        blocks_received <= blocks_received + 1;
+                        
+                        if (last_fifo[fifo_rd_ptr])
+                            last_block_received <= 1'b1;
                     end
                     
-                    // Transition when all data received and GHASH queue empty
-                    if (last_block_received && ghash_pending_empty && !ghash_busy) begin
-                        state <= ST_FINAL_GHASH;
+                    if (!ghash_pending_empty && !ghash_busy) begin
+                        ghash_data <= ghash_pending_fifo[ghash_pending_rd_ptr];
+                        ghash_data_valid <= 1'b1;
+                        ghash_pending_rd_ptr <= ghash_pending_rd_ptr + 1;
+                        ghash_pending_count <= ghash_pending_count - 1;
+                        ghash_busy <= 1'b1;
                     end
+                    
+                    if (ghash_result_valid)
+                        ghash_busy <= 1'b0;
+                    
+                    if (aes_valid_out && init_complete &&
+                        !ghash_pending_empty && !ghash_busy)
+                        ghash_pending_count <= ghash_pending_count;
+                    
+                    if (last_block_received && ghash_pending_empty && !ghash_busy)
+                        state <= ST_FINAL_GHASH;
                 end
                 
                 //=============================================================
                 ST_FINAL_GHASH: begin
-                    // Make sure GHASH is not busy before sending length block
                     if (!ghash_busy) begin
-                        // GHASH the length block: AAD_len (64 bits) || Data_len (64 bits)
                         ghash_data <= {aad_len_bits, data_len_bits};
                         ghash_data_valid <= 1'b1;
                         ghash_busy <= 1'b1;
                         state <= ST_COMPUTE_TAG;
                     end
                     
-                    // Clear ghash_busy when result is valid
-                    if (ghash_result_valid) begin
+                    if (ghash_result_valid)
                         ghash_busy <= 1'b0;
-                    end
                 end
                 
                 //=============================================================
                 ST_COMPUTE_TAG: begin
-                    // Wait for GHASH result, then XOR with E(Y0)
                     if (ghash_result_valid) begin
                         tag_out <= ghash_result ^ e_y0;
                         tag_valid <= 1'b1;
                         
-                        // For decryption, check tag
-                        if (!is_encrypt) begin
+                        if (!is_encrypt)
                             tag_match <= ((ghash_result ^ e_y0) == tag_in);
-                            //tag_match <= ((ghash_result ^ e_y0) == tag_in_reg);
-                        end else begin
+                        else
                             tag_match <= 1'b1;
-                        end
                         
                         state <= ST_DONE;
                     end
                 end
                 
                 //=============================================================
+                // DONE: Advance LFSR for next IV (encrypt only)
+                //=============================================================
                 ST_DONE: begin
+                    // Advance LFSR after encrypt operations
+                    // so next encrypt gets a different IV
+                    if (is_encrypt) begin
+                        iv_lfsr <= lfsr_advanced;
+                        iv_updated <= 1'b1;
+                        $display("[%0t] [AES-GCM] IV rotated: next LFSR IV=0x%024h",
+                                 $time, lfsr_advanced);
+                    end
+                    
+                    // Invalidate H/E(Y0) cache since IV will change next time
+                    // (H depends only on key so could be kept, but E(Y0) depends
+                    //  on IV, so we must recompute. Invalidate both for safety.)
+                    if (is_encrypt)
+                        h_e_y0_valid <= 1'b0;
+                    
                     state <= ST_IDLE;
                 end
                 
