@@ -1,0 +1,27 @@
+# src/mem/nvme_ssd/SConscript
+#
+# Builds the NvmeSsdDevice SimObject (PCIe NVMe SSD).
+# Reuses SimpleSSD sources and ssd_engine already compiled by src/mem/ssd/.
+# Only adds the NVMe device wrapper.
+
+Import('*')
+
+import os
+
+# ---- Debug flag (reuses SsdMemory flag from src/mem/ssd/) ----
+# No new DebugFlag needed — we use the same SsdMemory flag.
+
+# ---- SimObject ----
+SimObject('NvmeSsdDevice.py', sim_objects=['NvmeSsdDevice'])
+
+# ---- Source ----
+Source('nvme_ssd_device.cc')
+
+# ---- Include paths ----
+# SimpleSSD headers are already on CPPPATH from src/mem/ssd/SConscript.
+# But SConscripts execute independently, so we need to add them here too.
+simplessd = Dir('#src/mem/ssd/simplessd').abspath
+env.Append(CPPPATH=[simplessd])
+
+# ssd_engine.hh is in src/mem/ssd/, which is already on the include path
+# via gem5's standard src/ CPPPATH. So #include "mem/ssd/ssd_engine.hh" works.
