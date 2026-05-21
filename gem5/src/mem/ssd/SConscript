@@ -1,0 +1,140 @@
+# src/mem/ssd/SConscript
+
+Import('*')
+
+import os
+
+# ---- Debug flag ----
+DebugFlag('SsdMemory', 'SSD memory device debug messages')
+
+# ---- SimObject ----
+SimObject('SsdMemory.py', sim_objects=['SsdMemory'])
+
+# ---- Our source files ----
+Source('ssd_memory.cc')
+Source('ssd_engine.cc')
+
+# ---- SimpleSSD include paths ----
+simplessd = Dir('simplessd').abspath
+env.Append(CPPPATH=[
+    simplessd,
+    os.path.join(simplessd, 'lib', 'inih'),
+    os.path.join(simplessd, 'lib', 'mcpat'),
+    os.path.join(simplessd, 'lib', 'mcpat', 'cacti'),
+])
+
+# DRAMPower (gem5 ships this in ext/drampower/src/)
+drampower = Dir('#ext/drampower/src').abspath
+if os.path.isdir(drampower):
+    env.Append(CPPPATH=[drampower])
+
+# ---- SimpleSSD sources ----
+
+# HIL front desk
+Source('simplessd/hil/hil.cc')
+
+# NVMe/SATA/UFS config objects — required because ConfigReader
+# internally constructs them (even though we never use those protocols)
+Source('simplessd/hil/nvme/abstract_subsystem.cc')
+Source('simplessd/hil/nvme/config.cc')
+Source('simplessd/hil/nvme/controller.cc')
+Source('simplessd/hil/nvme/dma.cc')
+Source('simplessd/hil/nvme/namespace.cc')
+Source('simplessd/hil/nvme/ocssd.cc')
+Source('simplessd/hil/nvme/queue.cc')
+Source('simplessd/hil/nvme/subsystem.cc')
+Source('simplessd/hil/sata/config.cc')
+Source('simplessd/hil/sata/device.cc')
+Source('simplessd/hil/sata/hba.cc')
+Source('simplessd/hil/ufs/config.cc')
+Source('simplessd/hil/ufs/def.cc')
+Source('simplessd/hil/ufs/device.cc')
+Source('simplessd/hil/ufs/host.cc')
+
+# ICL (SSD-internal DRAM cache)
+Source('simplessd/icl/abstract_cache.cc')
+Source('simplessd/icl/config.cc')
+Source('simplessd/icl/generic_cache.cc')
+Source('simplessd/icl/icl.cc')
+
+# FTL (flash translation layer, GC, page mapping)
+Source('simplessd/ftl/config.cc')
+Source('simplessd/ftl/ftl.cc')
+Source('simplessd/ftl/page_mapping.cc')
+Source('simplessd/ftl/common/block.cc')
+
+# PAL (NAND timing model)
+Source('simplessd/pal/config.cc')
+Source('simplessd/pal/pal.cc')
+Source('simplessd/pal/pal_old.cc')
+Source('simplessd/pal/old/Latency.cc')
+Source('simplessd/pal/old/LatencyMLC.cc')
+Source('simplessd/pal/old/LatencySLC.cc')
+Source('simplessd/pal/old/LatencyTLC.cc')
+Source('simplessd/pal/old/PAL2.cc')
+Source('simplessd/pal/old/PAL2_TimeSlot.cc')
+Source('simplessd/pal/old/PALStatistics.cc')
+
+# SSD controller CPU model
+Source('simplessd/cpu/config.cc')
+Source('simplessd/cpu/cpu.cc')
+
+# SSD-internal DRAM
+Source('simplessd/dram/abstract_dram.cc')
+Source('simplessd/dram/config.cc')
+Source('simplessd/dram/simple.cc')
+
+# Simulator infrastructure
+Source('simplessd/sim/config_reader.cc')
+Source('simplessd/sim/cpu.cc')
+Source('simplessd/sim/log.cc')
+Source('simplessd/sim/simulator.cc')
+Source('simplessd/sim/state.cc')
+
+# Utilities
+Source('simplessd/util/bitset.cc')
+Source('simplessd/util/def.cc')
+Source('simplessd/util/disk.cc')
+Source('simplessd/util/fifo.cc')
+Source('simplessd/util/interface.cc')
+Source('simplessd/util/simplessd.cc')
+
+# INI parser
+Source('simplessd/lib/inih/ini.c')
+
+# ---- McPAT (power model, used by SimpleSSD CPU model) ----
+# Explicit list.  cacti/main.cc is EXCLUDED — it has a main()
+# that would conflict with gem5's entry point.
+Source('simplessd/lib/mcpat/XML_Parse.cc')
+Source('simplessd/lib/mcpat/array.cc')
+Source('simplessd/lib/mcpat/basic_components.cc')
+Source('simplessd/lib/mcpat/core.cc')
+Source('simplessd/lib/mcpat/interconnect.cc')
+Source('simplessd/lib/mcpat/iocontrollers.cc')
+Source('simplessd/lib/mcpat/logic.cc')
+Source('simplessd/lib/mcpat/mcpat.cc')
+Source('simplessd/lib/mcpat/memoryctrl.cc')
+Source('simplessd/lib/mcpat/noc.cc')
+Source('simplessd/lib/mcpat/processor.cc')
+Source('simplessd/lib/mcpat/sharedcache.cc')
+Source('simplessd/lib/mcpat/cacti/Ucache.cc')
+Source('simplessd/lib/mcpat/cacti/arbiter.cc')
+Source('simplessd/lib/mcpat/cacti/area.cc')
+Source('simplessd/lib/mcpat/cacti/bank.cc')
+Source('simplessd/lib/mcpat/cacti/basic_circuit.cc')
+Source('simplessd/lib/mcpat/cacti/cacti_interface.cc')
+Source('simplessd/lib/mcpat/cacti/component.cc')
+Source('simplessd/lib/mcpat/cacti/crossbar.cc')
+Source('simplessd/lib/mcpat/cacti/decoder.cc')
+Source('simplessd/lib/mcpat/cacti/htree2.cc')
+Source('simplessd/lib/mcpat/cacti/io.cc')
+Source('simplessd/lib/mcpat/cacti/mat.cc')
+Source('simplessd/lib/mcpat/cacti/nuca.cc')
+Source('simplessd/lib/mcpat/cacti/parameter.cc')
+Source('simplessd/lib/mcpat/cacti/powergating.cc')
+Source('simplessd/lib/mcpat/cacti/router.cc')
+Source('simplessd/lib/mcpat/cacti/subarray.cc')
+Source('simplessd/lib/mcpat/cacti/technology.cc')
+Source('simplessd/lib/mcpat/cacti/uca.cc')
+Source('simplessd/lib/mcpat/cacti/wire.cc')
+# NOTE: cacti/main.cc deliberately excluded (contains main())
