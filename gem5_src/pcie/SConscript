@@ -1,0 +1,10 @@
+Import('*')
+
+# Debug flag for PCIe tracing
+DebugFlag('PCIe', 'PCIe link model debug messages')
+
+# SimObject definition
+SimObject('PCIeModel.py', sim_objects=['PCIeModel'])
+
+# Source file
+Source('pcie_model.cc')
