@@ -1,0 +1,22 @@
+Import('*')
+
+DebugFlag('Oram', 'ORAM device debug messages')
+
+SimObject('OramDevice.py', sim_objects=['OramDevice'])
+
+env.Append(CPPPATH=[
+    '/mnt/f/rtl/obj_dir',
+    '/usr/share/verilator/include',
+    '/usr/share/verilator/include/vltstd',
+])
+
+Source('oram_device.cc')
+
+env.Append(LINKFLAGS=[
+    '-Wl,--whole-archive',
+    '/mnt/f/rtl/obj_dir/Vsecure_oram_top__ALL.a',
+    '-Wl,--no-whole-archive',
+    '/mnt/f/rtl/obj_dir/verilated.o',
+    '/mnt/f/rtl/obj_dir/verilated_threads.o',
+    '-lpthread',
+])
