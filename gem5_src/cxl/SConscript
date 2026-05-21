@@ -1,0 +1,4 @@
+Import('*')
+DebugFlag('CXL', 'CXL model debug messages')
+SimObject('CxlModel.py', sim_objects=['CxlModel'])
+Source('cxl_model.cc')
