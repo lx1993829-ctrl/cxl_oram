@@ -193,7 +193,12 @@ SsdMemory::ssdLatency(Addr byteAddr, unsigned size, bool isRead)
     uint64_t offset = byteAddr % logicalPageSize;
 
     uint64_t interval = 0;
-    SimpleSSD::HIL::Request req(&interval);
+    const uint64_t startTick = curTick();
+    SimpleSSD::DMAFunction completion =
+        [&interval, startTick](uint64_t tick, void *) {
+            interval = tick > startTick ? tick - startTick : 0;
+        };
+    SimpleSSD::HIL::Request req(completion, nullptr);
     req.reqID = ++nextReqId;
     req.range.slpn = slpn;
     req.range.nlp = 1;

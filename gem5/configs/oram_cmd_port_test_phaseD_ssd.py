@@ -327,7 +327,7 @@ if need_oram:
         max_outstanding=512,
         max_outstanding_writes=512,
         flit_credits=128,
-        completion_buffer_depth=128,
+        completion_buffer_depth=1024,
         host_inject_interval='1ns',
     )
     system.cxl.clk_domain = SrcClockDomain(clock='1GHz', voltage_domain=VoltageDomain())
@@ -378,11 +378,12 @@ if args.use_ssd:
 # cxl_host_xbar) hit this same memory, so CPU↔device aliasing is
 # trivially consistent. 55 ns latency calibrated against measured DDR5
 # round-trip from the existing PCIe model.
-# DROPPED the dedicated SimpleMemory: NVME_SHARED_BASE is now inside
-# DDR_AGG, so the existing 8-channel DDR5 controllers already claim and
-# serve this address range. Both CPU loads/stores and NVMe DMAs hit the
-# same DDR5 backing, no separate memory device needed.
-# (was: system.nvme_shared = SimpleMemory(range=nvme_shared_range, latency='55ns'))
+if nvme_shared_range:
+    system.nvme_shared = SimpleMemory(
+        range=nvme_shared_range,
+        latency='55ns',
+    )
+    system.nvme_shared.port = system.cxl_host_xbar.mem_side_ports
 
 # --- CPU traffic through fabric ---
 # CPU accesses to cmd_ring/result_buf go directly into cxl_host_xbar,
@@ -391,11 +392,8 @@ if args.use_ssd:
 # host xbar. Always includes DDR5; under --use-nvme also includes the
 # dedicated SimpleMemory range backing NVMe queues + stage buffers.
 fabric_bridge_ranges = [ddr_agg_range]
-# DISABLED: nvme_shared_range is now inside DDR_AGG already.
-# Adding it explicitly would make the bridge claim the range twice
-# and trip xbar's "two ports responding" check.
-# if nvme_shared_range:
-#     fabric_bridge_ranges.append(nvme_shared_range)
+if nvme_shared_range:
+    fabric_bridge_ranges.append(nvme_shared_range)
 
 system.cpu_fabric_bridge = Bridge(
     delay='2ns',
@@ -492,9 +490,10 @@ for i, p in enumerate(processes):
     if args.use_nvme:
         max_lba = DDR_PER_INSTANCE // 512  # = 131072 for 64 MB / 512
         p.cmd = [args.binary, str(N), str(i), str(args.n_iters),
-                 hex(args.nvme_bar0), str(max_lba)]
+                 hex(args.nvme_bar0), str(max_lba), str(args.num_slots)]
     else:
-        p.cmd = [args.binary, str(N), str(i), str(args.n_iters)]
+        p.cmd = [args.binary, str(N), str(i), str(args.n_iters),
+                 '0', '0', str(args.num_slots)]
 
 system.workload = m5.objects.SEWorkload.init_compatible(args.binary)
 for i in range(N):

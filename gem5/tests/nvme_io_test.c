@@ -427,6 +427,6 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    se_puts("nvme_io_test: PASS\n");
+    se_puts("|||PASS nvme_io_test\n");
     return 0;
 }
