@@ -1,22 +1,40 @@
 Import('*')
 
+import os
+
 DebugFlag('Oram', 'ORAM device debug messages')
 
 SimObject('OramDevice.py', sim_objects=['OramDevice'])
 
+rtl_obj_dir = Dir('#../rtl_gem5/obj_dir').abspath
+verilator_root = os.environ.get('VERILATOR_ROOT')
+if verilator_root:
+    verilator_include = os.path.join(verilator_root, 'include')
+else:
+    conda_prefix = os.environ.get('CONDA_PREFIX')
+    conda_verilator_include = (
+        os.path.join(conda_prefix, 'share', 'verilator', 'include')
+        if conda_prefix else None
+    )
+    verilator_include = (
+        conda_verilator_include
+        if conda_verilator_include and os.path.isdir(conda_verilator_include)
+        else '/usr/share/verilator/include'
+    )
+
 env.Append(CPPPATH=[
-    '/mnt/f/rtl/obj_dir',
-    '/usr/share/verilator/include',
-    '/usr/share/verilator/include/vltstd',
+    rtl_obj_dir,
+    verilator_include,
+    os.path.join(verilator_include, 'vltstd'),
 ])
 
 Source('oram_device.cc')
 
 env.Append(LINKFLAGS=[
     '-Wl,--whole-archive',
-    '/mnt/f/rtl/obj_dir/Vsecure_oram_top__ALL.a',
+    os.path.join(rtl_obj_dir, 'Vsecure_oram_top__ALL.a'),
     '-Wl,--no-whole-archive',
-    '/mnt/f/rtl/obj_dir/verilated.o',
-    '/mnt/f/rtl/obj_dir/verilated_threads.o',
+    os.path.join(rtl_obj_dir, 'verilated.o'),
+    os.path.join(rtl_obj_dir, 'verilated_threads.o'),
     '-lpthread',
 ])

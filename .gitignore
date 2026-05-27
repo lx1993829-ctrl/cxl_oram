@@ -1,0 +1,17 @@
+# Build outputs and simulator run artifacts
+gem5/build/
+gem5/m5out*/
+gem5/**/*.log
+gem5/**/*.out
+rtl_gem5/obj_dir/
+
+# Locally compiled SE test binaries
+gem5/tests/nvme_io_test
+gem5/tests/oram_nvme_test
+gem5/mem_touch
+
+# Local scratch/backup trees
+gem5_1/
+
+# CMake/build directories inside vendored components
+gem5/src/mem/ssd/build/

@@ -1,0 +1,29 @@
+import os
+
+Import('env')
+
+ramulator2_ext_path = os.path.join(Dir('#').abspath, 'ext/ramulator2')
+ramulator2_path = os.path.join(ramulator2_ext_path, 'ramulator2')
+
+if not os.path.exists(ramulator2_path):
+    env['HAVE_RAMULATOR2'] = False
+    Return()
+
+if not os.path.exists(os.path.join(ramulator2_path, 'libramulator.so')):
+    env['HAVE_RAMULATOR2'] = False
+    Return()
+
+env['HAVE_RAMULATOR2'] = True
+
+env.Append(
+    LIBS=['ramulator'],
+    LIBPATH=[ramulator2_path],
+    RPATH=[ramulator2_path],
+    CPPPATH=[
+        ramulator2_ext_path,                  # for #include "ramulator2/src/..."
+        ramulator2_path,                      # for #include "src/..."
+        ramulator2_path + '/src',             # for #include "base/..."
+        ramulator2_path + '/ext/spdlog/include',
+        ramulator2_path + '/ext/yaml-cpp/include',
+    ]
+)

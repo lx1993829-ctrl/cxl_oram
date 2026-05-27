@@ -19,11 +19,11 @@
  * We extern-declare it here so the constructor can install our
  * trampoline when dram_cache_size > 0. */
 namespace SimpleSSD {
-extern bool (*nvmeCacheCheckAllHit)(uint64_t startPageNum,
-                                     uint64_t nPages,
-                                     bool isWrite,
-                                     uint64_t *hitLatencyPs,
-                                     uint64_t *evictWritebackPs);
+bool (*nvmeCacheCheckAllHit)(uint64_t startPageNum,
+                             uint64_t nPages,
+                             bool isWrite,
+                             uint64_t *hitLatencyPs,
+                             uint64_t *evictWritebackPs) = nullptr;
 }
 
 namespace gem5

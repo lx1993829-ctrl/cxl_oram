@@ -141,7 +141,7 @@ SsdEngine::allocateEvent(SimpleSSD::EventFunction func)
     auto iter = eventList.insert({++counter, func});
 
     if (!iter.second) {
-        SimpleSSD::ssd_panic("SsdEngine: failed to allocate event");
+        panic("SsdEngine: failed to allocate event");
     }
 
     DPRINTF(SsdMemory, "[ALLOC_EVENT] eid=%lu\n", counter);
@@ -154,7 +154,7 @@ SsdEngine::scheduleEvent(SimpleSSD::Event eid, uint64_t tick)
     auto iter = eventList.find(eid);
 
     if (iter == eventList.end()) {
-        SimpleSSD::ssd_panic(
+        panic(
             "SsdEngine: event %" PRIu64 " does not exist", eid);
         return;
     }
@@ -205,7 +205,7 @@ SsdEngine::descheduleEvent(SimpleSSD::Event eid)
     auto iter = eventList.find(eid);
 
     if (iter == eventList.end()) {
-        SimpleSSD::ssd_panic(
+        panic(
             "SsdEngine: event %" PRIu64 " does not exist", eid);
         return;
     }
@@ -226,7 +226,7 @@ SsdEngine::isScheduled(SimpleSSD::Event eid, uint64_t *pTick)
     auto iter = eventList.find(eid);
 
     if (iter == eventList.end()) {
-        SimpleSSD::ssd_panic(
+        panic(
             "SsdEngine: event %" PRIu64 " does not exist", eid);
     }
 
@@ -239,7 +239,7 @@ SsdEngine::deallocateEvent(SimpleSSD::Event eid)
     auto iter = eventList.find(eid);
 
     if (iter == eventList.end()) {
-        SimpleSSD::ssd_panic(
+        panic(
             "SsdEngine: event %" PRIu64 " does not exist", eid);
         return;
     }
