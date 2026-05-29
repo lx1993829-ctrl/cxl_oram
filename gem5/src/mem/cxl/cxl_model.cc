@@ -265,13 +265,20 @@ void CxlModel::retryStarvedPorts()
 
     // Retry ONE port per call (matches PCIe pattern). Round-robin across
     // ports so no single port permanently wins retry races.
+    // Shared-pool: outstanding reads/writes are global limits (one physical
+    // CXL link), not per-port. Compute global sums for admission check.
+    unsigned totalReadsOut = 0, totalWritesOut = 0;
+    for (unsigned j = 0; j < n; j++) {
+        totalReadsOut += perPortReadsOut[j];
+        totalWritesOut += outstandingWrites[j];
+    }
     for (unsigned i = 0; i < n; i++) {
         unsigned idx = (nextRetryPort + i) % n;
         bool canRead = hasFreeTags() &&
                        (maxOutstanding == 0 ||
-                        perPortReadsOut[idx] < maxOutstanding);
+                        totalReadsOut < maxOutstanding);
         bool canWrite = (maxOutstandingWrites == 0 ||
-                         outstandingWrites[idx] < maxOutstandingWrites);
+                         totalWritesOut < maxOutstandingWrites);
         if (!canRead && !canWrite) continue;
 
         auto *dp = devicePorts[idx];
@@ -504,11 +511,15 @@ CxlModel::handleDeviceRequest(PacketPtr pkt, int srcPort)
     if (pkt->isRead()) {
         // Accept into buffer — tags gate at processBufferedRead
     } else if (pkt->isWrite()) {
+        // Shared-pool: sum writes across all ports for global limit check.
+        unsigned totalWritesOut = 0;
+        for (unsigned j = 0; j < devicePorts.size(); j++)
+            totalWritesOut += outstandingWrites[j];
         if (maxOutstandingWrites > 0 &&
-            outstandingWrites[srcPort] >= maxOutstandingWrites) {
-            DPRINTF(CXL, "  WR BUFFER FULL: portBuf=%zu outstanding[%d]=%u max=%u\n",
+            totalWritesOut >= maxOutstandingWrites) {
+            DPRINTF(CXL, "  WR BUFFER FULL: portBuf=%zu outstanding[%d]=%u totalWr=%u max=%u\n",
                     deviceWriteBuffers[srcPort].size(), srcPort,
-                    outstandingWrites[srcPort], maxOutstandingWrites);
+                    outstandingWrites[srcPort], totalWritesOut, maxOutstandingWrites);
             devicePorts[srcPort]->needRetry = true;
             return false;
         }
@@ -1126,13 +1137,12 @@ void CxlModel::processUpstreamQueue()
     // can accept a write.
     {
         bool canAcceptRead = hasFreeTags();
-        bool canAcceptWrite = false;
-        for (unsigned sp = 0; sp < n; sp++) {
-            if (maxOutstandingWrites == 0 ||
-                outstandingWrites[sp] < maxOutstandingWrites) {
-                canAcceptWrite = true; break;
-            }
-        }
+        // Shared-pool: check global write budget, not per-port.
+        unsigned totalWritesOut = 0;
+        for (unsigned sp = 0; sp < n; sp++)
+            totalWritesOut += outstandingWrites[sp];
+        bool canAcceptWrite = (maxOutstandingWrites == 0 ||
+                               totalWritesOut < maxOutstandingWrites);
         if (canAcceptRead || canAcceptWrite)
             retryStarvedPorts();
     }
