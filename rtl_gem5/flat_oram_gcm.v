@@ -103,6 +103,7 @@ module flat_oram_gcm #(
     // Test controls
     input  wire                  dbg_force_same_bucket,  // override req_b_new = req_b
     input  wire [BUCKET_W-1:0]  dbg_prng_override,      // when != 0, replaces prng_bucket
+    input  wire                  dbg_prng_override_en,   // separate enable (allows bucket 0)
     input  wire                  perf_reset,              // clear all perf counters
     output wire dbg_gcm_tag_match,
     output wire [4:0]            dbg_state,
@@ -650,14 +651,14 @@ module flat_oram_gcm #(
                     if (pm_rd_valid) begin
                         req_b <= pm_rd_bucket;
                         req_b_new <= dbg_force_same_bucket ? pm_rd_bucket :
-                                     (|dbg_prng_override)  ? dbg_prng_override :
+                                     dbg_prng_override_en  ? dbg_prng_override :
                                                              prng_bucket;
                         same_bucket <= dbg_force_same_bucket ? 1'b1 :
-                                      (|dbg_prng_override)  ? (dbg_prng_override == pm_rd_bucket) :
+                                      dbg_prng_override_en  ? (dbg_prng_override == pm_rd_bucket) :
                                                               (prng_bucket == pm_rd_bucket);
                         pm_wr_addr <= req_slot_addr;
                         pm_wr_bucket <= dbg_force_same_bucket ? pm_rd_bucket :
-                                       (|dbg_prng_override)  ? dbg_prng_override :
+                                       dbg_prng_override_en  ? dbg_prng_override :
                                                                prng_bucket;
                         pm_wr_status <= `ST_VALID;
                         pm_wr_en <= 1;

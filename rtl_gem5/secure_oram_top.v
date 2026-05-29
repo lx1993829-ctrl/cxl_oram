@@ -129,6 +129,7 @@ module secure_oram_top #(
     // Test controls
     input  wire dbg_force_same_bucket,
     input  wire [`BUCKET_ID_W-1:0] dbg_prng_override,
+    input  wire dbg_prng_override_en,
     input  wire perf_reset,
 
     // Performance counters - 4-way: rb=read/bucket, rs=read/stash, wb=write/bucket, ws=write/stash
@@ -439,6 +440,7 @@ module secure_oram_top #(
         .dbg_ht_sng_done(dbg_ht_sng_done),
         .dbg_force_same_bucket(dbg_force_same_bucket),
         .dbg_prng_override(dbg_prng_override),
+        .dbg_prng_override_en(dbg_prng_override_en),
         .perf_reset(perf_reset),
         .perf_rb_ddr_rd(perf_rb_ddr_rd), .perf_rb_decrypt(perf_rb_decrypt),
         .perf_rb_encrypt(perf_rb_encrypt), .perf_rb_compact(perf_rb_compact),
