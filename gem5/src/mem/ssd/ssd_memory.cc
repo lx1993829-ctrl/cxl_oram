@@ -193,12 +193,7 @@ SsdMemory::ssdLatency(Addr byteAddr, unsigned size, bool isRead)
     uint64_t offset = byteAddr % logicalPageSize;
 
     uint64_t interval = 0;
-    const uint64_t startTick = curTick();
-    SimpleSSD::DMAFunction completion =
-        [&interval, startTick](uint64_t tick, void *) {
-            interval = tick > startTick ? tick - startTick : 0;
-        };
-    SimpleSSD::HIL::Request req(completion, nullptr);
+    SimpleSSD::HIL::Request req(&interval);
     req.reqID = ++nextReqId;
     req.range.slpn = slpn;
     req.range.nlp = 1;
@@ -217,6 +212,10 @@ SsdMemory::ssdLatency(Addr byteAddr, unsigned size, bool isRead)
     if (latency == 0) {
         latency = 1000;
     }
+
+    inform("SSD-NAND %s page=%lu (addr=0x%lx) size=%u lat=%lu ps (%.1f us) @tick=%lu",
+           isRead ? "RD" : "WR", slpn, byteAddr, size,
+           latency, latency / 1e6, curTick());
 
     return latency;
 }
@@ -268,16 +267,19 @@ SsdMemory::dramCacheInstall(uint64_t pageNum, bool dirty, Tick *evictLatency)
     // Evict victim if valid
     if (set[victimWay].valid) {
         stats.cacheEvictions++;
+        inform("SSD-CACHE EVICT victim_page=%lu (addr=0x%lx) dirty=%d way=%u -> new_page=%lu",
+               set[victimWay].tag, set[victimWay].tag * logicalPageSize,
+               set[victimWay].dirty, victimWay, pageNum);
         if (set[victimWay].dirty && dramCacheWriteBack) {
             // Dirty eviction — must write back to NAND
             stats.cacheDirtyEvictions++;
+            inform("SSD-CACHE DIRTY-EVICT page=%lu -> calling ssdLatency(WR)...",
+                   set[victimWay].tag);
             *evictLatency = ssdLatency(
                 set[victimWay].tag * logicalPageSize,
                 logicalPageSize, false /* write */);
-
-            DPRINTF(SsdMemory, "  DRAM cache evict dirty page %lu, "
-                    "writeback latency=%lu ps\n",
-                    set[victimWay].tag, *evictLatency);
+            inform("SSD-CACHE DIRTY-EVICT page=%lu evictLat=%lu ps (%.1f us)",
+                   set[victimWay].tag, *evictLatency, *evictLatency / 1e6);
         }
     }
 
@@ -286,6 +288,8 @@ SsdMemory::dramCacheInstall(uint64_t pageNum, bool dirty, Tick *evictLatency)
     set[victimWay].valid = true;
     set[victimWay].dirty = dirty;
     set[victimWay].lruCounter = ++globalLruCounter;
+    inform("SSD-CACHE INSTALL page=%lu (addr=0x%lx) dirty=%d way=%u",
+           pageNum, pageNum * logicalPageSize, dirty, victimWay);
 }
 
 Tick
@@ -317,8 +321,14 @@ SsdMemory::dramCacheAccess(Addr byteAddr, unsigned size, bool isRead)
     // Cache miss
     stats.cacheMisses++;
 
+    inform("SSD-CACHE MISS page=%lu (addr=0x%lx) %s -> fetch from NAND...",
+           pageNum, byteAddr, isRead ? "RD" : "WR");
+
     // Fetch page from SSD
     Tick fetchLatency = ssdLatency(byteAddr, size, isRead);
+
+    inform("SSD-CACHE MISS-FETCH page=%lu fetchLat=%lu ps (%.1f us)",
+           pageNum, fetchLatency, fetchLatency / 1e6);
 
     // Install in cache (may evict dirty page)
     Tick evictLatency = 0;
@@ -328,6 +338,9 @@ SsdMemory::dramCacheAccess(Addr byteAddr, unsigned size, bool isRead)
     // In real hardware, eviction and fetch can be pipelined on different
     // NAND channels. Model as max(fetch, evict) for simplicity.
     Tick totalLatency = std::max(fetchLatency, evictLatency);
+
+    inform("SSD-CACHE MISS-TOTAL page=%lu fetch=%.1f us evict=%.1f us total=%.1f us",
+           pageNum, fetchLatency / 1e6, evictLatency / 1e6, totalLatency / 1e6);
 
     DPRINTF(SsdMemory, "  DRAM cache MISS page %lu, fetch=%lu evict=%lu "
             "total=%lu ps\n",
