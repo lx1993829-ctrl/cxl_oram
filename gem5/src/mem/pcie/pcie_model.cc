@@ -769,15 +769,14 @@ void PCIeModel::processDeferredCredits()
     if (anyBuffered)
         drainDeviceRequests();
 
-    // Retry starved ports — per-port limits checked in handleDeviceRequest
+    // Retry starved ports — shared-pool: global outstanding limits.
     bool canAcceptRead = hasFreeTags();
-    bool canAcceptWrite = false;
-    for (unsigned sp = 0; sp < outstandingWrites.size(); sp++) {
-        if (maxOutstandingWrites == 0 ||
-            outstandingWrites[sp] < maxOutstandingWrites) {
-            canAcceptWrite = true; break;
-        }
-    }
+    // Shared-pool: check global write budget, not per-port.
+    unsigned totalWritesOut = 0;
+    for (unsigned sp = 0; sp < outstandingWrites.size(); sp++)
+        totalWritesOut += outstandingWrites[sp];
+    bool canAcceptWrite = (maxOutstandingWrites == 0 ||
+                           totalWritesOut < maxOutstandingWrites);
     if (canAcceptRead || canAcceptWrite)
         retryStarvedPorts();
 
@@ -1044,9 +1043,12 @@ void PCIeModel::deliverCompletions(Tick now)
                 outstandingReads.erase(readIt);
                 perPortReadsOut[srcPort]--;  // one coalesced group done
 
+                // Shared-pool: check global read budget.
+                unsigned totalReadsOut = 0;
+                for (auto v : perPortReadsOut) totalReadsOut += v;
                 if (hasFreeTags() &&
                     (maxOutstanding == 0 ||
-                     perPortReadsOut[srcPort] < maxOutstanding)) {
+                     totalReadsOut < maxOutstanding)) {
                     pendingDeviceRetry = true;
                 }
 
@@ -1164,12 +1166,15 @@ PCIeModel::handleDeviceRequest(PacketPtr pkt, int srcPort)
         // push and includes every buffered write until DDR5 commit. Summing
         // double-counts. CXL has the same fix at handleDeviceRequest;
         // PCIe was missed. Effective cap was ~64 (half of max_outstanding_writes=128).
-        // Phase A.1: per-port outstanding-write count.
+        // Phase A.1: shared-pool outstanding-write count.
+        unsigned totalWritesOut = 0;
+        for (unsigned j = 0; j < devicePorts.size(); j++)
+            totalWritesOut += outstandingWrites[j];
         if (maxOutstandingWrites > 0 &&
-            outstandingWrites[srcPort] >= maxOutstandingWrites) {
-            DPRINTF(PCIe, "  WR BUFFER FULL: portBuf=%zu out[%d]=%u max=%u\n",
+            totalWritesOut >= maxOutstandingWrites) {
+            DPRINTF(PCIe, "  WR BUFFER FULL: portBuf=%zu out[%d]=%u totalWr=%u max=%u\n",
                     deviceWriteBuffers[srcPort].size(), srcPort,
-                    outstandingWrites[srcPort], maxOutstandingWrites);
+                    outstandingWrites[srcPort], totalWritesOut, maxOutstandingWrites);
             devicePorts[srcPort]->needRetry = true;
             return false;
         }
@@ -1606,6 +1611,28 @@ void PCIeModel::processUpstreamQueue()
 
                 Tick sendTick = std::max(now + rcDelay, curTick() + 1);
 
+                // Temporary RC debug — first 10 read TLPs only
+                {
+                    static int rcDbgCount = 0;
+                    if (rcDbgCount < 10) {
+                        inform("RC-DBG READ[%d] tag=%u "
+                               "firstDevReq=%llu tlpCreated=%llu tlpReady=%llu "
+                               "upstreamNow=%llu rcGap=%llu burstWin=%llu "
+                               "rcDelay=%llu sendTick=%llu "
+                               "upstreamSpan=%llu",
+                               rcDbgCount, tlp.tag,
+                               rdTracker.firstDevReq,
+                               tlp.creationTick,
+                               entry.readyTick,
+                               now,
+                               rcGap, burstWindowTicks,
+                               rcDelay, sendTick,
+                               (sendTick > rdTracker.firstDevReq) ?
+                                   (sendTick - rdTracker.firstDevReq) : 0);
+                        rcDbgCount++;
+                    }
+                }
+
                 OutstandingRead &orec = it->second;
                 for (auto *devPkt : orec.allPkts) {
                     PacketPtr hostPkt = new Packet(devPkt->req,
@@ -1655,6 +1682,25 @@ void PCIeModel::processUpstreamQueue()
                 lastUpstreamRcTick = now;
 
                 Tick sendTick2 = std::max(now + rcDelay, curTick() + 1);
+
+                // Temporary RC debug — first 10 write TLPs only
+                {
+                    static int rcWrDbgCount = 0;
+                    if (rcWrDbgCount < 10) {
+                        inform("RC-DBG WRITE[%d] "
+                               "firstDevReq=%llu tlpCreated=%llu tlpReady=%llu "
+                               "upstreamNow=%llu rcGap=%llu burstWin=%llu "
+                               "rcDelay=%llu sendTick=%llu",
+                               rcWrDbgCount,
+                               wrTracker.firstDevReq,
+                               tlp.creationTick,
+                               entry.readyTick,
+                               now,
+                               rcGap, burstWindowTicks,
+                               rcDelay, sendTick2);
+                        rcWrDbgCount++;
+                    }
+                }
 
                 auto &wrPkts = tlp.allWritePkts;
                 if (!wrPkts.empty()) {
@@ -1738,11 +1784,15 @@ void PCIeModel::processUpstreamQueue()
     // outstandingWrites and per-port phCredits.
     {
         bool canAcceptRead = hasFreeTags();
+        // Shared-pool: check global write budget.
+        unsigned totalWritesOut = 0;
+        for (unsigned sp = 0; sp < credits.size(); sp++)
+            totalWritesOut += outstandingWrites[sp];
         bool canAcceptWrite = false;
         for (unsigned sp = 0; sp < credits.size(); sp++) {
             bool portCanWrite = credits[sp].phCredits > 0 &&
                 (maxOutstandingWrites == 0 ||
-                 outstandingWrites[sp] < maxOutstandingWrites);
+                 totalWritesOut < maxOutstandingWrites);
             if (portCanWrite) { canAcceptWrite = true; break; }
         }
         if (canAcceptRead || canAcceptWrite)
@@ -1815,13 +1865,12 @@ bool PCIeModel::handleHostResponse(PacketPtr pkt)
 
         {
             bool canRead = hasFreeTags();
-            bool canWrite = false;
-            for (unsigned sp = 0; sp < outstandingWrites.size(); sp++) {
-                if (maxOutstandingWrites > 0 &&
-                    outstandingWrites[sp] < maxOutstandingWrites) {
-                    canWrite = true; break;
-                }
-            }
+            // Shared-pool: check global write budget.
+            unsigned totalWritesOut = 0;
+            for (unsigned sp = 0; sp < outstandingWrites.size(); sp++)
+                totalWritesOut += outstandingWrites[sp];
+            bool canWrite = (maxOutstandingWrites == 0 ||
+                             totalWritesOut < maxOutstandingWrites);
             if (canRead || canWrite)
                 retryStarvedPorts();
         }
@@ -2004,6 +2053,16 @@ bool PCIeModel::handleHostResponse(PacketPtr pkt)
             rcDelay = rcLatency;  // cold: full RC pipeline fill
         }
         lastDownstreamRcTick = now;
+
+        // Temporary downstream RC debug — first 10 completions only
+        static int rcDnDbgCount = 0;
+        if (rcDnDbgCount < 10) {
+            inform("RC-DBG DN-CPL[%d] tag=%u rcGap=%llu burstWin=%llu "
+                   "rcDelay=%llu now=%llu combinedBytes=%u",
+                   rcDnDbgCount, tag, rcGap, burstWindowTicks,
+                   rcDelay, now, combinedSize);
+            rcDnDbgCount++;
+        }
     }
     Tick arriveBridge = now + rcDelay;
     const Tick cdcCycles = 2;
@@ -2106,10 +2165,12 @@ void PCIeModel::processDownstreamQueue()
 
     // Flag retry if any port has room and needs retry.
     if (hasFreeTags()) {
+        unsigned totalReadsOut = 0;
+        for (auto v : perPortReadsOut) totalReadsOut += v;
         for (unsigned i = 0; i < devicePorts.size(); i++) {
             if (devicePorts[i]->needRetry &&
                 (maxOutstanding == 0 ||
-                 perPortReadsOut[i] < maxOutstanding)) {
+                 totalReadsOut < maxOutstanding)) {
                 pendingDeviceRetry = true;
                 break;
             }
