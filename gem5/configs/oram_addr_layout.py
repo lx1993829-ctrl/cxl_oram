@@ -47,12 +47,12 @@ HBM_PER_INSTANCE   = 0x020000000   # 512 MB — must hold HT at 0x10500000 (261 
 # ---- Shared DDR5 aggregate ----
 # Covers cmd_ring + result_buf + per-instance ORAM DDR slabs.
 # Starts at 16 GB to avoid overlap with 16 × 512 MB HBM (ends at 12 GB).
-DDR_AGG_BASE       = 0x400000000    # 16 GB
+DDR_AGG_BASE       = 0x600000000    # 24 GB — pushed for N≤32 (HBM ends at 0x500000000)
 
 CMD_RING_BASE      = DDR_AGG_BASE + 0x000000000    # 16 × 4 KB
 RESULT_BUF_BASE    = DDR_AGG_BASE + 0x010000000    # 16 × 1 MB
 DDR_SLAB_BASE      = DDR_AGG_BASE + 0x100000000    # 16 × 64 MB; offset 4 GB into agg
-DDR_PER_INSTANCE   = 0x020000000                   # 512 MB per slab (matches HBM_PER_INSTANCE)
+DDR_PER_INSTANCE   = 0x010000000                   # 256 MB per slab (bucket tree ≈ 128 MB)
 
 
 def per_instance_addrs(i):
@@ -98,7 +98,7 @@ def _assert_no_overlap(N):
         f"stash_offset 0x{stash_offset:x} overlaps HT region ending at 0x{HT_END_OFFSET:x}"
 
 
-_assert_no_overlap(20)
+_assert_no_overlap(32)
 
 
 if __name__ == '__main__':
