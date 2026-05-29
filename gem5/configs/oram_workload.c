@@ -18,8 +18,8 @@
 
 // Addresses — must match phase_d_layout.py.
 #define ORAM_CMD_BASE     0x0E0000000ULL
-#define CMD_RING_BASE     0x400000000ULL
-#define RESULT_BUF_BASE   0x410000000ULL
+#define CMD_RING_BASE     0x600000000ULL
+#define RESULT_BUF_BASE   0x610000000ULL
 
 // MMIO offsets
 #define OFF_NUM_K              0x80
@@ -116,7 +116,7 @@ int main(int argc, char **argv)
     int num_slots   = (argc > 4) ? atoi(argv[4]) : DEFAULT_NUM_SLOTS;
     (void)N;
 
-    if (instance_id < 0 || instance_id >= 16) {
+    if (instance_id < 0 || instance_id >= 32) {
         fprintf(stderr, "instance_id out of range: %d\n", instance_id);
         return 1;
     }
@@ -140,7 +140,7 @@ int main(int argc, char **argv)
     /* PRNG seeded per-instance: different access pattern per ORAM. */
     uint32_t rng_state = (uint32_t)(instance_id + 1) * 2654435761u; /* Knuth multiplicative */
 
-    /* Inner loop — random slot access, write then read. */
+    /* Pass 1 — WRITE all slots. */
     for (uint32_t i = 0; i < (uint32_t)n_iters; i++) {
         uint32_t slotIdx = xorshift32(&rng_state) % (uint32_t)num_slots;
         uint32_t slot = 0x1000u + slotIdx * 0x1000u;
@@ -152,28 +152,44 @@ int main(int argc, char **argv)
         for (int j = 0; j < 8; j++)
             wdata[j] = 0xABCD0000u | (i << 8) | (uint32_t)j;
 
-        /* Write */
-        uint64_t wrIdx = 2ull * i;
-        while ((wrIdx - rd64(ring_base + RING_CONS_IDX_OFF)) >= CMD_RING_DEPTH) { }
+        uint64_t wrIdx = (uint64_t)i;
+        while ((wrIdx - rd64(ring_base + RING_CONS_IDX_OFF)) >= CMD_RING_DEPTH) {
+            for (volatile int d = 0; d < 100; d++) { }
+        }
         write_ring_entry(ring_base, wrIdx, slot, token, lease_id, 1, hwid, wdata);
         wr64(ring_base + RING_PROD_IDX_OFF, wrIdx + 1);
         wr32(cmd_base + OFF_CMD_RING_DOORBELL, 1);
+    }
 
-        /* Read same slot */
-        uint64_t rdIdx = wrIdx + 1;
-        while ((rdIdx - rd64(ring_base + RING_CONS_IDX_OFF)) >= CMD_RING_DEPTH) { }
+    /* Reset PRNG so pass 2 reads the same slots. */
+    rng_state = (uint32_t)(instance_id + 1) * 2654435761u;
+
+    /* Pass 2 — READ all slots (blocks may have been evicted to encrypted buckets). */
+    for (uint32_t i = 0; i < (uint32_t)n_iters; i++) {
+        uint32_t slotIdx = xorshift32(&rng_state) % (uint32_t)num_slots;
+        uint32_t slot = 0x1000u + slotIdx * 0x1000u;
+        uint8_t  hwid = (slotIdx < slots_per_client) ? 0 : 1;
+        uint32_t token = (hwid == 0) ? token0 : token1;
+        uint8_t  lease_id = hwid + 1;
+
+        uint64_t rdIdx = (uint64_t)n_iters + i;
+        while ((rdIdx - rd64(ring_base + RING_CONS_IDX_OFF)) >= CMD_RING_DEPTH) {
+            for (volatile int d = 0; d < 100; d++) { }
+        }
         write_ring_entry(ring_base, rdIdx, slot, token, lease_id, 0, hwid, NULL);
         wr64(ring_base + RING_PROD_IDX_OFF, rdIdx + 1);
         wr32(cmd_base + OFF_CMD_RING_DOORBELL, 1);
     }
 
-    /* Drain. */
-    while (rd32(cmd_base + OFF_CPU_OP_COUNT) < TOTAL_OPS) { }
+    /* Drain — spin delay between polls to reduce MMIO congestion at high N. */
+    while (rd32(cmd_base + OFF_CPU_OP_COUNT) < TOTAL_OPS) {
+        for (volatile int d = 0; d < 100; d++) { }
+    }
 
     /* Verify — each read returns data from the paired write in same iteration. */
     uint32_t pass = 0, fail = 0;
     for (uint32_t i = 0; i < (uint32_t)n_iters; i++) {
-        uint64_t opIdx   = 2ull * i + 1;
+        uint64_t opIdx   = (uint64_t)n_iters + i;
         uint64_t resAddr = result_base + opIdx * 64;
         uint64_t status  = rd64(resAddr + RES_STATUS_OFF);
         if (!(status & RES_DONE_BIT))    { fail++; continue; }
