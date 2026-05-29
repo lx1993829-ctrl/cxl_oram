@@ -282,9 +282,13 @@ void OramDevice::startup()
     memset(&oram->init_bm_wr_slot_list[0], 0,
            sizeof(oram->init_bm_wr_slot_list));
     oram->init_bm_wr_fill = 0; oram->init_bm_wr_en = 0;
-    // Force all bucket remaps to bucket 8191 for step 3 eviction testing.
-    // Bucket 8191 is a leaf frequently visited on ORAM paths.
+    // Constrain bucket remaps to [0, numBuckets) instead of [0, 8191).
+    // The RTL's 13-bit PRNG covers the full hardware range, but with
+    // fewer slots the actual bucket count is much smaller.
+    // dbg_prng_override_en + dbg_prng_override overrides the RTL PRNG
+    // each cycle with a uniform value in [0, numBuckets).
     oram->dbg_prng_override = 0;
+    oram->dbg_prng_override_en = 1;  // always use gem5's constrained PRNG
     oram->dbg_force_same_bucket = 0;
     // hold_stash / hold_ddr_wr removed — not in new RTL
 
@@ -364,6 +368,17 @@ void OramDevice::tick()
 {
     oram->clk = 1;
 
+    // Constrain RTL's bucket remap to [0, numBuckets-1].
+    // numBuckets = ceil(numSlots / ORAM_C), where ORAM_C = 4.
+    // ORAM_C is the nominal slots per bucket (ORAM_Z=8 total positions, ORAM_C=4 real + 4 slack).
+    {
+        uint32_t numBuckets = (numSlots + ORAM_C - 1) / ORAM_C;
+        if (numBuckets > 1) {
+            std::uniform_int_distribution<uint32_t> dist(0, numBuckets - 1);
+            oram->dbg_prng_override = dist(rng);
+        }
+    }
+
     // Step 9: ring fetcher — kick off a prod_idx read when the CPU has
     // signaled (via doorbell) that it has produced new commands and we
     // don't already have a fetch in flight. The actual entry reads are
@@ -401,22 +416,16 @@ void OramDevice::tick()
         for (auto &rb : pendingReadBursts) {
             if (rb.totalBeats == 1) { stashReadPending = true; break; }
         }
-        oram->m_axi_arready = (hbmBlocked || stashReadPending ||
-                               (currentOpIsPcie && pcieBlocked)) ? 0 : 1;
-        // AW: always accept for stash (sel_stash=1) to avoid the AW+W desync
-        // deadlock — stash_axi_master issues AW+W simultaneously and dropping
-        // AW while accepting W causes a BRESP that never comes.
-        // For bucket AWs (sel_stash=0), gate on pcieBlocked when the op
-        // routes to PCIe. Bucket master only issues 8 AWs per DDR_WRITE
-        // phase so this won't cause excessive stalls.
-        {
-            bool selStash = (oram->sel_stash_out != 0);
-            if (selStash) {
-                oram->m_axi_awready = 1;
-            } else {
-                oram->m_axi_awready = (currentOpIsPcie && pcieBlocked) ? 0 : 1;
-            }
-        }
+        oram->m_axi_arready = (hbmBlocked || stashReadPending) ? 0 : 1;
+        // AW: always accept. The stash_axi_master issues AW+W simultaneously
+        // (ST_IDLE → ST_SNG_WRITE sets both awvalid=1 and wvalid=1 on the same
+        // cycle). If awready=0 but wready=1, the W handshake fires without a
+        // matching activeWrites entry — the W beat is silently dropped and the
+        // stash_axi_master waits for a BRESP that never comes (Group A deadlock).
+        // hbmBlocked only affects the gem5→HBM path (wFifo/drainWriteFifo),
+        // not the RTL→gem5 AXI handshake. Bucket AW flooding is not an issue
+        // because the RTL's bucket master only issues 8 AWs per DDR_WRITE phase.
+        oram->m_axi_awready = 1;
     }
 
     // W ready: depends on which port and which master.
@@ -429,7 +438,7 @@ void OramDevice::tick()
         bool wrPcie = activeWrites.front().isPcie;
         bool selStash = (oram->sel_stash_out != 0);
         if (wrPcie) {
-            oram->m_axi_wready = (pcieBlocked || (int)wFifo.size() >= W_FIFO_DEPTH) ? 0 : 1;
+            oram->m_axi_wready = pcieBlocked ? 0 : 1;
         } else if (selStash) {
             // Stash HBM writes: always accept (prefetch pipeline safety)
             oram->m_axi_wready = 1;
@@ -451,7 +460,7 @@ void OramDevice::tick()
     // with bucket traffic — only burst stash ops do.
     {
         // Per-instance previous state (NOT shared across instances!)
-        static uint8_t prevBurstBusy[16] = {0}, prevSelPosmap[16] = {0};
+        static uint8_t prevBurstBusy[64] = {0}, prevSelPosmap[64] = {0};
         uint8_t curBurstBusy = oram->st_burst_busy_out;
         uint8_t curSelPosmap = oram->sel_posmap_out;
         if (curBurstBusy != prevBurstBusy[instanceId] || curSelPosmap != prevSelPosmap[instanceId]) {
@@ -497,9 +506,9 @@ void OramDevice::tick()
     // Monitor R channel and stash HBM access
     {
         uint8_t fsm = oram->dbg_oram_state;
-        static int stashMonCount[16] = {0}, ddrMonCount[16] = {0};
-        static int stLoadMonCount[16] = {0}, stFlushMonCount[16] = {0};
-        static int extractWrMonCount[16] = {0}, evictMonCount[16] = {0};
+        static int stashMonCount[64] = {0}, ddrMonCount[64] = {0};
+        static int stLoadMonCount[64] = {0}, stFlushMonCount[64] = {0};
+        static int extractWrMonCount[64] = {0}, evictMonCount[64] = {0};
 
         // S_STASH_READ (12): reading from line_buf to client after HBM load
         if (fsm == 12 && stashMonCount[instanceId] < 50) {
@@ -1084,7 +1093,7 @@ void OramDevice::tick()
                    (int)currentOpIsPcie,
                    (int)currentOpIsWrite,
                    (int)pendingReadSends.size(), (int)rQueue.size(),
-                   (int)oram->oram_busy, (int)oram->client_done,
+                   (int)oram->oram_busy, (int)(oram->client_done & 0x1),
                    (int)oram->client_req,
                    (int)oram->init_mode, (int)oram->pm_busy_out,
                    (int)oram->mgmt_req, (int)oram->mgmt_ack,
@@ -1117,7 +1126,7 @@ void OramDevice::tick()
     // This catches the multi-instance shared-HBM bug where an HT op's
     // st_ext_busy lingers into S_DDR_READ/S_DDR_WRITE.
     {
-        static uint64_t muxConflictCount[16] = {0};
+        static uint64_t muxConflictCount[64] = {0};
         uint8_t fsm = oram->dbg_oram_state;
         bool bucketPhase = (fsm == 2 || fsm == 19);  // S_DDR_READ or S_DDR_WRITE
         bool selStash = (oram->sel_stash_out != 0);
@@ -1171,35 +1180,9 @@ void OramDevice::tick()
     // completes but we never see it (deadlock: writeInitIdx never
     // advances, same slot re-sent forever).
     uint8_t doneMask = (uint8_t)(1u << activeHwClient);
-
-    // Deadlock E diagnostic: log every tick during WRITE_INIT where
-    // client_done has ANY bit set, or every 500 cycles for idle state.
-    if (ctrlState == OramState::WRITE_INIT) {
-        uint8_t cd = oram->client_done;
-        if (cd || (oramCycle % 500 == 0)) {
-            inform("WRITE_INIT-DIAG[%s] cyc=%lu wrIdx=%d activeHw=%u "
-                   "doneMask=0x%x client_done=0x%x oram_busy=%d "
-                   "access_viol=0x%x fsm=%d",
-                   name(), oramCycle, writeInitIdx, activeHwClient,
-                   (int)doneMask, (int)cd, (int)oram->oram_busy,
-                   (int)oram->access_violation,
-                   (int)oram->dbg_oram_state);
-        }
-    }
-
-    // Deadlock E fix: during WRITE_INIT only one op is ever in flight.
-    // When writeInitIdx crosses the slotsPerClient boundary (e.g. slot 8
-    // with num_logical_clients=2), activeHwClient switches from 0 to 1,
-    // making doneMask=0x2. If the RTL's arbiter timing causes client_done
-    // to pulse on bit 0 instead of bit 1, completeOp() never fires and
-    // writeInitIdx never advances. Accept any client_done bit during
-    // WRITE_INIT since there's no ambiguity with a single op in flight.
-    uint8_t completionMask = (ctrlState == OramState::WRITE_INIT)
-                             ? ((1u << numLogicalClients) - 1) : doneMask;
-
     if ((ctrlState == OramState::PROCESSING ||
          ctrlState == OramState::WRITE_INIT) &&
-        (oram->client_done & completionMask))
+        (oram->client_done & doneMask))
         completeOp();
 
     // State machine
@@ -1292,7 +1275,7 @@ void OramDevice::tick()
                initSlotIdx, initPhase, grantPhase, writeInitIdx,
                opsCompleted, numOps,
                (int)oram->oram_busy, (int)oram->client_req,
-               (int)(oram->client_done),
+               (int)(oram->client_done & 0x1),
                (int)oram->init_mode, (int)oram->pm_busy_out,
                (int)oram->mgmt_req, (int)oram->mgmt_ack,
                (int)oram->dbg_pm_awvalid, (int)oram->dbg_pm_wvalid,
@@ -1331,9 +1314,8 @@ void OramDevice::checkRtlErrors()
              "(expected on first access to uninitialized data)", oramCycle);
         tagMismatchWarned = true;
     }
-    if (oram->access_violation)
-        fatal("ORAM RTL: access violation (0x%x) @ cycle %lu",
-              (int)oram->access_violation, oramCycle);
+    if (oram->access_violation & 0x1)
+        fatal("ORAM RTL: access violation @ cycle %lu", oramCycle);
 }
 
 // =============================================================================
@@ -1343,6 +1325,18 @@ void OramDevice::checkRtlErrors()
 bool OramDevice::sendPkt(PacketPtr pkt, bool isPcie)
 {
     if (isPcie) {
+        // Fast-path: bypass CXL timing during write-init.
+        // sendFunctional goes CxlModel→hostPort[0]→xbar→SSD/DDR5 backing
+        // store in zero sim-time.  SsdMemory::recvFunctional (and MemCtrl)
+        // fills read data / writes pmem and calls makeResponse().
+        // handleMemResp then either delivers read beats to rQueue or
+        // accumulates write responses in earlyWriteResps — the existing
+        // W-LAST path picks them up and pushes an immediate BRESP.
+        if (ctrlState == OramState::WRITE_INIT) {
+            pciePort.sendFunctional(pkt);
+            handleMemResp(pkt);   // pkt is deleted inside
+            return true;
+        }
         if (pcieBlocked) {
             DPRINTF(Oram, "[%lu] sendPkt: PCIe blocked (%s, wrQ=%d rdQ=%d)\n",
                     oramCycle, pkt->isWrite() ? "WR" : "RD",
@@ -2229,10 +2223,11 @@ void OramDevice::initNextSlot()
     if (initPhase == 0) {
         // Fill entire bucket region with dummy pattern via sendFunctional.
         // Write one full bucket (32KB) per call to minimize overhead.
-        // Only fill buckets we'll actually use (numSlots / SLOTS_PER_BUCKET),
-        // plus a margin. No need to fill 256 MB for 4 buckets.
-        int usedBuckets = ((int)numSlots + SLOTS_PER_BUCKET - 1) / SLOTS_PER_BUCKET;
-        int totalBuckets = std::min(usedBuckets + 8, (int)MAX_BUCKETS); // small margin
+        // Only fill buckets we'll actually use (numSlots / ORAM_C),
+        // where ORAM_C = 4 (nominal slots per bucket).
+        // No need to fill 256 MB for a few buckets.
+        int usedBuckets = ((int)numSlots + ORAM_C - 1) / ORAM_C;
+        int totalBuckets = std::min(usedBuckets, (int)MAX_BUCKETS);
         Addr totalBytes = (Addr)totalBuckets * BUCKET_BYTES;
 
         inform("[cyc %lu] DDR_FILL: writing %d buckets (%lu bytes, %lu MB) to HBM "
@@ -2357,8 +2352,8 @@ void OramDevice::initNextSlot()
 
     Addr slotAddr = LEASE_BASE + initSlotIdx * SLOT_SIZE;
     // 8 slots per bucket: 32 slots → 4 buckets
-    uint32_t bucketIdx = initSlotIdx / SLOTS_PER_BUCKET;
-    int posInBucket = initSlotIdx % SLOTS_PER_BUCKET;
+    uint32_t bucketIdx = initSlotIdx / ORAM_C;
+    int posInBucket = initSlotIdx % ORAM_C;
     if (bucketIdx >= MAX_BUCKETS)
         fatal("Slot %u -> bucket %u >= B=%d", initSlotIdx, bucketIdx, MAX_BUCKETS);
 
@@ -2373,10 +2368,10 @@ void OramDevice::initNextSlot()
         // This avoids narrow 2-byte writes.
 
         static constexpr int ENTRIES_PER_BEAT = AXI_DATA_BYTES / 2;  // 16
-        static uint8_t pmBeatBuf[16][AXI_DATA_BYTES];
-        static uint32_t pmCurrentBeat[16];
+        static uint8_t pmBeatBuf[64][AXI_DATA_BYTES];
+        static uint32_t pmCurrentBeat[64];
         // Initialize on first use
-        static bool pmInited[16] = {false};
+        static bool pmInited[64] = {false};
         if (!pmInited[instanceId]) {
             memset(pmBeatBuf[instanceId], 0, AXI_DATA_BYTES);
             pmCurrentBeat[instanceId] = 0xFFFFFFFF;
@@ -2451,9 +2446,9 @@ void OramDevice::initNextSlot()
         // we need to maintain the accumulated slot_list in software.
 
         // Accumulate in a per-instance array (reset when bucket changes)
-        static uint32_t accum_slot_list[16][4];
-        static uint32_t prev_bucket[16];
-        static bool bmInited[16] = {false};
+        static uint32_t accum_slot_list[64][4];
+        static uint32_t prev_bucket[64];
+        static bool bmInited[64] = {false};
         if (!bmInited[instanceId]) {
             memset(accum_slot_list[instanceId], 0, sizeof(accum_slot_list[instanceId]));
             prev_bucket[instanceId] = 0xFFFFFFFF;
@@ -2495,7 +2490,7 @@ void OramDevice::initNextSlot()
         oram->init_bm_wr_en = 1;
 
         if (initSlotIdx < 3 || initSlotIdx == (int)numSlots - 1
-            || posInBucket == SLOTS_PER_BUCKET - 1)
+            || posInBucket == ORAM_C - 1)
             inform("[cyc %lu] INIT bm: slot=%d bkt=%u pos=%d slotId=%u "
                    "fill=%d list=[0x%08x 0x%08x 0x%08x 0x%08x]",
                    oramCycle, initSlotIdx, bucketIdx, posInBucket, slotId,

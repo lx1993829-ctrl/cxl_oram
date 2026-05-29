@@ -272,9 +272,11 @@ class OramDevice : public ClockedObject
     static constexpr int BUCKET_BYTES = 32768;
     static constexpr Addr LEASE_BASE = 0x1000;
     static constexpr int SLOT_SIZE = 0x1000;
-    static constexpr int MAX_SLOTS = 32764;
-    static constexpr int MAX_BUCKETS = 8191;
-    static constexpr int SLOTS_PER_BUCKET = 8;
+    static constexpr int MAX_SLOTS = 32764;       // ORAM_N
+    static constexpr int MAX_BUCKETS = 8191;       // ORAM_B
+    static constexpr int ORAM_Z = 8;               // total positions per bucket (c + s)
+    static constexpr int ORAM_C = MAX_SLOTS / MAX_BUCKETS;  // = 4, nominal slots per bucket
+    static constexpr int SLOTS_PER_BUCKET = ORAM_Z; // backward compat (physical capacity)
 
     uint32_t localPct, numSlots, hbmSlotCount;
     bool currentOpIsPcie;
@@ -418,7 +420,7 @@ class OramDevice : public ClockedObject
     Addr currentOpAddr;
     uint32_t lastWrittenSlot;       // slot index of the last WRITE op
     std::set<uint32_t> writtenSlots; // slots that have been written at least once
-    uint32_t lastWrittenData[16];   // data written by the last WRITE op
+    uint32_t lastWrittenData[64];   // data written by the last WRITE op
 
     // Step 3 additions (cpu_driven mode):
     //   leaseTokens[i] holds the token returned by the RTL when lease i
