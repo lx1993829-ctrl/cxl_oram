@@ -133,9 +133,9 @@ parser.add_argument('--cache-warm-after', type=int, default=0,
 parser.add_argument('--nvme-bar0', type=lambda x: int(x, 0),
                     default=0x500000000,
                     help='Base address of NVMe BAR0 (controller registers + '
-                         'doorbells). Default 0x500000000 (20 GiB) to clearly '
-                         'sit above all DDR/HBM/SSD/ORAM ranges. The test '
-                         'binary reads this from argv to know where to MMIO.')
+                         'doorbells). Default 0x500000000 sits between the '
+                         'HBM aggregate and DDR aggregate in the current '
+                         'address layout. The test binary reads this from argv.')
 parser.add_argument('--nvme-bar0-size', type=lambda x: int(x, 0),
                     default=0x10000,
                     help='Size of NVMe BAR0 (must match NvmeSsdDevice). '
@@ -327,7 +327,10 @@ if need_oram:
         max_outstanding=512,
         max_outstanding_writes=512,
         flit_credits=128,
-        completion_buffer_depth=1024,
+        # Completion occupancy is tracked per returned beat, not just per
+        # request tag. Multi-instance ORAM can have several 4KB bursts
+        # returning at once, so size this above the shared tag pool.
+        completion_buffer_depth=max(2048, 1024 * N),
         host_inject_interval='1ns',
     )
     system.cxl.clk_domain = SrcClockDomain(clock='1GHz', voltage_domain=VoltageDomain())
@@ -487,13 +490,21 @@ for i, p in enumerate(processes):
     # the same LBA span that CXL SSD covers, sized at DDR_PER_INSTANCE
     # bytes (the ORAM bucket-storage size). LBA size is 512 B (matches
     # SimpleSSD sample.cfg).
+    a = per_instance_addrs(i)
+    common_tail = [
+        str(args.num_slots),
+        hex(a['cmd_ring']),
+        hex(a['result_buf']),
+        hex(a['ddr']),
+        hex(a['cmd_port']),
+    ]
     if args.use_nvme:
-        max_lba = DDR_PER_INSTANCE // 512  # = 131072 for 64 MB / 512
+        max_lba = DDR_PER_INSTANCE // 512
         p.cmd = [args.binary, str(N), str(i), str(args.n_iters),
-                 hex(args.nvme_bar0), str(max_lba), str(args.num_slots)]
+                 hex(args.nvme_bar0), str(max_lba)] + common_tail
     else:
         p.cmd = [args.binary, str(N), str(i), str(args.n_iters),
-                 '0', '0', str(args.num_slots)]
+                 '0', '0'] + common_tail
 
 system.workload = m5.objects.SEWorkload.init_compatible(args.binary)
 for i in range(N):

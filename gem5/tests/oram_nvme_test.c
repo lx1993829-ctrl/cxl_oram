@@ -252,8 +252,28 @@ int main(int argc, char **argv) {
     if (argc >= 7) num_slots_arg = (uint32_t)strtoul(argv[6], NULL, 0);
     else num_slots_arg = 16;
 
+    uint64_t cmd_ring_base_arg;
+    if (argc >= 8) cmd_ring_base_arg = strtoull(argv[7], NULL, 0);
+    else cmd_ring_base_arg = 0x600000000ULL;
+
+    uint64_t result_buf_base_arg;
+    if (argc >= 9) result_buf_base_arg = strtoull(argv[8], NULL, 0);
+    else result_buf_base_arg = 0x610000000ULL;
+
+    uint64_t oram_host_base_arg;
+    if (argc >= 10) oram_host_base_arg = strtoull(argv[9], NULL, 0);
+    else oram_host_base_arg = 0x700000000ULL;
+
+    uint64_t oram_cmd_base_arg;
+    if (argc >= 11) oram_cmd_base_arg = strtoull(argv[10], NULL, 0);
+    else oram_cmd_base_arg = 0x0E0000000ULL;
+
     se_printf_uint("|||max_lba", max_lba);
     se_printf_uint("|||num_slots", (uint64_t)num_slots_arg);
+    se_printf_hex("|||cmd_ring_base", cmd_ring_base_arg);
+    se_printf_hex("|||result_buf_base", result_buf_base_arg);
+    se_printf_hex("|||oram_host_base", oram_host_base_arg);
+    se_printf_hex("|||oram_cmd_base", oram_cmd_base_arg);
 
     bar0 = (volatile uint8_t *)bar0_addr;
 
@@ -462,10 +482,9 @@ int main(int argc, char **argv) {
     }
 
     /* ===================== STEP 8: Release ORAM gate ============== */
-    /* ORAM_CMD_BASE matches phase_d_layout.py. Per-instance 0. */
-    #define ORAM_CMD_BASE       0x0E0000000ULL
-    #define CMD_RING_BASE       0x400000000ULL
-    #define RESULT_BUF_BASE     0x410000000ULL
+    uint64_t oram_cmd_base = oram_cmd_base_arg;
+    uint64_t cmd_ring_base = cmd_ring_base_arg;
+    uint64_t result_buf_base = result_buf_base_arg;
     #define OFF_NUM_K           0x80
     #define OFF_TOKEN_BASE      0x84
     #define OFF_READY           0xC4
@@ -490,14 +509,14 @@ int main(int argc, char **argv) {
     #define TEST_SLOT_ORAM_ADDR (uint32_t)(ORAM_LEASE_BASE + TEST_SLOT_IDX * ORAM_SLOT_SIZE)
 
     se_puts("|||releasing ORAM gate\n");
-    *(volatile uint32_t *)(uintptr_t)(ORAM_CMD_BASE + OFF_GATE_RELEASE) = 1;
+    *(volatile uint32_t *)(uintptr_t)(oram_cmd_base + OFF_GATE_RELEASE) = 1;
 
     /* Wait for ORAM ready bit at 0xC4 */
     {
         const int MAX_POLLS = 50 * 1000 * 1000;
         int p = 0;
         while (p < MAX_POLLS) {
-            uint32_t r = *(volatile uint32_t *)(uintptr_t)(ORAM_CMD_BASE + OFF_READY);
+            uint32_t r = *(volatile uint32_t *)(uintptr_t)(oram_cmd_base + OFF_READY);
             if (r & 0x1) break;
             p++;
         }
@@ -508,7 +527,7 @@ int main(int argc, char **argv) {
         se_printf_uint("|||oram_ready_polls", (uint64_t)p);
     }
 
-    uint32_t K = *(volatile uint32_t *)(uintptr_t)(ORAM_CMD_BASE + OFF_NUM_K);
+    uint32_t K = *(volatile uint32_t *)(uintptr_t)(oram_cmd_base + OFF_NUM_K);
     if (K == 0 || K > 16) {
         se_eputs("|||FAIL invalid ORAM K\n");
         return 1;
@@ -517,7 +536,7 @@ int main(int argc, char **argv) {
     memset(lease_tokens, 0, sizeof(lease_tokens));
     for (uint32_t k = 0; k < K; k++) {
         lease_tokens[k] = *(volatile uint32_t *)(uintptr_t)
-            (ORAM_CMD_BASE + OFF_TOKEN_BASE + k * 4);
+            (oram_cmd_base + OFF_TOKEN_BASE + k * 4);
     }
     uint32_t slots_per_client = num_slots_arg / K;
     if (slots_per_client == 0) {
@@ -534,8 +553,8 @@ int main(int argc, char **argv) {
     }
 
     /* Init cmd_ring header */
-    *(volatile uint64_t *)(uintptr_t)(CMD_RING_BASE + RING_PROD_IDX_OFF) = 0;
-    *(volatile uint64_t *)(uintptr_t)(CMD_RING_BASE + RING_CONS_IDX_OFF) = 0;
+    *(volatile uint64_t *)(uintptr_t)(cmd_ring_base + RING_PROD_IDX_OFF) = 0;
+    *(volatile uint64_t *)(uintptr_t)(cmd_ring_base + RING_CONS_IDX_OFF) = 0;
 
     /* ===================== STEP 9: ORAM op loop with NVMe staging === */
     /* Each iter:
@@ -550,14 +569,14 @@ int main(int argc, char **argv) {
      * num_slots=32, every slot is a host slot. NVMe sees writes
      * across LBAs slot*64 (since BUCKET_SIZE_BYTES/LBA_SIZE = 64).
      *
-     * DDR5 slab base = host_base = 0x500000000 (per oram_addr_layout.py).
+     * DDR5 slab base is passed by the gem5 config (per oram_addr_layout.py).
      * Per-slot offset within slab assumed to start at slot*32KB
      * (this is the size of one bucket the RTL Reads/Writes per op).
      * The actual address ranges the RTL touches may differ; for a
      * smoke test, staging-then-restoring the same fixed window
      * still proves the NVMe + memcpy plumbing works correctly. */
     uint32_t n_iters = (argc >= 4) ? (uint32_t)strtoul(argv[3], NULL, 0) : 10;
-    #define ORAM_HOST_BASE           0x500000000ULL  /* DDR_SLAB_BASE */
+    uint64_t oram_host_base = oram_host_base_arg;
     #define BUCKET_SIZE_BYTES        IO_DATA_SIZE     /* 32 KB */
     #define LBAS_PER_SLOT            (BUCKET_SIZE_BYTES / LBA_SIZE)  /* 64 */
 
@@ -572,7 +591,7 @@ int main(int argc, char **argv) {
         uint32_t client_token    = lease_tokens[client_id];
         uint32_t slot_oram_addr  = ORAM_LEASE_BASE + slot_idx * ORAM_SLOT_SIZE;
         uint64_t slot_lba        = (uint64_t)slot_idx * LBAS_PER_SLOT;
-        uint64_t ddr5_slab_addr  = ORAM_HOST_BASE + (uint64_t)slot_idx * BUCKET_SIZE_BYTES;
+        uint64_t ddr5_slab_addr  = oram_host_base + (uint64_t)slot_idx * BUCKET_SIZE_BYTES;
 
         uint64_t op_w = (uint64_t)iter * 2;
         uint64_t op_r = op_w + 1;
@@ -624,7 +643,7 @@ int main(int argc, char **argv) {
          * ORAM Write op
          * ============================================================ */
         {
-            uint64_t base = CMD_RING_BASE + RING_ENTRIES_OFF
+            uint64_t base = cmd_ring_base + RING_ENTRIES_OFF
                           + (op_w % CMD_RING_DEPTH) * RING_ENTRY_BYTES;
             *(volatile uint32_t *)(uintptr_t)(base + 0x00) = slot_oram_addr;
             *(volatile uint32_t *)(uintptr_t)(base + 0x04) = client_token;
@@ -642,41 +661,21 @@ int main(int argc, char **argv) {
             *(volatile uint32_t *)(uintptr_t)(base + 0x3C) = 0;
 
             while ((op_w + 1 - *(volatile uint64_t *)(uintptr_t)
-                   (CMD_RING_BASE + RING_CONS_IDX_OFF)) > CMD_RING_DEPTH) { }
+                   (cmd_ring_base + RING_CONS_IDX_OFF)) > CMD_RING_DEPTH) { }
 
             *(volatile uint64_t *)(uintptr_t)
-                (CMD_RING_BASE + RING_PROD_IDX_OFF) = op_w + 1;
+                (cmd_ring_base + RING_PROD_IDX_OFF) = op_w + 1;
             *(volatile uint32_t *)(uintptr_t)
-                (ORAM_CMD_BASE + OFF_CMD_RING_DOORBELL) = 1;
+                (oram_cmd_base + OFF_CMD_RING_DOORBELL) = 1;
         }
 
-        /* Wait write completion */
-        {
-            const int MAX_POLLS = 50 * 1000 * 1000;
-            int p = 0;
-            while (p < MAX_POLLS) {
-                uint32_t c = *(volatile uint32_t *)
-                              (uintptr_t)(ORAM_CMD_BASE + OFF_CPU_OP_COUNT);
-                if (c >= op_w + 1) break;
-                p++;
-            }
-            if (p >= MAX_POLLS) {
-                se_eputs("|||FAIL ORAM write op timeout\n");
-                se_printf_uint("|||  iter", (uint64_t)iter);
-                se_printf_uint("|||  want_cpu_op_count", op_w + 1);
-                se_printf_uint("|||  got_cpu_op_count",
-                    (uint64_t)*(volatile uint32_t *)
-                    (uintptr_t)(ORAM_CMD_BASE + OFF_CPU_OP_COUNT));
-                return 1;
-            }
-        }
-        se_printf_uint("|||after_oram_write", (uint64_t)iter);
+        se_printf_uint("|||after_oram_write_submit", (uint64_t)iter);
 
         /* ============================================================
          * ORAM Read op
          * ============================================================ */
         {
-            uint64_t base = CMD_RING_BASE + RING_ENTRIES_OFF
+            uint64_t base = cmd_ring_base + RING_ENTRIES_OFF
                           + (op_r % CMD_RING_DEPTH) * RING_ENTRY_BYTES;
             *(volatile uint32_t *)(uintptr_t)(base + 0x00) = slot_oram_addr;
             *(volatile uint32_t *)(uintptr_t)(base + 0x04) = client_token;
@@ -694,12 +693,12 @@ int main(int argc, char **argv) {
             *(volatile uint32_t *)(uintptr_t)(base + 0x3C) = 0;
 
             while ((op_r + 1 - *(volatile uint64_t *)(uintptr_t)
-                   (CMD_RING_BASE + RING_CONS_IDX_OFF)) > CMD_RING_DEPTH) { }
+                   (cmd_ring_base + RING_CONS_IDX_OFF)) > CMD_RING_DEPTH) { }
 
             *(volatile uint64_t *)(uintptr_t)
-                (CMD_RING_BASE + RING_PROD_IDX_OFF) = op_r + 1;
+                (cmd_ring_base + RING_PROD_IDX_OFF) = op_r + 1;
             *(volatile uint32_t *)(uintptr_t)
-                (ORAM_CMD_BASE + OFF_CMD_RING_DOORBELL) = 1;
+                (oram_cmd_base + OFF_CMD_RING_DOORBELL) = 1;
         }
 
         /* Wait read completion */
@@ -708,7 +707,7 @@ int main(int argc, char **argv) {
             int p = 0;
             while (p < MAX_POLLS) {
                 uint32_t c = *(volatile uint32_t *)
-                              (uintptr_t)(ORAM_CMD_BASE + OFF_CPU_OP_COUNT);
+                              (uintptr_t)(oram_cmd_base + OFF_CPU_OP_COUNT);
                 if (c >= op_r + 1) break;
                 p++;
             }
@@ -718,14 +717,14 @@ int main(int argc, char **argv) {
                 se_printf_uint("|||  want_cpu_op_count", op_r + 1);
                 se_printf_uint("|||  got_cpu_op_count",
                     (uint64_t)*(volatile uint32_t *)
-                    (uintptr_t)(ORAM_CMD_BASE + OFF_CPU_OP_COUNT));
+                    (uintptr_t)(oram_cmd_base + OFF_CPU_OP_COUNT));
                 return 1;
             }
         }
-        se_printf_uint("|||after_oram_read", (uint64_t)iter);
+        se_printf_uint("|||after_oram_pair", (uint64_t)iter);
 
         /* ---- Verify ORAM rdata ---- */
-        uint64_t res_addr = RESULT_BUF_BASE + op_r * 64;
+        uint64_t res_addr = result_buf_base + op_r * 64;
         uint64_t status = *(volatile uint64_t *)
                           (uintptr_t)(res_addr + RES_STATUS_OFF);
         se_printf_hex("|||  result_status", status);

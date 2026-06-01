@@ -39,10 +39,12 @@ grep -F "|||" m5out/nvme_io_stdout.log | grep -aE "PASS|FAIL|verify|mismatches"
 cd /home/ylu18/luoresearch/cxl_oram/gem5
 export LD_LIBRARY_PATH=/home/ylu18/miniconda3/lib:$LD_LIBRARY_PATH
 
+# Use the config default NVMe BAR0. Do not set --nvme-bar0=0x600000000;
+# 0x600000000 is the DDR aggregate/cmd-ring region in the current layout.
+
 ./build/ALL/gem5.opt configs/oram_cmd_port_test_phaseD_ssd.py \
     --binary=tests/nvme_io_test \
     --use-nvme \
-    --nvme-bar0=0x600000000 \
     > m5out/nvme_io_stdout.log 2>&1
 
 grep -F "|||" m5out/nvme_io_stdout.log | grep -aE "PASS|FAIL|verify|mismatches"
@@ -57,24 +59,24 @@ grep -F "|||" m5out/nvme_io_stdout.log | grep -aE "PASS|FAIL|verify|mismatches"
     --n-iters=1 \
     > m5out/oram_nvme_stdout.log 2>&1
 grep -F "|||" m5out/oram_nvme_stdout.log | grep -aE "PASS|FAIL|iter_pass|iter_fail|verify"
-        
+
+cd /home/ylu18/luoresearch/cxl_oram/gem5        
 export LD_LIBRARY_PATH=/home/ylu18/miniconda3/lib:$LD_LIBRARY_PATH
 
 ./build/ALL/gem5.opt configs/oram_cmd_port_test_phaseD_ssd.py \
     --binary=tests/oram_nvme_test \
     --use-nvme \
     --n-iters=1 \
-    --nvme-bar0=0x600000000 \
     > m5out/oram_nvme_stdout.log 2>&1
 
 grep -F "|||" m5out/oram_nvme_stdout.log | grep -aE "PASS|FAIL|iter_pass|iter_fail|verify"
 
 # Full pipeline regression: crosses the default client0/client1 lease boundary.
+cd /home/ylu18/luoresearch/cxl_oram/gem5
 ./build/ALL/gem5.opt configs/oram_cmd_port_test_phaseD_ssd.py \
     --binary=tests/oram_nvme_test \
     --use-nvme \
     --n-iters=10 \
-    --nvme-bar0=0x600000000 \
     > m5out/oram_nvme_n10_stdout.log 2>&1
 
 grep -F "|||" m5out/oram_nvme_n10_stdout.log | grep -aE "PASS|FAIL|iter_pass|iter_fail|verify"
