@@ -100,7 +100,10 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--binary',         type=str, required=True)
 parser.add_argument('--num-instances',  type=int, default=1)
 parser.add_argument('--num-slots',      type=int, default=16)
-parser.add_argument('--num-ops',        type=int, default=1)
+parser.add_argument('--num-ops',        type=int, default=20,
+                    help='Total ops per instance (writes + reads). '
+                         'Must be even. Binary gets n_iters = num_ops/2. '
+                         'Default 20 (= 10 write + 10 read).')
 parser.add_argument('--local-pct',      type=int, default=0)
 
 # Backend selection (mutually exclusive)
@@ -117,10 +120,6 @@ parser.add_argument('--ssd-config',     type=str,
                     default='src/mem/ssd/simplessd/config/sample.cfg',
                     help='Path to SimpleSSD config file (used by both '
                          '--use-ssd and --use-nvme).')
-parser.add_argument('--n-iters',        type=int, default=10,
-                    help='Number of write+read iteration pairs the test '
-                         'binary submits. Total ops = 2 * n_iters. '
-                         'Default 10 (= 20 ops). Use 1 for quick SSD tests.')
 parser.add_argument('--dram-cache',     type=str, default='0B',
                     help='On-device DRAM cache size for SsdMemory '
                          '(e.g. 4MB). 0B = disabled. Ignored for --use-nvme.')
@@ -133,9 +132,9 @@ parser.add_argument('--cache-warm-after', type=int, default=0,
 parser.add_argument('--nvme-bar0', type=lambda x: int(x, 0),
                     default=0x500000000,
                     help='Base address of NVMe BAR0 (controller registers + '
-                         'doorbells). Default 0x500000000 sits between the '
-                         'HBM aggregate and DDR aggregate in the current '
-                         'address layout. The test binary reads this from argv.')
+                         'doorbells). Default 0x500000000 (20 GiB) to clearly '
+                         'sit above all DDR/HBM/SSD/ORAM ranges. The test '
+                         'binary reads this from argv to know where to MMIO.')
 parser.add_argument('--nvme-bar0-size', type=lambda x: int(x, 0),
                     default=0x10000,
                     help='Size of NVMe BAR0 (must match NvmeSsdDevice). '
@@ -210,10 +209,23 @@ nvme_bar0_range = (AddrRange(args.nvme_bar0, size=args.nvme_bar0_size)
 # this build's PCIe model (HostSend→HostResp = 54.2 ns observed in
 # pcie_model.cc:2293 trace). This makes the timing comparable to the
 # DDR5 aggregate without the address-translation conflicts.
-NVME_SHARED_BASE = 0x220000000
+# Bug fix A1+A2: was 0x220000000 which overlaps HBM instance 9 at N>=10.
+# Moved INSIDE DDR_AGG so the existing 8-channel DDR5 controllers serve
+# it — both CPU loads/stores and NVMe DMAs route through cxl_host_xbar
+# to the same DDR5 backing, no separate SimpleMemory needed.
+# Offset 0x020000000 sits safely after result_buf (ends +0x011000000
+# at N=16) and before DDR slabs (start +0x100000000).
+NVME_SHARED_BASE = DDR_AGG_BASE + 0x020000000
 NVME_SHARED_SIZE = 0x01000000  # 16 MB
 nvme_shared_range = (AddrRange(NVME_SHARED_BASE, size=NVME_SHARED_SIZE)
                      if args.use_nvme else None)
+
+# Sanity: NVME_SHARED must sit inside DDR_AGG and not overlap result_buf or DDR slabs.
+_result_buf_end = RESULT_BUF_BASE + N * 0x100000
+assert NVME_SHARED_BASE >= _result_buf_end, \
+    f"NVME_SHARED 0x{NVME_SHARED_BASE:x} overlaps result_buf ending at 0x{_result_buf_end:x}"
+assert NVME_SHARED_BASE + NVME_SHARED_SIZE <= DDR_SLAB_BASE, \
+    f"NVME_SHARED end 0x{NVME_SHARED_BASE+NVME_SHARED_SIZE:x} overlaps DDR slabs at 0x{DDR_SLAB_BASE:x}"
 
 
 # =============================================================================
@@ -224,15 +236,16 @@ system.clk_domain = SrcClockDomain(clock='3GHz', voltage_domain=VoltageDomain())
 system.mem_mode = 'timing'
 system.mem_ranges = [main_range, ddr_agg_range,
                      cmd_combined_range] + hbm_ranges
-if ssd_range:
-    system.mem_ranges.append(ssd_range)
+# Bug fix A3: ssd_range NOT added to mem_ranges. SsdMemory.port
+# advertises its range to cxl_host_xbar for routing. Adding it to
+# mem_ranges causes gem5 SE mode to calloc a SECOND backing store for
+# the same range — wasting 4 GB host RAM at N=16. The CPU never
+# accesses SSD addresses directly; only ORAM does via CXL.
 if nvme_bar0_range:
     system.mem_ranges.append(nvme_bar0_range)
-# DISABLED: adding nvme_shared_range to mem_ranges puts it in SE-mode
-# memPools, which lets glibc heap overwrite our queues. SimpleMemory.range=
-# is enough for routing; mem_ranges is for SE-mode RAM allocation only.
-# if nvme_shared_range:
-#     system.mem_ranges.append(nvme_shared_range)
+# nvme_shared_range is inside DDR_AGG (see NVME_SHARED_BASE definition),
+# so ddr_agg_range already covers it. Do NOT add separately — SE-mode
+# memPools would let glibc heap overwrite our queues.
 
 # --- CPU + caches ---
 system.cpu = [X86TimingSimpleCPU(cpu_id=i) for i in range(N)]
@@ -281,7 +294,7 @@ if need_oram:
             oram_freq='300MHz',
             local_pct=args.local_pct,
             num_slots=args.num_slots,
-            gated_start = True,
+            gated_start = args.use_nvme,
             num_ops=args.num_ops,
             hbm_base       = a['hbm'],
             host_base      = oram_host_base,
@@ -323,14 +336,11 @@ if need_oram:
         gen=5,
         lanes=16,
         cxl_core_clock='1ns',
-        max_tags=1024,
-        max_outstanding=512,
-        max_outstanding_writes=512,
+        max_tags=256,
+        max_outstanding=64,
+        max_outstanding_writes=128,
         flit_credits=128,
-        # Completion occupancy is tracked per returned beat, not just per
-        # request tag. Multi-instance ORAM can have several 4KB bursts
-        # returning at once, so size this above the shared tag pool.
-        completion_buffer_depth=max(2048, 1024 * N),
+        completion_buffer_depth=2048,
         host_inject_interval='1ns',
     )
     system.cxl.clk_domain = SrcClockDomain(clock='1GHz', voltage_domain=VoltageDomain())
@@ -368,35 +378,26 @@ if args.use_ssd:
     system.ssd_mem = SsdMemory(
         ssd_config=args.ssd_config,
         range=AddrRange(SSD_BASE, size=SSD_TOTAL),
-        coalesce_window='0ns',
+        coalesce_window='500ns',
         dram_cache_size=args.dram_cache,
         dram_cache_warm_after=args.cache_warm_after,
     )
     system.ssd_mem.port = system.cxl_host_xbar.mem_side_ports
 
 # --- NVMe shared region (--use-nvme, Option Z) ---
-# Dedicated SimpleMemory backing the NVMe queues, PRP pool, and stage
-# buffers. Both CPU loads/stores (CPU → membus → cpu_fabric_bridge →
-# cxl_host_xbar) and NVMe DMAs (nvme_ssd.dma → system.pcie →
-# cxl_host_xbar) hit this same memory, so CPU↔device aliasing is
-# trivially consistent. 55 ns latency calibrated against measured DDR5
-# round-trip from the existing PCIe model.
-if nvme_shared_range:
-    system.nvme_shared = SimpleMemory(
-        range=nvme_shared_range,
-        latency='55ns',
-    )
-    system.nvme_shared.port = system.cxl_host_xbar.mem_side_ports
+# NVMe queues (ASQ/ACQ/IOSQ/IOCQ), PRP-list pool, and stage buffers
+# live at NVME_SHARED_BASE, which is inside DDR_AGG. The 8-channel DDR5
+# controllers already claim and serve this address range. Both CPU
+# loads/stores (CPU → membus → cpu_fabric_bridge → cxl_host_xbar) and
+# NVMe DMAs (nvme_ssd.dma → system.pcie → cxl_host_xbar) hit the same
+# DDR5 backing — no separate SimpleMemory needed.
 
 # --- CPU traffic through fabric ---
-# CPU accesses to cmd_ring/result_buf go directly into cxl_host_xbar,
-# bypassing the CxlModel (avoids contention with ORAM traffic).
-# Build the list of ranges the CPU-side fabric bridge forwards to the
-# host xbar. Always includes DDR5; under --use-nvme also includes the
-# dedicated SimpleMemory range backing NVMe queues + stage buffers.
+# CPU accesses to cmd_ring/result_buf/nvme_shared go directly into
+# cxl_host_xbar, bypassing the CxlModel (avoids contention with ORAM
+# traffic). All these ranges are inside DDR_AGG, so the single
+# ddr_agg_range bridge entry covers everything.
 fabric_bridge_ranges = [ddr_agg_range]
-if nvme_shared_range:
-    fabric_bridge_ranges.append(nvme_shared_range)
 
 system.cpu_fabric_bridge = Bridge(
     delay='2ns',
@@ -490,21 +491,12 @@ for i, p in enumerate(processes):
     # the same LBA span that CXL SSD covers, sized at DDR_PER_INSTANCE
     # bytes (the ORAM bucket-storage size). LBA size is 512 B (matches
     # SimpleSSD sample.cfg).
-    a = per_instance_addrs(i)
-    common_tail = [
-        str(args.num_slots),
-        hex(a['cmd_ring']),
-        hex(a['result_buf']),
-        hex(a['ddr']),
-        hex(a['cmd_port']),
-    ]
     if args.use_nvme:
-        max_lba = DDR_PER_INSTANCE // 512
-        p.cmd = [args.binary, str(N), str(i), str(args.n_iters),
-                 hex(args.nvme_bar0), str(max_lba)] + common_tail
+        max_lba = DDR_PER_INSTANCE // 512  # = 131072 for 64 MB / 512
+        p.cmd = [args.binary, str(N), str(i), str(args.num_ops // 2),
+                 hex(args.nvme_bar0), str(max_lba)]
     else:
-        p.cmd = [args.binary, str(N), str(i), str(args.n_iters),
-                 '0', '0'] + common_tail
+        p.cmd = [args.binary, str(N), str(i), str(args.num_ops // 2)]
 
 system.workload = m5.objects.SEWorkload.init_compatible(args.binary)
 for i in range(N):
@@ -555,17 +547,17 @@ print('=' * 60)
 print(f'oram_cmd_port_test_phaseD (CXL): N={N}')
 print(f'  fabric:  CxlModel(gen=5, lanes=16, core_clock=1ns) shared')
 print(f'  HBM:     {N} controllers, [0x{HBM_BASE:09x}, 0x{HBM_BASE + N*HBM_PER_INSTANCE:09x})')
-print(f'  DDR5:    8 channels, [0x{DDR_AGG_BASE:09x}, 0x{DDR_AGG_BASE + ddr_agg_size:09x}) (incl. cmd_ring + result_buf)')
+print(f'  DDR5:    {NUM_DDR5_CHANNELS} channels, [0x{DDR_AGG_BASE:09x}, 0x{DDR_AGG_BASE + ddr_agg_size:09x}) (incl. cmd_ring + result_buf)')
 if args.use_ssd:
     print(f'  SSD:     [0x{SSD_BASE:09x}, 0x{SSD_BASE + SSD_TOTAL:09x}) (ORAM bucket storage)')
     print(f'           config: {args.ssd_config}')
 elif args.use_nvme:
     print(f'  NVMe:    BAR0 at [0x{args.nvme_bar0:09x}, '
           f'0x{args.nvme_bar0 + args.nvme_bar0_size:09x})')
-    print(f'           DMA -> system.pcie (Gen5 x4) -> cxl_host_xbar -> nvme_shared')
+    print(f'           DMA -> system.pcie (Gen5 x4) -> cxl_host_xbar -> DDR5')
     print(f'           shared (queues + stage bufs): '
           f'[0x{NVME_SHARED_BASE:09x}, 0x{NVME_SHARED_BASE + NVME_SHARED_SIZE:09x}) '
-          f'SimpleMemory @ 55 ns')
+          f'(inside DDR5 aggregate)')
     print(f'           config: {args.ssd_config}')
 else:
     print(f'  SSD:     disabled (ORAM buckets in DDR5)')
