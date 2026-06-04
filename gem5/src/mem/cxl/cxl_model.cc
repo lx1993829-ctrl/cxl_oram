@@ -45,6 +45,8 @@ CxlModel::CxlModel(const Params &p)
       // .hh:188-191 — Link serialization shared state
       upstreamBusyUntil(0),
       downstreamBusyUntil(0),
+      rcDownstreamBusyUntil(0),
+      rcUpstreamBusyUntil(0),
       // .hh:279-292 — Pipeline events (declaration order)
       drainDeviceEvent([this]{ drainDeviceRequests(); }, name()),
       upstreamEvent([this]{ processUpstreamQueue(); }, name()),
@@ -93,8 +95,13 @@ CxlModel::CxlModel(const Params &p)
     // Pools are full per port (NOT split) — realistic for separate
     // AXI masters with their own controller channels.
     outstandingWrites.resize(devicePorts.size(), 0);
-    flitCreditsMax.assign(devicePorts.size(), p.flit_credits);
-    flitCredits.assign(devicePorts.size(), p.flit_credits);
+    // FLIT credits: shared pool. All ports compete for one link budget
+    // (stored at index 0). Natural contention at high N.
+    unsigned N = devicePorts.size();
+    flitCreditsMax.assign(devicePorts.size(), 0);
+    flitCredits.assign(devicePorts.size(), 0);
+    flitCreditsMax[0] = p.flit_credits;
+    flitCredits[0] = p.flit_credits;
     deferredFlitCredits.resize(devicePorts.size());
     upstreamQueue.resize(devicePorts.size());
     downstreamQueue.resize(devicePorts.size());
@@ -142,6 +149,7 @@ CxlModel::CxlModel(const Params &p)
     nextRetryPort = 0;
     maxOutstanding = p.max_outstanding;
     maxOutstandingWrites = p.max_outstanding_writes;
+    // Completion buffer: per-port occupancy tracking.
     rootPortDelay = p.root_port_delay;
     // hostSendSpacing removed — host xbar provides natural backpressure
 
@@ -582,9 +590,12 @@ CxlModel::handleDeviceRequest(PacketPtr pkt, int srcPort)
         respPkt->senderState = pkt->senderState;
         pkt->senderState = nullptr;
 
-        responseQueue[srcPort].push_back({respPkt, srcPort});
+        Tick deliverAt = curTick() + endpointDelay;
+        responseQueue[srcPort].push_back({respPkt, srcPort, deliverAt});
         if (!responseEvent.scheduled())
-            schedule(responseEvent, curTick() + endpointDelay);
+            schedule(responseEvent, deliverAt);
+        else if (deliverAt < responseEvent.when())
+            reschedule(responseEvent, deliverAt);
 
         lastBrespDelivered = curTick() + endpointDelay;
         perPortBrespsDelivered[srcPort]++;  // Debug: per-port BRESP counter
@@ -643,9 +654,9 @@ CxlModel::processBufferedRead(PacketPtr pkt, int srcPort)
     // before allocateTag).
     if (!hasFreeTags())
         return false;
-    if (flitCreditsMax[srcPort] > 0 && flitCredits[srcPort] == 0) {
+    if (flitCreditsMax[0] > 0 && flitCredits[0] == 0) {
         DPRINTF(CXL, "  RD FLIT CREDIT STALL: port=%d credits=%u/%u\n",
-                srcPort, flitCredits[srcPort], flitCreditsMax[srcPort]);
+                srcPort, flitCredits[0], flitCreditsMax[0]);
         return false;
     }
 
@@ -749,13 +760,13 @@ CxlModel::processBufferedWrite(PacketPtr pkt, int srcPort)
 
     // FLIT credit gate. Posted writes consume upstream FLIT credits.
     // With FLIT_SIZE=256 capacity: 256B write = 1 FLIT = 1 credit.
-    if (flitCreditsMax[srcPort] > 0) {
+    if (flitCreditsMax[0] > 0) {
         unsigned expectedFlits = (maxPayload + FLIT_SIZE - 1) / FLIT_SIZE;
         if (expectedFlits == 0) expectedFlits = 1;
-        if (flitCredits[srcPort] < expectedFlits) {
+        if (flitCredits[0] < expectedFlits) {
             DPRINTF(CXL, "  WR FLIT CREDIT STALL: port=%d credits=%u/%u "
                     "need=%u\n",
-                    srcPort, flitCredits[srcPort], flitCreditsMax[srcPort],
+                    srcPort, flitCredits[0], flitCreditsMax[0],
                     expectedFlits);
             return false;
         }
@@ -985,7 +996,7 @@ void CxlModel::processUpstreamQueue()
                upstreamQueue[sp].front().readyTick <= now) {
 
             // Per-port FLIT credit check
-            if (flitCreditsMax[sp] > 0 && flitCredits[sp] == 0) {
+            if (flitCreditsMax[0] > 0 && flitCredits[0] == 0) {
                 DPRINTF(CXL, "  [UP] port=%u FLIT credit stall @%llu\n",
                         sp, now);
                 break;  // try other ports; this one waits for return
@@ -1009,19 +1020,19 @@ void CxlModel::processUpstreamQueue()
             // Consume FLIT credits from this port's pool — one credit
             // per wire FLIT (256B). A 256B write that requires 2 wire
             // FLITs consumes 2 credits.
-            if (flitCreditsMax[sp] > 0) {
+            if (flitCreditsMax[0] > 0) {
                 unsigned wireFlits = (flit.wireBytes + FLIT_SIZE - 1) / FLIT_SIZE;
                 if (wireFlits == 0) wireFlits = 1;
                 // If not enough credits, stall — try other ports
-                if (flitCredits[sp] < wireFlits) {
+                if (flitCredits[0] < wireFlits) {
                     DPRINTF(CXL, "  [UP] port=%u FLIT credit stall: "
                             "need=%u have=%u @%llu\n",
-                            sp, wireFlits, flitCredits[sp], now);
+                            sp, wireFlits, flitCredits[0], now);
                     // Push back — we already popped, need to re-insert
                     upstreamQueue[sp].push_front(std::move(flit));
                     break;
                 }
-                flitCredits[sp] -= wireFlits;
+                flitCredits[0] -= wireFlits;
                 for (unsigned fc = 0; fc < wireFlits; fc++) {
                     DeferredFlitCredit dc;
                     dc.returnTick = now + flitCreditReturnDelay;
@@ -1031,11 +1042,20 @@ void CxlModel::processUpstreamQueue()
                     schedule(flitCreditEvent, now + flitCreditReturnDelay);
             }
 
-            // RC traversal (shared — RC pipeline is one physical stage,
-            // burst window applies across all ports). rcLatency (150ns)
-            // already includes full one-way RC path.
-            Tick rcDelay = computeRcDelay(lastUpstreamRcTick);
-            Tick earliestSend = std::max(now + rcDelay, curTick() + 1);
+            // Upstream RC pipeline (shared, serialized) — same model as
+            // downstream. Cold = pipeline idle. Warm = serialize at
+            // rcThroughputDelay via rcUpstreamBusyUntil.
+            bool rcColdUp = (now > rcUpstreamBusyUntil + burstWindowTicks);
+            Tick rcStartUp, rcEndUp;
+            if (rcColdUp) {
+                rcStartUp = now + rcLatency;
+                rcEndUp = rcStartUp;
+            } else {
+                rcStartUp = std::max(now, rcUpstreamBusyUntil);
+                rcEndUp = rcStartUp + rcThroughputDelay;
+            }
+            rcUpstreamBusyUntil = rcEndUp;
+            Tick earliestSend = std::max(rcEndUp, curTick() + 1);
             unsigned moved = 0;
 
             if (flit.type == FlitType::ReadReq) {
@@ -1062,8 +1082,8 @@ void CxlModel::processUpstreamQueue()
                     moved++;
                 }
                 DPRINTF(CXL, "  [UP] port=%u Read FLIT done: tag=%u "
-                        "expanded=%u rcDelay=%llu @%llu\n",
-                        sp, flit.tag, moved, rcDelay, now);
+                        "expanded=%u cold=%d rcEnd=%llu @%llu\n",
+                        sp, flit.tag, moved, rcColdUp, rcEndUp, now);
 
             } else if (flit.type == FlitType::WriteReq) {
                 for (auto *devicePkt : flit.allWritePkts) {
@@ -1089,8 +1109,8 @@ void CxlModel::processUpstreamQueue()
                 }
                 flit.allWritePkts.clear();
                 DPRINTF(CXL, "  [UP] port=%u Write FLIT done: expanded=%u "
-                        "rcDelay=%llu @%llu\n",
-                        sp, moved, rcDelay, now);
+                        "cold=%d rcEnd=%llu @%llu\n",
+                        sp, moved, rcColdUp, rcEndUp, now);
 
             } else {
                 DPRINTF(CXL, "  [UP] UNEXPECTED non-request FLIT type\n");
@@ -1230,13 +1250,11 @@ bool CxlModel::handleHostResponse(PacketPtr pkt)
         // Bug 2: coarse gate here; retryStarvedPorts checks per-port room.
         {
             bool canRead = hasFreeTags();
-            bool canWrite = false;
-            for (unsigned sp = 0; sp < outstandingWrites.size(); sp++) {
-                if (maxOutstandingWrites == 0 ||
-                    outstandingWrites[sp] < maxOutstandingWrites) {
-                    canWrite = true; break;
-                }
-            }
+            unsigned totalWritesOut = 0;
+            for (unsigned sp = 0; sp < outstandingWrites.size(); sp++)
+                totalWritesOut += outstandingWrites[sp];
+            bool canWrite = (maxOutstandingWrites == 0 ||
+                             totalWritesOut < maxOutstandingWrites);
             if (canRead || canWrite)
                 retryStarvedPorts();
         }
@@ -1293,11 +1311,10 @@ bool CxlModel::handleHostResponse(PacketPtr pkt)
             completionBufferOccupied[orecPort], completionBufferDepth);
     if (completionBufferDepth > 0 &&
         completionBufferOccupied[orecPort] > completionBufferDepth) {
-        fatal("CXL: port=%d completion buffer occupancy %u exceeds "
-              "completion_buffer_depth=%u. Set completion_buffer_depth "
-              ">= max_tags (%u) to prevent this.\n",
-              orecPort, completionBufferOccupied[orecPort],
-              completionBufferDepth, maxTags);
+        warn("CXL: port=%d completion buffer occupancy %u exceeds "
+             "completion_buffer_depth=%u (shared pool, transient).\n",
+             orecPort, completionBufferOccupied[orecPort],
+             completionBufferDepth);
     }
 
     // Accumulate: record this beat. pkt is the individual host read
@@ -1332,25 +1349,17 @@ bool CxlModel::handleHostResponse(PacketPtr pkt)
     unsigned combinedBytes = orec.pendingCplBytes;
     unsigned combinedBeats = orec.pendingCplBeats.size();
 
-    // Downstream: RC traversal + CDC serialization, charged ONCE for
-    // the whole combined FLIT (not per beat). This is the big win.
-    Tick rcDelay = computeRcDelay(lastDownstreamRcTick);
-    Tick arriveEndpoint = curTick() + rcDelay;
+    // ================================================================
+    // Downstream delay: RC pipeline → Gen5 wire → per-port CDC → RTL
+    //
+    // Same two bugs as PCIe (see pcie_model.cc for full description):
+    //  Bug A: dead rcThroughputDelay — warm RC gave 0 instead of 5ns.
+    //  Bug B: CDC↔wire ordering — CDC-done dominated wire serialization.
+    // Fix: 3-stage serialized pipeline in physical order.
+    // ================================================================
+    Tick now = curTick();
 
-    // CDC serialization: 2 FPGA cycles per FLIT (not per beat). With
-    // RCB=128B combining, the CDC chain is 4x shorter.
-    // Bug #10 fix: fpgaClockPeriod now comes from Param (member), not
-    // a hardcoded 3333. Must match fpga_clock in the Python config.
-    const Tick cdcCycles = 2;
-    const Tick cdcThroughput = cdcCycles * fpgaClockPeriod;
-    int dstPort = ss->srcPortIdx;
-    Tick startCdc = std::max(arriveEndpoint, endpointBusyUntil[dstPort]);
-    Tick doneCdc = startCdc + cdcThroughput;
-    endpointBusyUntil[dstPort] = doneCdc;
-
-    // Build the combined cpl FLIT.
-    // CXL 3.0 fixed 256B FLITs carry up to 256B of completion data
-    // (4 × 64B DRS slots). Wire cost = ceil(payload / 256) * 256.
+    // Build the combined cpl FLIT first (need wireBytes for stage 2).
     unsigned cplWireBytes = ((combinedBytes + FLIT_SIZE - 1) / FLIT_SIZE)
                             * FLIT_SIZE;
 
@@ -1360,26 +1369,68 @@ bool CxlModel::handleHostResponse(PacketPtr pkt)
     cplFlit.tag = tag;
     cplFlit.addr = orec.pendingCplBeats.front().beatAddr;
     cplFlit.payloadBytes = combinedBytes;
-    cplFlit.origPkt = nullptr;  // not used for combined FLITs
+    cplFlit.origPkt = nullptr;
     cplFlit.issueTick = orec.issueTick;
     cplFlit.isLast = isLastForTag;
-    cplFlit.srcPortIdx = ss->srcPortIdx;
-    // Move the accumulated beat list into the FLIT. processDownstreamQueue
-    // iterates this and delivers each beat to its matching device pkt.
+    int dstPort = ss->srcPortIdx;
+    cplFlit.srcPortIdx = dstPort;
     cplFlit.combinedBeats = std::move(orec.pendingCplBeats);
     orec.pendingCplBeats.clear();
+
+    // Stage 1: RC pipeline (shared, serialized).
+    // Cold detection uses pipeline state (rcDownstreamBusyUntil), not
+    // DDR5 inter-arrival gap. See pcie_model.cc for full rationale.
+    bool rcCold = (now > rcDownstreamBusyUntil + burstWindowTicks);
+    Tick rcStart;
+    Tick rcEnd;
+    if (rcCold) {
+        rcStart = now + rcLatency;
+        rcEnd = rcStart;
+    } else {
+        rcStart = std::max(now, rcDownstreamBusyUntil);
+        rcEnd = rcStart + rcThroughputDelay;
+    }
+    rcDownstreamBusyUntil = rcEnd;
+    lastDownstreamRcTick = now;
+
+    // Stage 2: Shared Gen5 wire serialization.
+    Tick wireSerDelay = serializationDelay(cplFlit.wireBytes);
+    Tick wireStart = std::max(rcEnd, downstreamBusyUntil);
+    Tick wireEnd = wireStart + wireSerDelay;
+    downstreamBusyUntil = wireEnd;
+
+    // Stage 3: Per-port CDC endpoint — can't start until wire delivers.
+    const Tick cdcCycles = 2;
+    const Tick cdcThroughput = cdcCycles * fpgaClockPeriod;
+    Tick startCdc = std::max(wireEnd, endpointBusyUntil[dstPort]);
+    Tick doneCdc = startCdc + cdcThroughput;
+    endpointBusyUntil[dstPort] = doneCdc;
+    cplFlit.readyTick = doneCdc;
 
     DPRINTF(CXL, "  [COMBINE] FLUSH tag=%u %uB (%u beats) emitted=%u/%u "
             "isLast=%d @%llu\n",
             tag, combinedBytes, combinedBeats,
-            orec.emittedBytes, orec.totalBytes, isLastForTag, curTick());
+            orec.emittedBytes, orec.totalBytes, isLastForTag, now);
+    DPRINTF(CXL, "  [DN RC→WIRE→CDC] port=%d tag=%u wire=%u "
+            "rc=[%llu,%llu] wire=[%llu,%llu] cdc=[%llu,%llu]\n",
+            dstPort, tag, cplFlit.wireBytes,
+            rcStart, rcEnd, wireStart, wireEnd, startCdc, doneCdc);
 
     orec.pendingCplBytes = 0;
     orec.emittedBytes += combinedBytes;
 
-    enqueueDownstream(cplFlit, doneCdc);
+    // Push to per-port downstream queue at CDC-done time.
+    // Bypass enqueueDownstream (it would re-apply wire delay).
+    panic_if(dstPort < 0 || (unsigned)dstPort >= downstreamQueue.size(),
+             "CXL downstream: bad srcPortIdx=%d", dstPort);
+    downstreamQueue[dstPort].push_back(cplFlit);
     stats.totalWireBytes += cplFlit.wireBytes;
     stats.totalCompletionFlits++;
+
+    if (!downstreamEvent.scheduled())
+        schedule(downstreamEvent, doneCdc);
+    else if (downstreamEvent.when() > doneCdc)
+        reschedule(downstreamEvent, doneCdc);
 
     delete ss;
     // pkt ownership of the LAST beat transfers via cplFlit.combinedBeats
@@ -1473,7 +1524,8 @@ void CxlModel::processDownstreamQueue()
                     Tick latency = now - orec.issueTick;
 
                     // Phase A.1: per-port responseQueue
-                    responseQueue[srcPort].push_back({devPktForBeat, srcPort});
+                    responseQueue[srcPort].push_back(
+                        {devPktForBeat, srcPort, curTick()});
                     orec.completedBytes += devPktForBeat->getSize();
                     perPortReadsDelivered[srcPort]++;
                     lastProgressTick = curTick();
@@ -1482,6 +1534,10 @@ void CxlModel::processDownstreamQueue()
                     // Phase A.1: per-port completion buffer occupancy.
                     if (completionBufferOccupied[srcPort] > 0)
                         completionBufferOccupied[srcPort]--;
+                    // Completion buffer freed a slot — reschedule host send
+                    // to unblock reads that were backpressured.
+                    if (!hostSendEvent.scheduled())
+                        schedule(hostSendEvent, now);
                     DPRINTF(CXL, "  [CPLBUF-RETIRE] port=%d occ=%u/%u\n",
                             srcPort, completionBufferOccupied[srcPort],
                             completionBufferDepth);
@@ -1628,11 +1684,22 @@ void CxlModel::processFlitCreditReturn()
         while (!deferredFlitCredits[sp].empty() &&
                deferredFlitCredits[sp].front().returnTick <= now) {
             deferredFlitCredits[sp].pop_front();
-            flitCredits[sp] = std::min(flitCredits[sp] + 1,
-                                        flitCreditsMax[sp]);
+            flitCredits[0] = std::min(flitCredits[0] + 1,
+                                        flitCreditsMax[0]);
             DPRINTF(CXL, "  [CREDIT] port=%u FLIT credit returned: "
                     "%u/%u @%llu\n",
-                    sp, flitCredits[sp], flitCreditsMax[sp], now);
+                    sp, flitCredits[0], flitCreditsMax[0], now);
+        }
+    }
+
+    // Shared credit pool: wakeup drain if any port has buffered requests
+    if (!drainDeviceEvent.scheduled()) {
+        for (unsigned sp2 = 0; sp2 < n; sp2++) {
+            if (!deviceReadBuffers[sp2].empty() ||
+                !deviceWriteBuffers[sp2].empty()) {
+                schedule(drainDeviceEvent, curTick());
+                break;
+            }
         }
     }
 
@@ -1656,7 +1723,7 @@ void CxlModel::processFlitCreditReturn()
     // AND that port now has credits.
     bool wakeUpstream = false;
     for (unsigned sp = 0; sp < n; sp++) {
-        if (flitCredits[sp] > 0 && !upstreamQueue[sp].empty()) {
+        if (flitCredits[0] > 0 && !upstreamQueue[sp].empty()) {
             wakeUpstream = true; break;
         }
     }
@@ -1667,13 +1734,11 @@ void CxlModel::processFlitCreditReturn()
     // budget can now accept new requests.
     {
         bool canRead = hasFreeTags();
-        bool canWrite = false;
-        for (unsigned sp = 0; sp < outstandingWrites.size(); sp++) {
-            if (maxOutstandingWrites == 0 ||
-                outstandingWrites[sp] < maxOutstandingWrites) {
-                canWrite = true; break;
-            }
-        }
+        unsigned totalWritesOut = 0;
+        for (unsigned sp = 0; sp < outstandingWrites.size(); sp++)
+            totalWritesOut += outstandingWrites[sp];
+        bool canWrite = (maxOutstandingWrites == 0 ||
+                         totalWritesOut < maxOutstandingWrites);
         if (canRead || canWrite)
             retryStarvedPorts();
     }
@@ -1694,10 +1759,19 @@ void CxlModel::trySendResponses()
 
     // Round-robin starting from nextResponsePort so port 0 doesn't
     // permanently win when multiple ports are simultaneously ready.
+    Tick earliestPending = MaxTick;
     for (unsigned i = 0; i < n; i++) {
         unsigned sp = (nextResponsePort + i) % n;
         while (!responseQueue[sp].empty()) {
             auto &entry = responseQueue[sp].front();
+
+            // Skip entries whose readyTick hasn't arrived yet
+            if (entry.readyTick > curTick()) {
+                if (entry.readyTick < earliestPending)
+                    earliestPending = entry.readyTick;
+                break;  // FIFO — later entries can't be earlier
+            }
+
             PacketPtr pkt = entry.pkt;
             int portIdx = entry.portIdx;
 
@@ -1747,6 +1821,10 @@ void CxlModel::trySendResponses()
             }
         }
     }
+
+    // Reschedule for the earliest pending entry not yet ready
+    if (earliestPending != MaxTick && !responseEvent.scheduled())
+        schedule(responseEvent, earliestPending);
 
     if (pendingDeviceRetry) {
         pendingDeviceRetry = false;
@@ -1799,6 +1877,19 @@ void CxlModel::trySendToHost()
             unsigned portIdx = (pkt->getAddr() >> 6) % hostPorts.size();
 
             if (hostPorts[portIdx]->needRetry) {
+                ++it;
+                continue;
+            }
+
+            // Shared completion buffer backpressure: if this is a read
+            // and the buffer is full, skip — leave it queued until a
+            // completion drains and frees a slot.
+            if (pkt->isRead() && completionBufferDepth > 0 &&
+                completionBufferOccupied[sp] >= completionBufferDepth) {
+                DPRINTF(CXL, "  [HOSTSEND-CPLBUF-FULL] port=%u occ=%u/%u "
+                        "— backpressure read\n",
+                        sp, completionBufferOccupied[sp],
+                        completionBufferDepth);
                 ++it;
                 continue;
             }
@@ -2053,13 +2144,11 @@ CxlModel::dumpCxlState(const char *trigger)
            tagUtil, tagWarn);
 
     // ---- Writes + FLIT credits (per-port, Phase A.1) ----
-    unsigned totalOutWr = 0, totalFlitCr = 0, totalFlitCrMax = 0;
+    unsigned totalOutWr = 0;
     for (unsigned sp = 0; sp < outstandingWrites.size(); sp++)
         totalOutWr += outstandingWrites[sp];
-    for (unsigned sp = 0; sp < flitCredits.size(); sp++) {
-        totalFlitCr += flitCredits[sp];
-        totalFlitCrMax += flitCreditsMax[sp];
-    }
+    unsigned totalFlitCr = flitCredits[0];
+    unsigned totalFlitCrMax = flitCreditsMax[0];
     inform("  writes (total): outstanding=%u flitCredits=%u/%u",
            totalOutWr, totalFlitCr, totalFlitCrMax);
 
@@ -2206,8 +2295,8 @@ CxlModel::dumpPortState(unsigned p, const char *where)
            p < responseQueue.size() ? responseQueue[p].size() : 0);
     inform("  resources: flitCredits=%u/%u outWr=%u perPortRds=%u "
            "compBuf=%u defCred=%lu",
-           p < flitCredits.size() ? flitCredits[p] : 0,
-           p < flitCreditsMax.size() ? flitCreditsMax[p] : 0,
+           p < flitCredits.size() ? flitCredits[0] : 0,
+           p < flitCreditsMax.size() ? flitCreditsMax[0] : 0,
            p < outstandingWrites.size() ? outstandingWrites[p] : 0,
            p < perPortReadsOut.size() ? perPortReadsOut[p] : 0,
            p < completionBufferOccupied.size()
@@ -2244,10 +2333,10 @@ CxlModel::dumpPortState(unsigned p, const char *where)
 
     // FLIT credit exhaustion check.
     if (p < flitCredits.size() && p < flitCreditsMax.size() &&
-        flitCreditsMax[p] > 0 && flitCredits[p] == 0) {
+        flitCreditsMax[0] > 0 && flitCredits[0] == 0) {
         inform("  >>> CREDIT-STARVED: port=%u has 0/%u FLIT credits. "
                "Pending returns: %lu. If 0, credit return path is broken.",
-               p, flitCreditsMax[p],
+               p, flitCreditsMax[0],
                (p < deferredFlitCredits.size())
                    ? deferredFlitCredits[p].size() : 0);
     }

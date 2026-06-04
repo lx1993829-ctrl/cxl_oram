@@ -105,6 +105,8 @@ class CxlModel : public ClockedObject
     // crossing from host clock to 300MHz FPGA fabric, so CplDs for
     // different instances do not head-of-line-block each other.
     std::vector<Tick> endpointBusyUntil;
+    Tick rcDownstreamBusyUntil;  // Shared RC pipeline throughput (downstream)
+    Tick rcUpstreamBusyUntil;    // Shared RC pipeline throughput (upstream)
 
     // Burst-window RC helper — returns 0 if RC was recently traversed,
     // rcLatency otherwise. Updates the lastTick tracker.
@@ -317,6 +319,7 @@ class CxlModel : public ClockedObject
     struct ResponseEntry {
         PacketPtr pkt;
         int portIdx;
+        Tick readyTick;   // earliest tick this response may be delivered
     };
     // Phase A.1: per-port response queues. Each device port can be
     // independently blocked on sendTimingResp; one stalled port must
