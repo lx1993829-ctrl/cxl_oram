@@ -2,6 +2,8 @@
 #define __ORAM_ORAM_DEVICE_HH__
 
 #include <deque>
+#include <map>
+#include <array>
 #include <random>
 #include <set>
 #include <unordered_map>
@@ -112,6 +114,12 @@ class OramDevice : public ClockedObject
     // consumes the shadow (not the live signal) and clears the valid bit.
     uint32_t rdataShadow[2][8];
     bool     rdataShadowValid[2];
+    bool     rdataValidEverSeen[2];  // latch: was rdata_valid EVER seen this op?
+
+    // Deferred completion: latch client_done and wait for rdataShadow
+    // before calling completeOp() for READ ops.
+    bool     clientDoneSeen = false;
+    unsigned clientDoneWaitCycles = 0;
 
     // Step 5: sender-state tag attached to result-packet writes. Used by
     // MemPort::recvTimingResp to distinguish result-buffer completions
@@ -196,6 +204,12 @@ class OramDevice : public ClockedObject
         // Captured rdata
         uint32_t rdata[8];
         bool     rdata_valid;
+
+        // --- E2E timing (gem5 Ticks) ---
+        Tick fetchTick;      // when ring entry arrived / MMIO doorbell
+        Tick dispatchTick;   // when dispatched to RTL (IN_PROGRESS)
+        Tick rtlDoneTick;    // when RTL asserted client_done
+        Tick commitTick;     // when result WriteResp arrived (COMMITTED)
     };
 
     // Step 9: queue of pending+in-flight ops. Capacity = cmdQueueDepth
@@ -266,23 +280,54 @@ class OramDevice : public ClockedObject
     Addr hbmBase, hostBase, stashOffset;
 
     static constexpr int AXI_DATA_BYTES = 32;
+
+    // =====================================================================
+    // Off-chip metadata address map — MUST match oram_params.vh / pos_map.v.
+    // Stash deepened to 16384 entries (STASH_PTR_W=14) => 64 MB region, so
+    // every region above STASH shifted up by 60 MB vs the old 4 MB-stash map.
+    //
+    //   region            base (rel hbmBase)   size
+    //   STASH             0x10000000           64 MB (16384 x 4KB)
+    //   PM_BASE           0x14000000            1 MB
+    //   HT_SLOT_BASE      0x14100000            1 MB
+    //   HT_BKT_HEAD_BASE  0x14200000            1 MB
+    //   HT_BKT_NEXT_BASE  0x14300000            1 MB
+    //   IVT_BASE          0x14400000            4 MB (per-physical-slot, 2MB used)
+    // =====================================================================
+    static constexpr Addr STASH_BASE_ADDR     = 0x10000000;
+    static constexpr Addr STASH_REGION_BYTES  = 0x04000000;   // 64 MB
     // Must match pos_map.v PM_BASE parameter
-    static constexpr Addr PM_BASE_ADDR = 0x10400000;
+    static constexpr Addr PM_BASE_ADDR        = 0x14000000;
+    static constexpr Addr HT_SLOT_BASE_ADDR   = 0x14100000;
+    static constexpr Addr HT_BKT_HEAD_ADDR    = 0x14200000;
+    static constexpr Addr HT_BKT_NEXT_ADDR    = 0x14300000;
+    static constexpr Addr IVT_BASE_ADDR       = 0x14400000;
+    static constexpr Addr SLOT_R_BASE_ADDR    = 0x14800000;   // per-stash-entry slot addr
+    static constexpr Addr BUCKET_META_BASE_ADDR = 0x14900000; // per-bucket directory
+    // Metadata region begins at STASH_BASE_ADDR; everything >= this is HBM.
+    static constexpr Addr METADATA_REGION_START = STASH_BASE_ADDR;
+    static constexpr Addr HT_REGION_END       = BUCKET_META_BASE_ADDR + 0x00100000; // top of bucket_meta (1MB)
+
     static constexpr int BUCKET_ID_BITS = 13;  // must match `BUCKET_ID_W
     static constexpr int BUCKET_BYTES = 32768;
     static constexpr Addr LEASE_BASE = 0x1000;
     static constexpr int SLOT_SIZE = 0x1000;
-    static constexpr int MAX_SLOTS = 32764;       // ORAM_N
-    static constexpr int MAX_BUCKETS = 8191;       // ORAM_B
+    static constexpr int MAX_SLOTS = 32768;       // ORAM_N (compiled max)
+    static constexpr int MAX_BUCKETS = 8192;       // ORAM_B (compiled max)
     static constexpr int ORAM_Z = 8;               // total positions per bucket (c + s)
     static constexpr int ORAM_C = MAX_SLOTS / MAX_BUCKETS;  // = 4, nominal slots per bucket
     static constexpr int SLOTS_PER_BUCKET = ORAM_Z; // backward compat (physical capacity)
+    // Stash compiled for max (16384). Runtime uses numSlots/2.
+    static constexpr int STASH_DEPTH = 16384;
 
     uint32_t localPct, numSlots, hbmSlotCount;
     bool currentOpIsPcie;
 
     bool isStashAddr(Addr axiAddr);
     bool isHostSlot(uint32_t slotIdx);
+    // Classify an AXI address into a metadata region for debug/accounting.
+    // Returns a short tag string; counts the beats into the per-region totals.
+    const char* metaRegionTag(Addr axiAddr);
 
     std::mt19937 rng;
 
@@ -322,7 +367,7 @@ class OramDevice : public ClockedObject
         }
     };
 
-    struct RBeat { uint8_t data[32] = {}; uint8_t id = 0; bool last = false; };
+    struct RBeat { uint8_t data[32] = {}; uint8_t id = 0; bool last = false; bool isSingle = false; };
     std::deque<RBeat> rQueue;
 
     struct ReadBurstReasm {
@@ -345,6 +390,36 @@ class OramDevice : public ClockedObject
 
     struct BResp { uint8_t id; bool isHbm; bool isStash; };
     std::deque<BResp> bQueue;
+
+    // HT SLOT write-forwarding shadow. The single-beat HT write commits to the
+    // HBM backing store with BRESP-to-data latency; a lookup issued in a later
+    // op can read the SLOT address before the prior write has functionally
+    // landed, returning pre-write memory (0) -> false MISS. We record every HT
+    // SLOT write's data keyed by gem5 address and forward it on HT SLOT reads,
+    // guaranteeing read-your-writes regardless of memory commit latency.
+    std::map<Addr, std::array<uint8_t, 32>> htSlotShadow;
+
+    // pos_map write-shadow: same pattern as htSlotShadow. Tracks the
+    // authoritative beat contents for each pos_map beat (16 entries/beat).
+    // The PmRmw timing-read can return stale data under load; the merge
+    // uses this shadow instead, so co-resident entries are never clobbered.
+    std::map<Addr, std::array<uint8_t, 32>> pmShadow;
+
+    // Stash data write-shadow: same pattern as pmShadow/htSlotShadow.
+    // Tracks stash data beats written to HBM. When S_ST_LOAD reads a
+    // stash entry back from HBM, the timing read may return stale data
+    // (write not yet committed). The shadow provides authoritative data.
+    std::map<Addr, std::array<uint8_t, 32>> stashDataShadow;
+
+    // HT BKT_HEAD write-shadow: same RAW hazard as HT SLOT/PM.
+    // INSERT/DELETE modify HEAD via read-modify-write; a subsequent
+    // read before HBM commits gets stale data → chain corruption.
+    std::map<Addr, std::array<uint8_t, 32>> htBktHeadShadow;
+
+    // HT BKT_NEXT write-shadow: same pattern. INSERT writes
+    // NEXT[idx] = old_head; if a later chain walk reads this before
+    // HBM commits, it follows a stale pointer.
+    std::map<Addr, std::array<uint8_t, 32>> htBktNextShadow;
 
     // Write data FIFO: models the AXI port write data buffer between
     // the RTL and HBM switch. W beats queue here, then drain to HBM
@@ -418,6 +493,7 @@ class OramDevice : public ClockedObject
     uint32_t leaseToken, numOps, opsCompleted;
     bool currentOpIsWrite;
     Addr currentOpAddr;
+    uint32_t currentOpWdata[8];     // real write payload of in-flight op (for VERIFY-WRITE)
     uint32_t lastWrittenSlot;       // slot index of the last WRITE op
     std::set<uint32_t> writtenSlots; // slots that have been written at least once
     uint32_t lastWrittenData[64];   // data written by the last WRITE op
@@ -454,6 +530,12 @@ class OramDevice : public ClockedObject
     uint64_t localOps, pcieOps, opStartCycle, totalOpCycles;
     uint64_t wStallCount;  // consecutive W-STALL cycles for deadlock detection
     uint64_t noProgressCount;  // consecutive cycles with no AXI progress
+
+    // E2E latency aggregate counters (cpu_driven mode)
+    uint64_t e2eOpsTracked;
+    Tick     e2eRtlSum;        // sum of (rtlDoneTick - dispatchTick)
+    Tick     e2eWritebackSum;  // sum of (commitTick - rtlDoneTick)
+    Tick     e2eColdStart;     // first op's full E2E (commitTick - fetchTick)
     bool statsPrinted;
     bool tagMismatchWarned;  // only warn once for tag mismatch
     uint8_t prevPmState;     // previous pos_map FSM state
@@ -515,6 +597,8 @@ class OramDevice : public ClockedObject
     // Stash routing verification
     uint64_t stashHbmBeats, stashPcieBeats;
     uint64_t bucketHbmBeats, bucketPcieBeats;
+    // Per-metadata-region beat counters (all should be HBM-only).
+    uint64_t ivtBeats, slotrBeats, bmetaBeats, pmBeats, htBeats;
 
     void printStats();
 };

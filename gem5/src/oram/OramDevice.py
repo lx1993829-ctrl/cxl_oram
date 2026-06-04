@@ -6,7 +6,7 @@ from m5.objects.ClockedObject import ClockedObject
 class OramDevice(ClockedObject):
     """Secure ORAM device wrapping a Verilated RTL model.
 
-    RTL limits: N=16380 slots, B=4095 buckets, Z=8 slots/bucket.
+    RTL limits: N=16384 slots, B=4096 buckets, Z=8 slots/bucket.
     Slots permanently split: lower X% → HBM, upper (100-X)% → host.
 
     Per-operation routing: when a client request targets a host slot,
@@ -30,7 +30,7 @@ class OramDevice(ClockedObject):
 
     oram_freq = Param.Frequency("300MHz", "ORAM engine clock frequency")
     local_pct = Param.UInt32(50, "Percent of slots in local HBM")
-    num_slots = Param.UInt32(32, "ORAM slots (max 16380)")
+    num_slots = Param.UInt32(32, "ORAM slots (max 32768)")
     num_ops = Param.UInt32(100, "Test operations to run")
 
     aes_key_0 = Param.UInt32(0x01234567, "AES key word 0")
@@ -40,7 +40,12 @@ class OramDevice(ClockedObject):
 
     hbm_base = Param.Addr(0x0, "HBM base in gem5 address map")
     host_base = Param.Addr(0x400000000, "Host DDR5 base")
-    stash_offset = Param.Addr(0x08000000, "Stash region offset")
+    stash_offset = Param.Addr(0x08000000,
+        "Stash region offset. NOTE: the RTL stash master issues AXI at "
+        "STASH_DDR_BASE=0x10000000 and the stash is now 32 MB "
+        "(STASH_PTR_W=13, 8192 entries). For the driver's stash zero-fill "
+        "to land where the RTL accesses, set this to 0x10000000 unless your "
+        "address mapping already reconciles the two.")
 
     # ------------------------------------------------------------------
     # Phase 1 (CPU-driven mode) additions. When cpu_driven=False (default),

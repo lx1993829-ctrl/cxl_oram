@@ -1,7 +1,9 @@
 #include "oram/oram_device.hh"
+#include "oram/aes_gcm_sw.hh"
 
 #include <cstring>
 #include <algorithm>
+#include <numeric>
 #include <deque>
 #include <unordered_map>
 #include <unordered_set>
@@ -53,20 +55,39 @@ bool OramDevice::MemPort::recvTimingResp(PacketPtr pkt)
                 d.lastCompletedRdata[i] = op.rdata[i];
             d.lastCompletedRdataValid = op.rdata_valid;
             d.cmdQueue.front().phase = CmdEntry::Phase::COMMITTED;
+            d.cmdQueue.front().commitTick = curTick();
+
+            // --- E2E accumulation ---
+            {
+                const CmdEntry &e = d.cmdQueue.front();
+                if (e.dispatchTick > 0 && e.rtlDoneTick > 0 && e.commitTick > 0) {
+                    Tick clk       = d.oramClkPeriod;
+                    Tick rtlTime   = e.rtlDoneTick - e.dispatchTick;
+                    Tick writeback = e.commitTick   - e.rtlDoneTick;
+                    inform("E2E[%u] op=%lu: RTL=%lu cyc (%.1f ns), "
+                           "writeback=%lu cyc (%.1f ns), "
+                           "steady=%lu cyc (%.1f ns)",
+                           d.instanceId, e.opIdx,
+                           rtlTime / clk, rtlTime / 1000.0,
+                           writeback / clk, writeback / 1000.0,
+                           (rtlTime + writeback) / clk,
+                           (rtlTime + writeback) / 1000.0);
+                    d.e2eRtlSum       += rtlTime;
+                    d.e2eWritebackSum += writeback;
+                    if (d.e2eOpsTracked == 0 && e.fetchTick > 0)
+                        d.e2eColdStart = e.commitTick - e.fetchTick;
+                    d.e2eOpsTracked++;
+                }
+            }
+
+            // Pop queue and increment cpuOpCount when result BRESP arrives.
             d.cmdQueue.pop_front();
             d.cpuOpCount++;
 
-            // Step 9: queue just opened up. If the ring has unfetched
-            // entries waiting (ringConsIdx < ringProdIdxKnown) and now
-            // there's room, kick off entry fetches. Without this, when
-            // the queue fills to capacity during a steady stream of
-            // commands, no further entries get fetched even after ops
-            // complete and the queue drains — ORAM keeps polling
-            // prod_idx but never advances cons_idx.
-            //
-            // We also re-issue a prod_idx read if doorbell came in
-            // after we stopped fetching — covers the case where queue
-            // was full when CPU rang.
+            if (d.cpuDriven && d.cpuOpCount >= d.numOps && !d.statsPrinted)
+                d.printStats();
+
+            // Step 9: queue opened up — kick ring fetches if pending.
             if (d.cmdRingBase != 0) {
                 while (d.ringConsIdx < d.ringProdIdxKnown &&
                        d.cmdQueue.size() + d.ringEntriesInFlight
@@ -93,10 +114,6 @@ bool OramDevice::MemPort::recvTimingResp(PacketPtr pkt)
                 }
             }
         } else {
-            // Either the queue is empty or front opIdx doesn't match.
-            // For depth=1 this should never happen. For depth>1, it
-            // could mean an out-of-order completion (currently we don't
-            // expect this since the RTL serializes ops, but be defensive).
             warn("Result-pkt opIdx=%lu arrived but cmdQueue front "
                  "is %s opIdx=%lu — out-of-order commit not handled",
                  rss->opIdx,
@@ -214,13 +231,21 @@ OramDevice::OramDevice(const OramDeviceParams &p)
     memset(rdataShadow, 0, sizeof(rdataShadow));
     rdataShadowValid[0] = false;
     rdataShadowValid[1] = false;
+    rdataValidEverSeen[0] = false;
+    rdataValidEverSeen[1] = false;
+    clientDoneSeen = false;
+    clientDoneWaitCycles = 0;
     cpuOpCount = 0;
     wrDbg.reset();
     memset(phaseCycles, 0, sizeof(phaseCycles));
     memset(opPhaseCycles, 0, sizeof(opPhaseCycles));
     prevFsmState = 0;
+    e2eOpsTracked = 0;
+    e2eRtlSum = e2eWritebackSum = 0;
+    e2eColdStart = 0;
     stashHbmBeats = stashPcieBeats = 0;
     bucketHbmBeats = bucketPcieBeats = 0;
+    ivtBeats = slotrBeats = bmetaBeats = pmBeats = htBeats = 0;
     if (numSlots > MAX_SLOTS) {
         warn("num_slots=%u > N=%d, clamping", numSlots, MAX_SLOTS);
         numSlots = MAX_SLOTS;
@@ -344,6 +369,22 @@ Port &OramDevice::getPort(const std::string &if_name, PortID idx)
 // =============================================================================
 
 bool OramDevice::isStashAddr(Addr a) { return a >= stashOffset; }
+
+// Classify an AXI address (instance-relative) into a metadata region.
+// Used for debug logging + per-region beat accounting. Ranges match
+// oram_params.vh. STASH is data, not counted as metadata here.
+const char* OramDevice::metaRegionTag(Addr a)
+{
+    if (a >= BUCKET_META_BASE_ADDR) return "BUCKET_META";
+    if (a >= SLOT_R_BASE_ADDR)      return "SLOT_R";
+    if (a >= IVT_BASE_ADDR)         return "IVT";
+    if (a >= HT_BKT_NEXT_ADDR)      return "HT_BKT_NEXT";
+    if (a >= HT_BKT_HEAD_ADDR)      return "HT_BKT_HEAD";
+    if (a >= HT_SLOT_BASE_ADDR)     return "HT_SLOT";
+    if (a >= PM_BASE_ADDR)          return "PM";
+    if (a >= STASH_BASE_ADDR)       return "STASH";
+    return "BUCKET";
+}
 bool OramDevice::isHostSlot(uint32_t s) { return s >= hbmSlotCount; }
 
 // =============================================================================
@@ -415,6 +456,17 @@ void OramDevice::tick()
         bool stashReadPending = false;
         for (auto &rb : pendingReadBursts) {
             if (rb.totalBeats == 1) { stashReadPending = true; break; }
+        }
+        // Also hold off if a single-beat HT read's beat is still sitting in
+        // rQueue undelivered. The single-beat port is single-outstanding on the
+        // RTL side; allowing a 2nd single-beat AR while the 1st beat is still in
+        // rQueue lets two single-read beats coexist and be delivered FIFO
+        // (completion order) rather than AR-issue order -> the RTL captures the
+        // wrong read's data. Keep one single-beat read in flight end-to-end.
+        if (!stashReadPending) {
+            for (auto &q : rQueue) {
+                if (q.isSingle) { stashReadPending = true; break; }
+            }
         }
         oram->m_axi_arready = (hbmBlocked || stashReadPending) ? 0 : 1;
         // AW: always accept. The stash_axi_master issues AW+W simultaneously
@@ -537,13 +589,16 @@ void OramDevice::tick()
         // S_ST_FLUSH (29): flushing line_buf to HBM
         if (fsm == 29 && stFlushMonCount[instanceId] < 50) {
             inform("[cyc %lu] STASH-FLUSH: sel_st=%d awV=%d awR=%d wV=%d wR=%d "
-                   "bV=%d bR=%d wFifo=%d",
+                   "bV=%d bR=%d wFifo=%d sel_sr=%d sel_bm=%d sel_iv=%d sel_pm=%d stFSM=%d",
                    oramCycle,
                    (int)oram->sel_stash_out,
                    (int)oram->m_axi_awvalid, (int)oram->m_axi_awready,
                    (int)oram->m_axi_wvalid, (int)oram->m_axi_wready,
                    (int)oram->m_axi_bvalid, (int)oram->m_axi_bready,
-                   (int)wFifo.size());
+                   (int)wFifo.size(),
+                   (int)oram->dbg_sel_slotr, (int)oram->dbg_sel_bmeta,
+                   (int)oram->dbg_sel_ivt, (int)oram->dbg_sel_posmap,
+                   (int)oram->dbg_sel_stash_fsm);
             stFlushMonCount[instanceId]++;
         }
 
@@ -731,7 +786,7 @@ void OramDevice::tick()
         // sel_stash may be 0 if the AR was delayed by stashReadPending
         // gate past the whitelisted FSM state. Use address as ground truth:
         // AXI addr >= 0x10000000 is metadata region (always HBM).
-        bool isMetadataAddr = (s_araddr >= 0x10000000);
+        bool isMetadataAddr = (s_araddr >= METADATA_REGION_START);
         bool pcie = (s_sel_stash || s_sel_posmap || isMetadataAddr)
                     ? false : currentOpIsPcie;
 
@@ -747,6 +802,21 @@ void OramDevice::tick()
             if (pcie) stashPcieBeats += numBeats; else stashHbmBeats += numBeats;
         } else {
             if (pcie) bucketPcieBeats += numBeats; else bucketHbmBeats += numBeats;
+        }
+        // Per-metadata-region accounting (HBM reads). All metadata must be HBM.
+        if (isMetadataAddr) {
+            const char* rtag = metaRegionTag(s_araddr);
+            if      (!strcmp(rtag, "IVT"))         ivtBeats   += numBeats;
+            else if (!strcmp(rtag, "SLOT_R"))      slotrBeats += numBeats;
+            else if (!strcmp(rtag, "BUCKET_META")) bmetaBeats += numBeats;
+            else if (!strcmp(rtag, "PM"))          pmBeats    += numBeats;
+            else if (!strncmp(rtag, "HT", 2))      htBeats    += numBeats;
+            DPRINTF(Oram, "[%lu] META-RD region=%s addr=0x%lx beats=%d %s\n",
+                    oramCycle, rtag, (uint64_t)s_araddr, numBeats,
+                    pcie ? "PCIe(!)" : "HBM");
+            if (pcie)
+                warn("[cyc %lu] META-RD MISROUTED to PCIe: region=%s addr=0x%lx",
+                     oramCycle, rtag, (uint64_t)s_araddr);
         }
 
         size_t seq = nextBurstSeq++;
@@ -782,7 +852,7 @@ void OramDevice::tick()
     if (s_awvalid && s_awready) {
         Addr axiAddr = s_awaddr;
         // Same metadata routing as AR — see comment above.
-        bool isMetadataAddr = (axiAddr >= 0x10000000);
+        bool isMetadataAddr = (axiAddr >= METADATA_REGION_START);
         bool pcie = (s_sel_stash || s_sel_posmap || isMetadataAddr)
                     ? false : currentOpIsPcie;
 
@@ -799,6 +869,21 @@ void OramDevice::tick()
             if (pcie) stashPcieBeats += awBeats; else stashHbmBeats += awBeats;
         } else {
             if (pcie) bucketPcieBeats += awBeats; else bucketHbmBeats += awBeats;
+        }
+        // Per-metadata-region accounting (HBM writes).
+        if (isMetadataAddr) {
+            const char* rtag = metaRegionTag(axiAddr);
+            if      (!strcmp(rtag, "IVT"))         ivtBeats   += awBeats;
+            else if (!strcmp(rtag, "SLOT_R"))      slotrBeats += awBeats;
+            else if (!strcmp(rtag, "BUCKET_META")) bmetaBeats += awBeats;
+            else if (!strcmp(rtag, "PM"))          pmBeats    += awBeats;
+            else if (!strncmp(rtag, "HT", 2))      htBeats    += awBeats;
+            DPRINTF(Oram, "[%lu] META-WR region=%s addr=0x%lx beats=%d %s\n",
+                    oramCycle, rtag, (uint64_t)axiAddr, awBeats,
+                    pcie ? "PCIe(!)" : "HBM");
+            if (pcie)
+                warn("[cyc %lu] META-WR MISROUTED to PCIe: region=%s addr=0x%lx",
+                     oramCycle, rtag, (uint64_t)axiAddr);
         }
 
         size_t seq = nextBurstSeq++;
@@ -821,8 +906,8 @@ void OramDevice::tick()
         // Debug: log every AW that targets the HT region
         {
             Addr gem5AwAddr = pcie ? (hostBase + axiAddr) : (hbmBase + axiAddr);
-            Addr htRegionStart = hbmBase + 0x10500000;
-            Addr htRegionEnd   = hbmBase + 0x10700800;
+            Addr htRegionStart = hbmBase + HT_SLOT_BASE_ADDR;
+            Addr htRegionEnd   = hbmBase + HT_REGION_END;   // through end of IVT
             if (gem5AwAddr >= htRegionStart && gem5AwAddr < htRegionEnd) {
                 inform("[cyc %lu] HT_AW_WRITE: addr=0x%lx (axi=0x%lx) len=%d "
                        "FSM=%d ht_st=%d sel_st=%d sel_pm=%d burst_busy=%d isStash=%d",
@@ -844,8 +929,8 @@ void OramDevice::tick()
 
         // Debug: log W data for HT region writes
         {
-            Addr htRegionStart = hbmBase + 0x10500000;
-            Addr htRegionEnd   = hbmBase + 0x10700800;
+            Addr htRegionStart = hbmBase + HT_SLOT_BASE_ADDR;
+            Addr htRegionEnd   = hbmBase + HT_REGION_END;   // through end of IVT
             if (gem5Addr >= htRegionStart && gem5Addr < htRegionEnd) {
                 inform("[cyc %lu] HT_W_DATA: addr=0x%lx beat=%d wstrb=0x%x "
                        "data[0..7]=0x%02x%02x%02x%02x%02x%02x%02x%02x "
@@ -871,9 +956,25 @@ void OramDevice::tick()
 
         if (!allEnabled) {
             // pos_map masked write: read-modify-write via timing path.
-            // Send read directly (not through sendPkt which adds AxiSenderState
-            // and pendingReadBursts tracking — this is NOT a bucket/stash read).
+            // The timing read is kept for latency modeling, but the MERGE
+            // step uses pmShadow (authoritative) instead of the timing-read
+            // data, so stale reads cannot corrupt co-resident entries.
 
+            // Update pmShadow if it already exists for this beat.
+            // Do NOT create a new entry here (it would be zeros for the
+            // other 15 entries, corrupting them on merge). The shadow is
+            // first populated from rdData at merge time in recvTimingResp.
+            {
+                auto it = pmShadow.find(gem5Addr);
+                if (it != pmShadow.end()) {
+                    for (int b = 0; b < std::min(beatBytes, AXI_DATA_BYTES); b++)
+                        if (s_wstrb & (1u << b))
+                            it->second[b] = s_wdata[b];
+                }
+            }
+
+            // Issue timing read (for latency modeling — data will be
+            // replaced by pmShadow at merge time in recvTimingResp).
             auto rdReq = std::make_shared<Request>(gem5Addr, beatBytes, 0, reqId);
             PacketPtr rdPkt = new Packet(rdReq, MemCmd::ReadReq);
             uint8_t *rdBuf = new uint8_t[beatBytes]();
@@ -885,30 +986,22 @@ void OramDevice::tick()
             memcpy(ss->wdata, s_wdata, AXI_DATA_BYTES);
             rdPkt->pushSenderState(ss);
 
-            // Send directly — bypass sendPkt to avoid AxiSenderState/pendingReadBursts
             if (hbmBlocked) {
-                // Already blocked — just queue for retry, don't call sendTimingReq
                 hbmRetryQueue.push_back(rdPkt);
             } else if (!hbmPort.sendTimingReq(rdPkt)) {
-                // HBM busy — queue for retry
                 hbmBlocked = true;
                 hbmRetryQueue.push_back(rdPkt);
             }
 
             wb.beatsRecv++;
             if (s_wlast) {
-                // Create PendingWriteBurst so the RMW write's response
-                // can match and generate a BRESP for the RTL.
-                // The RMW write uses wb.writeSeq as its burstSeq.
                 PendingWriteBurst pwb;
                 pwb.id = wb.id;
                 pwb.seq = wb.writeSeq;
-                pwb.totalBeats = 1;  // single-beat pos_map write
+                pwb.totalBeats = 1;
                 pwb.isHbm = !wb.isPcie;
                 pwb.isStash = false;
-                posmapWriteSeqs.insert(pwb.seq);  // track for BRESP matching
-                // Check earlyWriteResps: the RMW write's response may have
-                // arrived before this PendingWriteBurst was created.
+                posmapWriteSeqs.insert(pwb.seq);
                 auto earlyIt = earlyWriteResps.find(wb.writeSeq);
                 if (earlyIt != earlyWriteResps.end()) {
                     pwb.responsesRecv = earlyIt->second;
@@ -938,6 +1031,34 @@ void OramDevice::tick()
             memcpy(buf, s_wdata, std::min(beatBytes, AXI_DATA_BYTES));
             pkt->dataDynamic(buf);
 
+            // HT SLOT write-forwarding: record the data so a later HT read of
+            // this address returns it even if the HBM commit lags BRESP.
+            {
+                Addr htSlotStart = hbmBase + HT_SLOT_BASE_ADDR;
+                Addr htSlotEnd   = hbmBase + HT_SLOT_BASE_ADDR + 8192 * AXI_DATA_BYTES;
+                if (gem5Addr >= htSlotStart && gem5Addr < htSlotEnd &&
+                    beatBytes >= AXI_DATA_BYTES) {
+                    std::array<uint8_t, 32> e;
+                    memcpy(e.data(), s_wdata, AXI_DATA_BYTES);
+                    htSlotShadow[gem5Addr] = e;
+                    inform("[cyc %lu] HT_SHADOW_REC at 0x%lx [0..7]=0x%02x%02x%02x%02x%02x%02x%02x%02x (mapsz=%zu)",
+                           oramCycle, (uint64_t)gem5Addr,
+                           e[7],e[6],e[5],e[4],e[3],e[2],e[1],e[0], htSlotShadow.size());
+                } else if (gem5Addr >= htSlotStart && gem5Addr < htSlotEnd) {
+                    // In HT range but failed beatBytes guard — the diagnostic case.
+                    inform("[cyc %lu] HT_SHADOW_SKIP at 0x%lx (beatBytes=%d < %d)",
+                           oramCycle, (uint64_t)gem5Addr, beatBytes, AXI_DATA_BYTES);
+                }
+            }
+
+            // Cycle-by-cycle stash W data trace (FSM=29 S_ST_FLUSH) — EVERY beat
+            if (curFsmState == 29) {
+                uint32_t *dw = (uint32_t *)s_wdata;
+                inform("[cyc %lu] STASH_W_DATA: beat=%d addr=0x%lx data[0..3]=%08x %08x %08x %08x",
+                       oramCycle, wb.beatsRecv, (uint64_t)gem5Addr,
+                       dw[0], dw[1], dw[2], dw[3]);
+            }
+
             pkt->pushSenderState(
                 new AxiSenderState(wb.id, wb.beatsRecv, wb.len + 1,
                                    true, wb.writeSeq));
@@ -945,6 +1066,41 @@ void OramDevice::tick()
             // Queue to write FIFO instead of sending directly.
             // drainWriteFifo() sends 1 per tick to HBM.
             wFifo.push_back({pkt, wb.isPcie});
+
+            // Stash data shadow: record each stash beat written to HBM.
+            // When S_ST_LOAD reads this entry back, it may get stale data
+            // (write not committed). The shadow ensures correct forwarding.
+            {
+                Addr sdStart = hbmBase + STASH_BASE_ADDR;
+                Addr sdEnd   = sdStart + 0x400000; // 1024 entries × 4KB
+                if (gem5Addr >= sdStart && gem5Addr < sdEnd) {
+                    auto &sb = stashDataShadow[gem5Addr];
+                    memcpy(sb.data(), s_wdata,
+                           std::min(beatBytes, (int)sizeof(sb)));
+                }
+            }
+
+            // HT BKT_HEAD / BKT_NEXT write-shadow: same RAW hazard as
+            // HT SLOT and pos_map. INSERT/DELETE do read-modify-write on
+            // HEAD beats; a subsequent chain walk that reads the same beat
+            // before HBM commits gets stale chain pointers → lost entries.
+            {
+                Addr headStart = hbmBase + HT_BKT_HEAD_ADDR;
+                Addr headEnd   = headStart + (MAX_BUCKETS / 16) * AXI_DATA_BYTES;
+                Addr nextStart = hbmBase + HT_BKT_NEXT_ADDR;
+                Addr nextEnd   = nextStart + (STASH_DEPTH / 16) * AXI_DATA_BYTES;
+                if (gem5Addr >= headStart && gem5Addr < headEnd &&
+                    beatBytes >= AXI_DATA_BYTES) {
+                    std::array<uint8_t, 32> e;
+                    memcpy(e.data(), s_wdata, AXI_DATA_BYTES);
+                    htBktHeadShadow[gem5Addr] = e;
+                } else if (gem5Addr >= nextStart && gem5Addr < nextEnd &&
+                           beatBytes >= AXI_DATA_BYTES) {
+                    std::array<uint8_t, 32> e;
+                    memcpy(e.data(), s_wdata, AXI_DATA_BYTES);
+                    htBktNextShadow[gem5Addr] = e;
+                }
+            }
             if (curFsmState == 19) {
                 wrDbg.sendAccepted++;
             }
@@ -1155,6 +1311,57 @@ void OramDevice::tick()
     // Drain queued read requests to gem5
     drainPendingSends();
 
+    // --- HBM MEMORY WATCHPOINT ---
+    // Functional read of a specific HT_SLOT address every tick.
+    // Detects the exact cycle when the data changes unexpectedly.
+    if (instanceId == 0 && oramCycle > 1000) {
+        static uint64_t watchAddr = 0;
+        static uint64_t lastGoodData[4] = {};
+        static bool watchActive = false;
+        static bool corruptionDetected = false;
+
+        if (!watchActive) {
+            // The confirmed HBM address from the trace: 0x141015E0
+            // (beat 175 in the HT_SLOT table, slot 24750's hash bucket)
+            watchAddr = hbmBase + 0x141015E0ULL;
+            watchActive = true;
+        }
+
+        if (watchActive && !corruptionDetected) {
+            uint8_t buf[AXI_DATA_BYTES];
+            auto fReq = std::make_shared<Request>(watchAddr, AXI_DATA_BYTES, 0, reqId);
+            PacketPtr fPkt = new Packet(fReq, MemCmd::ReadReq);
+            fPkt->dataStatic(buf);
+            hbmPort.sendFunctional(fPkt);
+            delete fPkt;
+
+            uint64_t *d = (uint64_t*)buf;
+            if (d[0] != lastGoodData[0] || d[1] != lastGoodData[1] ||
+                d[2] != lastGoodData[2] || d[3] != lastGoodData[3]) {
+                warn("WATCHPOINT HIT cyc=%lu addr=0x%lx: "
+                     "OLD=[%016lx %016lx %016lx %016lx] "
+                     "NEW=[%016lx %016lx %016lx %016lx] "
+                     "FSM=%d ht_st=%d ht_op=%d sel_st=%d sel_pm=%d "
+                     "burst_busy=%d sng_wr=%d sng_rd=%d awvalid=%d",
+                     oramCycle, watchAddr,
+                     lastGoodData[0], lastGoodData[1],
+                     lastGoodData[2], lastGoodData[3],
+                     d[0], d[1], d[2], d[3],
+                     (int)oram->dbg_oram_state, (int)oram->dbg_ht_state,
+                     (int)oram->dbg_ht_op, (int)oram->sel_stash_out,
+                     (int)oram->sel_posmap_out,
+                     (int)oram->st_burst_busy_out,
+                     (int)oram->dbg_ht_sng_wr_req,
+                     (int)oram->dbg_ht_sng_rd_req,
+                     (int)oram->dbg_mux_awvalid);
+                if (d[0] == 0xFFFFFFFFFFFFFFFFULL)
+                    corruptionDetected = true;
+                lastGoodData[0] = d[0]; lastGoodData[1] = d[1];
+                lastGoodData[2] = d[2]; lastGoodData[3] = d[3];
+            }
+        }
+    }
+
     // Step 5: shadow-capture client_rdata for any hw-client whose
     // rdata_valid bit is currently set. This runs EVERY tick, so a
     // one-cycle valid pulse is never missed. completeOp consumes the
@@ -1166,6 +1373,12 @@ void OramDevice::tick()
             for (int i = 0; i < 8; i++)
                 rdataShadow[hw][i] = oram->client_rdata[rb + i];
             rdataShadowValid[hw] = true;
+            if (!rdataValidEverSeen[hw]) {
+                inform("RDATA_FIRST_SEEN hw=%u cycle=%lu data[0]=%08x FSM=%d",
+                       hw, oramCycle, rdataShadow[hw][0],
+                       (int)oram->dbg_oram_state);
+            }
+            rdataValidEverSeen[hw] = true;
             DPRINTF(Oram, "[%lu] rdata shadow captured hw=%u "
                     "[0..3]=%08x %08x %08x %08x\n",
                     oramCycle, hw,
@@ -1183,7 +1396,63 @@ void OramDevice::tick()
     if ((ctrlState == OramState::PROCESSING ||
          ctrlState == OramState::WRITE_INIT) &&
         (oram->client_done & doneMask))
-        completeOp();
+        clientDoneSeen = true;
+
+    // For READ ops, defer completeOp until rdataShadow is captured.
+    // The RTL may assert client_done before client_rdata_valid in some
+    // paths (e.g. stash hits). clientDoneSeen latches the done signal
+    // so we don't miss it if it's a one-cycle pulse.
+    if (clientDoneSeen) {
+        bool frontIsWrite = (!cmdQueue.empty() &&
+                             cmdQueue.front().op == 1);
+        if (frontIsWrite || rdataShadowValid[activeHwClient]) {
+            completeOp();
+            clientDoneSeen = false;
+            clientDoneWaitCycles = 0;
+        } else if (clientDoneWaitCycles == 0) {
+            // First cycle after client_done — capture client_rdata NOW
+            // before the RTL overwrites it with the next op's data.
+            unsigned rb = activeHwClient * 8;
+            for (int i = 0; i < 8; i++)
+                rdataShadow[activeHwClient][i] = oram->client_rdata[rb + i];
+            rdataShadowValid[activeHwClient] = true;
+            warn("rdata_valid missing — immediate capture hw=%u slot=0x%lx "
+                 "slotIdx=%u data=[%08x %08x %08x %08x] FSM=%d "
+                 "found_bucket=%d found_stash=%d everSeen=%d "
+                 "req_b=%u req_b_new=%u same_bucket=%d stash_occ=%u "
+                 "HT: ins_issued=%u ins_completed=%u del_issued=%u del_completed=%u "
+                 "ins_overwritten=%d del_overwritten=%d "
+                 "latch_ins=%d latch_del=%d "
+                 "LU_HBM: addr=0x%lx valid_bits=0x%x wb_hit=%d slot_queried=0x%x",
+                 activeHwClient, currentOpAddr,
+                 (unsigned)((currentOpAddr - LEASE_BASE) / SLOT_SIZE),
+                 rdataShadow[activeHwClient][0], rdataShadow[activeHwClient][1],
+                 rdataShadow[activeHwClient][2], rdataShadow[activeHwClient][3],
+                 (int)oram->dbg_oram_state,
+                 (int)oram->dbg_found_in_bucket,
+                 (int)oram->dbg_found_in_stash,
+                 (int)rdataValidEverSeen[activeHwClient],
+                 (unsigned)oram->dbg_req_b,
+                 (unsigned)oram->dbg_req_b_new,
+                 (int)oram->dbg_same_bucket,
+                 (unsigned)oram->dbg_stash_occ,
+                 (unsigned)oram->dbg_ht_ins_issued,
+                 (unsigned)oram->dbg_ht_ins_completed,
+                 (unsigned)oram->dbg_ht_del_issued,
+                 (unsigned)oram->dbg_ht_del_completed,
+                 (int)oram->dbg_ht_ins_overwritten,
+                 (int)oram->dbg_ht_del_overwritten,
+                 (int)oram->dbg_ht_latch_ins_active,
+                 (int)oram->dbg_ht_latch_del_active,
+                 (unsigned long)oram->dbg_ht_lu_hbm_addr,
+                 (unsigned)oram->dbg_ht_lu_valid_bits,
+                 (int)oram->dbg_ht_lu_wb_hit,
+                 (unsigned)oram->dbg_ht_lu_slot_looked_up);
+            clientDoneWaitCycles = 1;
+            // rdataShadowValid is now true — next tick hits the first
+            // branch and calls completeOp.
+        }
+    }
 
     // State machine
     switch (ctrlState) {
@@ -1208,8 +1477,12 @@ void OramDevice::tick()
                 CmdEntry &op = cmdQueue.front();
 
                 activeHwClient      = op.hw_client;
+                rdataValidEverSeen[op.hw_client] = false;
                 currentOpIsWrite    = (op.op == 1);
                 currentOpAddr       = op.slot_addr;
+                // Capture the real write payload so VERIFY-WRITE logs what the
+                // command actually carried (op.wdata), not a synthetic pattern.
+                for (int i = 0; i < 8; i++) currentOpWdata[i] = op.wdata[i];
                 currentOpIsPcie     = isHostSlot(
                     (currentOpAddr - LEASE_BASE) / SLOT_SIZE);
 
@@ -1241,6 +1514,7 @@ void OramDevice::tick()
                 }
 
                 op.phase       = CmdEntry::Phase::IN_PROGRESS;
+                op.dispatchTick = curTick();
                 op.rdata_valid = false;
 
                 ctrlState = OramState::PROCESSING;
@@ -1252,6 +1526,13 @@ void OramDevice::tick()
                         oramCycle, currentOpIsWrite ? "WR" : "RD",
                         op.slot_addr, op.hw_client, op.lease_id,
                         op.opIdx);
+                unsigned dispSlotIdx = (op.slot_addr - LEASE_BASE) / SLOT_SIZE;
+                inform("DISPATCH inst=%u op=%u %s slotIdx=%u hw=%u addr=0x%lx opIdx=%lu wdata0=%08x",
+                       instanceId, opsCompleted + 1,
+                       currentOpIsWrite ? "WR" : "RD",
+                       dispSlotIdx, op.hw_client,
+                       (unsigned long)op.slot_addr, op.opIdx,
+                       op.wdata[0]);
             }
             // else: no pending op, just tick idly.
         } else {
@@ -1677,6 +1958,10 @@ void OramDevice::handleCmdRingResp(PacketPtr pkt, CmdRingFetchSenderState *ss)
             e.op ? "WR" : "RD", e.slot_addr, e.hw_client, e.lease_id,
             cmdQueue.size(), cmdQueue.size() + 1);
 
+    e.fetchTick = curTick();
+    e.dispatchTick = 0;
+    e.rtlDoneTick = 0;
+    e.commitTick = 0;
     cmdQueue.push_back(e);
 
     // Throttled cons_idx writeback. Only write back every 4 commits to
@@ -1897,13 +2182,42 @@ void OramDevice::handleMemResp(PacketPtr pkt)
     if (pmRmw) {
         pkt->popSenderState();  // confirmed type, now pop
 
-        // Read completed — merge masked bytes and issue timing write
+        // Read completed — merge masked bytes and issue timing write.
+        // Use pmShadow as the authoritative beat contents instead of the
+        // timing-read data (which can be stale under load, corrupting the
+        // 15 co-resident pos_map entries sharing this 32-byte beat).
         const uint8_t *rdData = pkt->getConstPtr<uint8_t>();
-        uint8_t *mergedBuf = new uint8_t[pmRmw->writeSize];
-        memcpy(mergedBuf, rdData, pmRmw->writeSize);
+        uint8_t *mergedBuf = new uint8_t[pmRmw->writeSize]();
+        bool usedShadow = false;
+        {
+            auto it = pmShadow.find(pmRmw->writeAddr);
+            if (it != pmShadow.end()) {
+                // Shadow exists: use it (authoritative, immune to stale reads)
+                memcpy(mergedBuf, it->second.data(), std::min(pmRmw->writeSize, (int)sizeof(it->second)));
+                usedShadow = true;
+                bool differs = (memcmp(it->second.data(), rdData,
+                                std::min(pmRmw->writeSize, (int)sizeof(it->second))) != 0);
+                if (differs)
+                    inform("[cyc %lu] PM_SHADOW_FIX at 0x%lx: shadow differs from timing-read "
+                           "(stale read corrected)",
+                           oramCycle, (uint64_t)pmRmw->writeAddr);
+            } else {
+                // First RMW to this beat: populate shadow from timing-read
+                // (correct on first access — no contention yet)
+                std::array<uint8_t, 32> newShadow{};
+                memcpy(newShadow.data(), rdData, std::min(pmRmw->writeSize, (int)sizeof(newShadow)));
+                pmShadow[pmRmw->writeAddr] = newShadow;
+                memcpy(mergedBuf, rdData, pmRmw->writeSize);
+            }
+        }
         for (int b = 0; b < std::min(pmRmw->writeSize, (int)AXI_DATA_BYTES); b++) {
             if (pmRmw->wstrb & (1u << b))
                 mergedBuf[b] = pmRmw->wdata[b];
+        }
+        // Update shadow with the merged beat (latest state of all 16 entries)
+        {
+            auto &sb = pmShadow[pmRmw->writeAddr];
+            memcpy(sb.data(), mergedBuf, std::min(pmRmw->writeSize, (int)sizeof(sb)));
         }
 
         auto wrReq = std::make_shared<Request>(
@@ -1958,6 +2272,115 @@ void OramDevice::handleMemResp(PacketPtr pkt)
             return false;
         };
 
+        // HT SLOT read-your-writes: if this single-beat read targets an HT SLOT
+        // address we have a recorded write for, forward the shadowed data into
+        // the packet before delivery. Negates the BRESP-vs-HBM-commit gap that
+        // otherwise lets a lookup read pre-write memory (0) -> false MISS.
+        {
+            Addr pktAddr = pkt->getAddr();
+            Addr htSlotStart = hbmBase + HT_SLOT_BASE_ADDR;
+            Addr htSlotEnd   = hbmBase + HT_SLOT_BASE_ADDR + 8192 * AXI_DATA_BYTES;
+            if (pktAddr >= htSlotStart && pktAddr < htSlotEnd &&
+                ss->totalBeats == 1) {
+                auto it = htSlotShadow.find(pktAddr);
+                if (it != htSlotShadow.end()) {
+                    uint8_t *pd = pkt->getPtr<uint8_t>();
+                    bool differs = (memcmp(pd, it->second.data(), AXI_DATA_BYTES) != 0);
+                    memcpy(pd, it->second.data(), AXI_DATA_BYTES);
+                    inform("[cyc %lu] HT_FWD at 0x%lx: shadow hit differs=%d [0..7]=0x%02x%02x%02x%02x%02x%02x%02x%02x",
+                           oramCycle, pktAddr, differs,
+                           pd[7], pd[6], pd[5], pd[4], pd[3], pd[2], pd[1], pd[0]);
+                } else {
+                    inform("[cyc %lu] HT_FWD_MISS at 0x%lx: no shadow entry (mapsz=%zu)",
+                           oramCycle, pktAddr, htSlotShadow.size());
+                }
+            }
+        }
+
+        // pos_map read-your-writes: same pattern as HT SLOT forwarding.
+        // If this single-beat read targets a pos_map beat we have a shadow
+        // for, forward the shadowed data. Negates the BRESP-vs-commit gap
+        // that lets a pos_map read return a stale beat (with corrupted
+        // co-resident entries) before the prior RMW write lands in HBM.
+        {
+            Addr pktAddr = pkt->getAddr();
+            Addr pmStart = hbmBase + PM_BASE_ADDR;
+            Addr pmEnd   = hbmBase + PM_BASE_ADDR + 0x10000; // 2048 beats × 32B
+            if (pktAddr >= pmStart && pktAddr < pmEnd &&
+                ss->totalBeats == 1) {
+                auto it = pmShadow.find(pktAddr);
+                if (it != pmShadow.end()) {
+                    uint8_t *pd = pkt->getPtr<uint8_t>();
+                    bool differs = (memcmp(pd, it->second.data(), AXI_DATA_BYTES) != 0);
+                    memcpy(pd, it->second.data(), AXI_DATA_BYTES);
+                    if (differs)
+                        inform("[cyc %lu] PM_RD_FWD at 0x%lx: shadow corrected stale pos_map read",
+                               oramCycle, pktAddr);
+                }
+            }
+        }
+
+        // Stash data read-your-writes: same pattern as PM/HT forwarding.
+        // When S_ST_LOAD reads a stash entry from HBM, the timing read
+        // may return stale data (prior stash flush not yet committed).
+        // The shadow provides the authoritative beat data.
+        {
+            Addr pktAddr = pkt->getAddr();
+            Addr sdStart = hbmBase + STASH_BASE_ADDR;
+            Addr sdEnd   = sdStart + 0x400000; // 1024 entries × 4KB
+            if (pktAddr >= sdStart && pktAddr < sdEnd) {
+                auto it = stashDataShadow.find(pktAddr);
+                if (it != stashDataShadow.end()) {
+                    uint8_t *pd = pkt->getPtr<uint8_t>();
+                    bool differs = (memcmp(pd, it->second.data(), AXI_DATA_BYTES) != 0);
+                    memcpy(pd, it->second.data(), AXI_DATA_BYTES);
+                    if (differs)
+                        inform("[cyc %lu] STASH_FWD at 0x%lx: shadow corrected stale stash read",
+                               oramCycle, pktAddr);
+                }
+            }
+        }
+
+        // HT BKT_HEAD read-your-writes: same RAW hazard as HT SLOT/PM.
+        // Chain walk reads HEAD[bkt]; if a prior INSERT/DELETE wrote the
+        // same beat and HBM hasn't committed, forward from shadow.
+        {
+            Addr pktAddr = pkt->getAddr();
+            Addr headStart = hbmBase + HT_BKT_HEAD_ADDR;
+            Addr headEnd   = headStart + (MAX_BUCKETS / 16) * AXI_DATA_BYTES;
+            if (pktAddr >= headStart && pktAddr < headEnd &&
+                ss->totalBeats == 1) {
+                auto it = htBktHeadShadow.find(pktAddr);
+                if (it != htBktHeadShadow.end()) {
+                    uint8_t *pd = pkt->getPtr<uint8_t>();
+                    bool differs = (memcmp(pd, it->second.data(), AXI_DATA_BYTES) != 0);
+                    memcpy(pd, it->second.data(), AXI_DATA_BYTES);
+                    if (differs)
+                        inform("[cyc %lu] HEAD_FWD at 0x%lx: shadow corrected stale BKT_HEAD read",
+                               oramCycle, pktAddr);
+                }
+            }
+        }
+
+        // HT BKT_NEXT read-your-writes: same pattern.
+        {
+            Addr pktAddr = pkt->getAddr();
+            Addr nextStart = hbmBase + HT_BKT_NEXT_ADDR;
+            Addr nextEnd   = nextStart + (STASH_DEPTH / 16) * AXI_DATA_BYTES;
+            if (pktAddr >= nextStart && pktAddr < nextEnd &&
+                ss->totalBeats == 1) {
+                auto it = htBktNextShadow.find(pktAddr);
+                if (it != htBktNextShadow.end()) {
+                    uint8_t *pd = pkt->getPtr<uint8_t>();
+                    bool differs = (memcmp(pd, it->second.data(), AXI_DATA_BYTES) != 0);
+                    memcpy(pd, it->second.data(), AXI_DATA_BYTES);
+                    if (differs)
+                        inform("[cyc %lu] NEXT_FWD at 0x%lx: shadow corrected stale BKT_NEXT read",
+                               oramCycle, pktAddr);
+                }
+            }
+        }
+
         // First beat (always present)
         bool found = deliverBeat(ss->burstSeq, ss->beatIdx,
                                   pkt->getConstPtr<uint8_t>(), 0);
@@ -1965,8 +2388,8 @@ void OramDevice::handleMemResp(PacketPtr pkt)
         // Debug: cross-check HT region reads with functional path
         {
             Addr pktAddr = pkt->getAddr();
-            Addr htSlotStart = hbmBase + 0x10500000;
-            Addr htSlotEnd   = hbmBase + 0x10500000 + 512 * AXI_DATA_BYTES; // 16KB
+            Addr htSlotStart = hbmBase + HT_SLOT_BASE_ADDR;
+            Addr htSlotEnd   = hbmBase + HT_SLOT_BASE_ADDR + 8192 * AXI_DATA_BYTES; // 256KB
             if (pktAddr >= htSlotStart && pktAddr < htSlotEnd && ss->totalBeats == 1) {
                 // Single-beat HT SLOT read — verify data via functional
                 auto fReq = std::make_shared<Request>(pktAddr, AXI_DATA_BYTES, 0, reqId);
@@ -2076,7 +2499,23 @@ void OramDevice::flushCompletedReads()
         auto &rb = pendingReadBursts.front();
         if (rb.flushedBeats < rb.totalBeats &&
             rb.beatRecvd[rb.flushedBeats]) {
-            rQueue.push_back(rb.beats[rb.flushedBeats]);
+            RBeat beat = rb.beats[rb.flushedBeats];
+            beat.isSingle = (rb.totalBeats == 1);
+            // Diagnostic: detect two single-beat HT read beats coexisting in
+            // rQueue — the out-of-order-delivery hazard. If this fires, the
+            // gate failed to keep single reads serialized end-to-end.
+            if (beat.isSingle) {
+                for (auto &q : rQueue) {
+                    if (q.isSingle) {
+                        inform("[cyc %lu] RQ_SINGLE_COEXIST: pushing single beat while "
+                               "another single beat already in rQueue (size=%zu) — "
+                               "out-of-order delivery possible",
+                               oramCycle, rQueue.size());
+                        break;
+                    }
+                }
+            }
+            rQueue.push_back(beat);
             rb.flushedBeats++;
             if (rb.flushedBeats >= rb.totalBeats)
                 pendingReadBursts.pop_front();
@@ -2128,6 +2567,13 @@ void OramDevice::driveAxiR()
         oram->m_axi_rvalid = 1; oram->m_axi_rid = b.id;
         oram->m_axi_rlast = b.last ? 1 : 0; oram->m_axi_rresp = 0;
         memcpy(&oram->m_axi_rdata[0], b.data, AXI_DATA_BYTES);
+        // Cycle-by-cycle stash R data trace (FSM=28 S_ST_LOAD) — EVERY cycle
+        uint8_t fsm = oram->dbg_oram_state;
+        if (fsm == 28) {
+            uint32_t *dw = (uint32_t *)b.data;
+            inform("[cyc %lu] STASH_R_DATA: data[0..3]=%08x %08x %08x %08x (last=%d)",
+                   oramCycle, dw[0], dw[1], dw[2], dw[3], b.last);
+        }
     } else {
         oram->m_axi_rvalid = 0; oram->m_axi_rlast = 0;
     }
@@ -2221,47 +2667,140 @@ void OramDevice::initNextSlot()
 
     // --- Phase A: DDR fill (runs once, before per-slot init) ---
     if (initPhase == 0) {
-        // Fill entire bucket region with dummy pattern via sendFunctional.
-        // Write one full bucket (32KB) per call to minimize overhead.
-        // Only fill buckets we'll actually use (numSlots / ORAM_C),
-        // where ORAM_C = 4 (nominal slots per bucket).
-        // No need to fill 256 MB for a few buckets.
+        // Encrypted DDR_FILL: write AES-GCM encrypted data for each REAL
+        // slot position. Dummy positions get zeros. IVT gets matching {IV, tag}.
+        // This eliminates WRITE_INIT (no stash/eviction during init).
         int usedBuckets = ((int)numSlots + ORAM_C - 1) / ORAM_C;
         int totalBuckets = std::min(usedBuckets, (int)MAX_BUCKETS);
-        Addr totalBytes = (Addr)totalBuckets * BUCKET_BYTES;
 
-        inform("[cyc %lu] DDR_FILL: writing %d buckets (%lu bytes, %lu MB) to HBM "
-               "starting at 0x%lx",
-               oramCycle, totalBuckets, totalBytes, totalBytes / (1024*1024),
-               hbmBase);
+        inform("[cyc %lu] DDR_FILL: encrypting %d slots (%d buckets × C=%d) via SW AES-GCM",
+               oramCycle, totalBuckets * ORAM_C, totalBuckets, ORAM_C);
+
+        // Initialize SW AES-GCM engine with same key as RTL
+        AesGcmSw gcm;
+        gcm.setKeyFromWords(params().aes_key_0, params().aes_key_1,
+                            params().aes_key_2, params().aes_key_3);
+
+        Addr ivtBase = hbmBase + IVT_BASE_ADDR;
+        static constexpr int BLOCK_SZ = 4096;       // bytes per ORAM block
+        static constexpr int AES_BLK = 16;           // AES block size
+        static constexpr int BLKS_PER_ORAM = BLOCK_SZ / AES_BLK; // 256
+        static constexpr int BEATS_PER_BLK = BLOCK_SZ / AXI_DATA_BYTES; // 128
 
         for (int b = 0; b < totalBuckets; b++) {
             Addr bucketBase = hbmBase + (Addr)b * BUCKET_BYTES;
-            int beatsPerBucket = BUCKET_BYTES / AXI_DATA_BYTES;
-            for (int beat = 0; beat < beatsPerBucket; beat++) {
-                Addr addr = bucketBase + (Addr)beat * AXI_DATA_BYTES;
-                auto req = std::make_shared<Request>(addr, AXI_DATA_BYTES, 0, reqId);
-                PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
-                uint8_t *buf = new uint8_t[AXI_DATA_BYTES];
-                // Fill with pattern: global beat index
-                uint32_t pattern = (uint32_t)(b * beatsPerBucket + beat);
-                for (int off = 0; off < AXI_DATA_BYTES; off += 4)
-                    memcpy(buf + off, &pattern, std::min(4, AXI_DATA_BYTES - off));
-                pkt->dataDynamic(buf);
-                hbmPort.sendFunctional(pkt);
-                delete pkt;
+
+            for (int pos = 0; pos < ORAM_Z; pos++) {
+                Addr blockBase = bucketBase + (Addr)pos * BLOCK_SZ;
+                int physSlot = b * ORAM_Z + pos; // IVT index
+
+                if (pos < ORAM_C) {
+                    // Real slot: encrypt with AES-GCM
+                    int slotIdx = b * ORAM_C + pos;
+
+                    // Plaintext: all zeros (binary will overwrite with real data)
+                    uint8_t plain[BLOCK_SZ];
+                    memset(plain, 0, BLOCK_SZ);
+
+                    // Unique IV per slot (32-bit slot index in low bytes)
+                    uint8_t iv_aes[12] = {};
+                    iv_aes[8]  = (slotIdx >> 24) & 0xFF;
+                    iv_aes[9]  = (slotIdx >> 16) & 0xFF;
+                    iv_aes[10] = (slotIdx >>  8) & 0xFF;
+                    iv_aes[11] =  slotIdx        & 0xFF;
+
+                    // Convert plaintext from memory layout to AES byte order
+                    // (reverse each 16-byte block) then encrypt
+                    uint8_t plain_aes[BLOCK_SZ], cipher_aes[BLOCK_SZ];
+                    for (int i = 0; i < BLKS_PER_ORAM; i++)
+                        for (int j = 0; j < AES_BLK; j++)
+                            plain_aes[i*AES_BLK + j] = plain[i*AES_BLK + (AES_BLK-1-j)];
+
+                    uint8_t tag_aes[16];
+                    gcm.encrypt(iv_aes, plain_aes, BLOCK_SZ, cipher_aes, tag_aes);
+
+                    // Convert ciphertext from AES byte order back to memory layout
+                    uint8_t cipher_mem[BLOCK_SZ];
+                    for (int i = 0; i < BLKS_PER_ORAM; i++)
+                        for (int j = 0; j < AES_BLK; j++)
+                            cipher_mem[i*AES_BLK + j] = cipher_aes[i*AES_BLK + (AES_BLK-1-j)];
+
+                    // Write encrypted block to HBM (128 beats × 32 bytes)
+                    for (int beat = 0; beat < BEATS_PER_BLK; beat++) {
+                        Addr addr = blockBase + (Addr)beat * AXI_DATA_BYTES;
+                        auto req = std::make_shared<Request>(addr, AXI_DATA_BYTES, 0, reqId);
+                        PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
+                        uint8_t *buf = new uint8_t[AXI_DATA_BYTES];
+                        memcpy(buf, cipher_mem + beat * AXI_DATA_BYTES, AXI_DATA_BYTES);
+                        pkt->dataDynamic(buf);
+                        hbmPort.sendFunctional(pkt);
+                        delete pkt;
+                    }
+
+                    // Write IVT entry: { pad[31:0], tag[127:0], iv[95:0] }
+                    // Convert IV and tag from AES byte order to memory (LE) layout
+                    uint8_t ivtBeat[AXI_DATA_BYTES];
+                    memset(ivtBeat, 0, AXI_DATA_BYTES);
+                    // IV[95:0] in bytes 0-11: reverse from AES order
+                    for (int j = 0; j < 12; j++)
+                        ivtBeat[j] = iv_aes[11 - j];
+                    // Tag[127:0] in bytes 12-27: reverse from AES order
+                    for (int j = 0; j < 16; j++)
+                        ivtBeat[12 + j] = tag_aes[15 - j];
+
+                    Addr ivtAddr = ivtBase + (Addr)physSlot * AXI_DATA_BYTES;
+                    auto ivtReq = std::make_shared<Request>(ivtAddr, AXI_DATA_BYTES, 0, reqId);
+                    PacketPtr ivtPkt = new Packet(ivtReq, MemCmd::WriteReq);
+                    uint8_t *ivtBuf = new uint8_t[AXI_DATA_BYTES];
+                    memcpy(ivtBuf, ivtBeat, AXI_DATA_BYTES);
+                    ivtPkt->dataDynamic(ivtBuf);
+                    hbmPort.sendFunctional(ivtPkt);
+                    delete ivtPkt;
+
+                } else {
+                    // Dummy position: write zeros
+                    for (int beat = 0; beat < BEATS_PER_BLK; beat++) {
+                        Addr addr = blockBase + (Addr)beat * AXI_DATA_BYTES;
+                        auto req = std::make_shared<Request>(addr, AXI_DATA_BYTES, 0, reqId);
+                        PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
+                        uint8_t *buf = new uint8_t[AXI_DATA_BYTES]();
+                        pkt->dataDynamic(buf);
+                        hbmPort.sendFunctional(pkt);
+                        delete pkt;
+                    }
+                    // IVT for dummy: already zeroed by IVT_FILL below
+                }
             }
         }
 
-        inform("[cyc %lu] DDR_FILL: done, %d buckets written", oramCycle, totalBuckets);
+        inform("[cyc %lu] DDR_FILL: done, %d buckets × %d real slots encrypted",
+               oramCycle, totalBuckets, ORAM_C);
 
         // --- Zero-fill stash data region ---
+        // RTL compiled for max STASH_DEPTH entries. At runtime, only
+        // numSlots/2 entries are initialized (= active_buckets * Z / 4).
+        // This avoids zeroing 64 MB when testing with small slot counts.
+        //
+        // ADDRESS-BASE CAVEAT: the RTL stash master issues AXI at
+        // STASH_DDR_BASE = 0x10000000 (== STASH_BASE_ADDR). The driver bases
+        // this fill at (hbmBase + stashOffset). With the default
+        // stash_offset=0x08000000 and hbm_base=0x0 these DO NOT match
+        // (0x08000000 vs 0x10000000). If your config does not override
+        // stash_offset to 0x10000000, the fill targets the wrong region.
+        // Verify your config sets stash_offset == STASH_BASE_ADDR.
         {
             Addr stashBase = hbmBase + stashOffset;
-            int stashEntries = 1024;  // ORAM_STASH_DEPTH from RTL params
+            // Runtime stash sizing: stash = numSlots / 2 (= active_buckets * Z / 4).
+            // RTL is compiled for STASH_DEPTH (max), but we only init what we need.
+            int stashEntries = std::min((int)(numSlots / 2), (int)STASH_DEPTH);
             int beatsPerEntry = 128;  // STASH_BEATS_PER_ENTRY = 128 (4KB / 32B)
-            inform("[cyc %lu] STASH_FILL: zeroing %d stash entries (%d KB)",
-                   oramCycle, stashEntries, stashEntries * 4);
+            inform("[cyc %lu] STASH_FILL: zeroing %d stash entries (%d MB) base=0x%lx",
+                   oramCycle, stashEntries, stashEntries * 4 / 1024,
+                   (uint64_t)stashBase);
+            if (stashBase != hbmBase + STASH_BASE_ADDR)
+                warn("[cyc %lu] STASH_FILL: base 0x%lx != RTL STASH_DDR_BASE 0x%lx "
+                     "(check stash_offset)", oramCycle, (uint64_t)stashBase,
+                     (uint64_t)(hbmBase + STASH_BASE_ADDR));
             for (int e = 0; e < stashEntries; e++) {
                 for (int beat = 0; beat < beatsPerEntry; beat++) {
                     Addr addr = stashBase + (Addr)e * 4096 + (Addr)beat * AXI_DATA_BYTES;
@@ -2277,46 +2816,22 @@ void OramDevice::initNextSlot()
         }
 
         // --- Initialize hash table regions ---
-        // Order: HEAD, NEXT, then SLOT LAST.
-        // SLOT must be last because sendAtomic through Ramulator2 may
-        // have side effects on nearby addresses. Writing SLOT last
-        // guarantees SLOT contains zeros regardless of what HEAD/NEXT did.
+        // Init order: SLOT (zeros, sendAtomic) FIRST, then IVT/SLOTR, then
+        // HEAD/NEXT (0xFF, sendFunctional) LAST. HEAD/NEXT use sendFunctional
+        // to bypass the HBM timing model — sendAtomic has side effects on
+        // nearby addresses that were corrupting HEAD back to zeros.
+        // SLOT stays sendAtomic (zeroing, so corruption is harmless — any
+        // side effect from SLOT's sendAtomic on other regions is overwritten
+        // by the later sendFunctional writes to HEAD/NEXT).
         {
-            // BKT head array: 8191 buckets / 16 per beat = 512 beats
-            Addr bktHeadBase = hbmBase + 0x10600000;
-            int headBeats = 512;
-            inform("[cyc %lu] HT_FILL: init BKT head array (%d beats)",
-                   oramCycle, headBeats);
-            for (int i = 0; i < headBeats; i++) {
-                Addr addr = bktHeadBase + (Addr)i * AXI_DATA_BYTES;
-                auto req = std::make_shared<Request>(addr, AXI_DATA_BYTES, 0, reqId);
-                PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
-                uint8_t *buf = new uint8_t[AXI_DATA_BYTES];
-                memset(buf, 0xFF, AXI_DATA_BYTES);
-                pkt->dataDynamic(buf);
-                hbmPort.sendAtomic(pkt);
-                delete pkt;
-            }
-
-            // BKT next array: 1024 entries / 16 per beat = 64 beats
-            Addr bktNextBase = hbmBase + 0x10700000;
-            int nextBeats = 64;
-            inform("[cyc %lu] HT_FILL: init BKT next array (%d beats)",
-                   oramCycle, nextBeats);
-            for (int i = 0; i < nextBeats; i++) {
-                Addr addr = bktNextBase + (Addr)i * AXI_DATA_BYTES;
-                auto req = std::make_shared<Request>(addr, AXI_DATA_BYTES, 0, reqId);
-                PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
-                uint8_t *buf = new uint8_t[AXI_DATA_BYTES];
-                memset(buf, 0xFF, AXI_DATA_BYTES);
-                pkt->dataDynamic(buf);
-                hbmPort.sendAtomic(pkt);
-                delete pkt;
-            }
-
-            // SLOT hash table LAST: 2048 entries / 4 per beat = 512 beats
-            Addr slotHtBase = hbmBase + 0x10500000;
-            int slotBeats = 512;
+            // SLOT hash table: 2048 entries / 4 per beat = 512 beats
+            // Must be written FIRST because sendAtomic through gem5 HBM2 model may
+            // have side effects on nearby addresses — the original order
+            // (HEAD then NEXT then SLOT) caused SLOT's zeroing to corrupt
+            // HEAD back to zero, making every uninserted bucket head look
+            // like stash index 0 (root cause of phantom-chain bug #5).
+            Addr slotHtBase = hbmBase + HT_SLOT_BASE_ADDR;
+            int slotBeats = 8192;
             inform("[cyc %lu] HT_FILL: zeroing SLOT hash table (%d beats, %d KB)",
                    oramCycle, slotBeats, slotBeats * AXI_DATA_BYTES / 1024);
             for (int i = 0; i < slotBeats; i++) {
@@ -2330,7 +2845,122 @@ void OramDevice::initNextSlot()
                 delete pkt;
             }
 
-            inform("[cyc %lu] HT_FILL: all hash tables initialized", oramCycle);
+            inform("[cyc %lu] HT_FILL: SLOT zeroed (HEAD/NEXT init deferred to after IVT/SLOTR)",
+                   oramCycle);
+        }
+
+        // Metadata address map summary (per-instance offsets) for debug.
+        inform("[cyc %lu] METADATA MAP (hbmBase=0x%lx): STASH=0x%lx PM=0x%lx "
+               "HT_SLOT=0x%lx HT_HEAD=0x%lx HT_NEXT=0x%lx IVT=0x%lx "
+               "SLOT_R=0x%lx BUCKET_META=0x%lx",
+               oramCycle, (uint64_t)hbmBase,
+               (uint64_t)(hbmBase + STASH_BASE_ADDR),
+               (uint64_t)(hbmBase + PM_BASE_ADDR),
+               (uint64_t)(hbmBase + HT_SLOT_BASE_ADDR),
+               (uint64_t)(hbmBase + HT_BKT_HEAD_ADDR),
+               (uint64_t)(hbmBase + HT_BKT_NEXT_ADDR),
+               (uint64_t)(hbmBase + IVT_BASE_ADDR),
+               (uint64_t)(hbmBase + SLOT_R_BASE_ADDR),
+               (uint64_t)(hbmBase + BUCKET_META_BASE_ADDR));
+
+        // --- Initialize IV/TAG region (per-physical-slot) ---
+        // The IVT table is addressed per physical bucket slot
+        // (phys_idx = bucket*Z + pos). Zero the worst-case footprint so any
+        // read of a not-yet-written physical position returns a known value
+        // rather than garbage. Worst case = numBuckets*Z physical slots,
+        // one 32B beat each. We zero up to MAX_BUCKETS*ORAM_Z entries.
+        {
+            Addr ivtBase = hbmBase + IVT_BASE_ADDR;
+            int usedBuckets = ((int)numSlots + ORAM_C - 1) / ORAM_C;
+            int ivtEntries = std::min(usedBuckets, (int)MAX_BUCKETS) * ORAM_Z;
+            inform("[cyc %lu] IVT_FILL: zeroing %d IV/TAG entries (%d KB) base=0x%lx",
+                   oramCycle, ivtEntries, ivtEntries * AXI_DATA_BYTES / 1024,
+                   (uint64_t)ivtBase);
+            for (int i = 0; i < ivtEntries; i++) {
+                Addr addr = ivtBase + (Addr)i * AXI_DATA_BYTES;
+                auto req = std::make_shared<Request>(addr, AXI_DATA_BYTES, 0, reqId);
+                PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
+                uint8_t *buf = new uint8_t[AXI_DATA_BYTES];
+                memset(buf, 0, AXI_DATA_BYTES);
+                pkt->dataDynamic(buf);
+                hbmPort.sendAtomic(pkt);
+                delete pkt;
+            }
+            inform("[cyc %lu] IVT_FILL: IV/TAG region initialized", oramCycle);
+        }
+
+        // --- Initialize slot_r region (per-stash-entry slot address) ---
+        // slot_r is written on insert before being read on eviction, so a
+        // pre-init is not strictly required for correctness. Zero it anyway for
+        // determinism / clean debug, matching the IVT/HT init style.
+        // One 256-bit beat per stash entry: { pad[223:0], slot_addr[31:0] }.
+        {
+            Addr srBase = hbmBase + SLOT_R_BASE_ADDR;
+            int srEntries = std::min((int)(numSlots / 2), (int)STASH_DEPTH);
+            inform("[cyc %lu] SLOTR_FILL: zeroing %d slot_r entries (%d KB) base=0x%lx",
+                   oramCycle, srEntries, srEntries * AXI_DATA_BYTES / 1024,
+                   (uint64_t)srBase);
+            for (int i = 0; i < srEntries; i++) {
+                Addr addr = srBase + (Addr)i * AXI_DATA_BYTES;
+                auto req = std::make_shared<Request>(addr, AXI_DATA_BYTES, 0, reqId);
+                PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
+                uint8_t *buf = new uint8_t[AXI_DATA_BYTES];
+                memset(buf, 0, AXI_DATA_BYTES);
+                pkt->dataDynamic(buf);
+                hbmPort.sendAtomic(pkt);
+                delete pkt;
+            }
+            inform("[cyc %lu] SLOTR_FILL: slot_r region initialized", oramCycle);
+        }
+
+        // NOTE: bucket_meta region is initialized per-slot in Phase C (case 3)
+        // via direct HBM writes at BUCKET_META_BASE_ADDR, so no bulk fill here.
+
+        // --- BKT HEAD and NEXT arrays: MUST be initialized LAST ---
+        // gem5 HBM2 model sendAtomic has side effects on nearby addresses (documented
+        // in the original code). Any sendAtomic fill (SLOT at 0x141, IVT at 0x144,
+        // SLOTR at 0x148) can corrupt HEAD (0x142) or NEXT (0x143) if they were
+        // written earlier. Writing HEAD/NEXT dead last guarantees no subsequent
+        // sendAtomic fill can overwrite them.
+        {
+            // BKT head array: 8191 buckets / 16 per beat = 512 beats → 0xFF
+            // Uses sendFunctional (not sendAtomic) to bypass the HBM timing
+            // model entirely — sendAtomic has side effects on nearby addresses
+            // that corrupted HEAD when it was written before SLOT (bug #5).
+            // sendFunctional writes directly to backing store, no side effects.
+            Addr bktHeadBase = hbmBase + HT_BKT_HEAD_ADDR;
+            int headBeats = 512;
+            inform("[cyc %lu] HT_FILL: init BKT head array LAST (%d beats) -> 0xFF via sendFunctional",
+                   oramCycle, headBeats);
+            for (int i = 0; i < headBeats; i++) {
+                Addr addr = bktHeadBase + (Addr)i * AXI_DATA_BYTES;
+                auto req = std::make_shared<Request>(addr, AXI_DATA_BYTES, 0, reqId);
+                PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
+                uint8_t *buf = new uint8_t[AXI_DATA_BYTES];
+                memset(buf, 0xFF, AXI_DATA_BYTES);
+                pkt->dataDynamic(buf);
+                hbmPort.sendFunctional(pkt);
+                delete pkt;
+            }
+
+            // BKT next array: 1024 beats → 0xFF (also sendFunctional)
+            Addr bktNextBase = hbmBase + HT_BKT_NEXT_ADDR;
+            int nextBeats = 1024;
+            inform("[cyc %lu] HT_FILL: init BKT next array LAST (%d beats) -> 0xFF via sendFunctional",
+                   oramCycle, nextBeats);
+            for (int i = 0; i < nextBeats; i++) {
+                Addr addr = bktNextBase + (Addr)i * AXI_DATA_BYTES;
+                auto req = std::make_shared<Request>(addr, AXI_DATA_BYTES, 0, reqId);
+                PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
+                uint8_t *buf = new uint8_t[AXI_DATA_BYTES];
+                memset(buf, 0xFF, AXI_DATA_BYTES);
+                pkt->dataDynamic(buf);
+                hbmPort.sendFunctional(pkt);
+                delete pkt;
+            }
+
+            inform("[cyc %lu] HT_FILL: HEAD + NEXT initialized (last step, safe from gem5 HBM2 model side effects)",
+                   oramCycle);
         }
 
         initPhase = 1;
@@ -2433,7 +3063,7 @@ void OramDevice::initNextSlot()
       }
       case 3: {
         // --- bucket_meta init via RTL's init_bm_wr_* signals ---
-        // slot_list is Z * SLOT_ID_W = 8 * 12 = 96 bits, packed into
+        // slot_list is Z * SLOT_ID_W = 8 * 15 = 120 bits, packed into
         // uint32_t[3]. Each 12-bit field holds one slot ID.
         //
         // We must accumulate: each time we add a slot to the bucket,
@@ -2480,18 +3110,57 @@ void OramDevice::initNextSlot()
             accum_slot_list[instanceId][wordIdx + 1] |= (slotId >> lo_bits) & ((1u << hi_bits) - 1);
         }
 
-        oram->init_bm_wr_bucket = bucketIdx;
-        // Copy slot_list — use min of src/dst size to prevent overflow
-        // if Verilator and our accum have different sizes
-        size_t copyLen = std::min(sizeof(accum_slot_list[instanceId]),
-                                  sizeof(oram->init_bm_wr_slot_list));
-        memcpy(&oram->init_bm_wr_slot_list[0], accum_slot_list[instanceId], copyLen);
-        oram->init_bm_wr_fill = posInBucket + 1;
-        oram->init_bm_wr_en = 1;
+        // bucket_meta now lives in HBM (bucket_meta_hbm master). Write the
+        // packed 124-bit entry DIRECTLY to HBM via sendFunctional at
+        // BUCKET_META_BASE, mirroring the pos_map init above. This avoids
+        // pulsing init_bm_wr_* through the HBM master's 2-deep write queue
+        // (which could overflow at the init cadence). Beat layout matches
+        // bucket_meta_hbm: { pad, slot_list[119:0], fill_count[3:0] }.
+        //
+        // We rewrite the FULL entry every slot (accumulated slot_list + new
+        // fill); last write for a bucket leaves the final correct contents.
+        {
+            static constexpr int SLOT_ID_W2 = 15;   // local copy of SLOT_ID_W
+            static constexpr int FILL_W2     = 4;    // FILL_CNT_W
+            uint8_t bmBeat[AXI_DATA_BYTES];
+            memset(bmBeat, 0, AXI_DATA_BYTES);
+            // fill_count in low 4 bits of byte 0
+            uint32_t fillv = (uint32_t)(posInBucket + 1) & 0xF;
+            // slot_list occupies bits [ENTRY_W-1:FILL_W] = [123:4].
+            // Build a 128-bit value = (slot_list << 4) | fill, then emit LE.
+            // accum_slot_list holds slot_list in bits [119:0] across 4 words.
+            // Shift left by FILL_W2 (4) into a 160-bit staging buffer (5 words).
+            uint32_t stage[5] = {0,0,0,0,0};
+            for (int w = 0; w < 4; w++) {
+                uint32_t v = accum_slot_list[instanceId][w];
+                stage[w]   |= (v << FILL_W2);
+                stage[w+1] |= (v >> (32 - FILL_W2));
+            }
+            stage[0] |= fillv;   // fill in low nibble
+            // Emit stage[0..4] little-endian into bmBeat (covers 160 bits;
+            // only 124 are meaningful, the rest are zero pad).
+            for (int w = 0; w < 5; w++) {
+                bmBeat[w*4 + 0] = (uint8_t)(stage[w] & 0xFF);
+                bmBeat[w*4 + 1] = (uint8_t)((stage[w] >> 8) & 0xFF);
+                bmBeat[w*4 + 2] = (uint8_t)((stage[w] >> 16) & 0xFF);
+                bmBeat[w*4 + 3] = (uint8_t)((stage[w] >> 24) & 0xFF);
+            }
+            Addr bmAddr = hbmBase + BUCKET_META_BASE_ADDR
+                + (Addr)bucketIdx * AXI_DATA_BYTES;
+            auto req = std::make_shared<Request>(bmAddr, AXI_DATA_BYTES, 0, reqId);
+            PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
+            uint8_t *buf = new uint8_t[AXI_DATA_BYTES];
+            memcpy(buf, bmBeat, AXI_DATA_BYTES);
+            pkt->dataDynamic(buf);
+            hbmPort.sendFunctional(pkt);
+            delete pkt;
+        }
+        // Keep init_bm_wr_en deasserted — init no longer drives the RTL port.
+        oram->init_bm_wr_en = 0;
 
         if (initSlotIdx < 3 || initSlotIdx == (int)numSlots - 1
             || posInBucket == ORAM_C - 1)
-            inform("[cyc %lu] INIT bm: slot=%d bkt=%u pos=%d slotId=%u "
+            inform("[cyc %lu] INIT bm(HBM): slot=%d bkt=%u pos=%d slotId=%u "
                    "fill=%d list=[0x%08x 0x%08x 0x%08x 0x%08x]",
                    oramCycle, initSlotIdx, bucketIdx, posInBucket, slotId,
                    posInBucket + 1,
@@ -2605,8 +3274,21 @@ void OramDevice::grantLease()
                 // client's token for compatibility with existing write-init
                 // code paths that use `leaseToken`.
                 leaseToken = leaseTokens[0];
-                writeInitIdx = 0;
-                ctrlState = OramState::WRITE_INIT;
+                if (cpuDriven) {
+                    // cpu_driven: skip WRITE_INIT — the binary writes before
+                    // it reads (test_random tracks which slots were written).
+                    // DDR_FILL + pos_map + HT + IVT are already initialized via
+                    // sendFunctional. Going through the ORAM path for 32768 init
+                    // writes overflows the stash at full capacity.
+                    writeInitIdx = numSlots;
+                    ctrlState = OramState::IDLE;
+                    ready = true;
+                    inform("[cyc %lu] cpu_driven: skipping WRITE_INIT, straight to READY",
+                           oramCycle);
+                } else {
+                    writeInitIdx = 0;
+                    ctrlState = OramState::WRITE_INIT;
+                }
             }
             // else loop: tick() will re-enter grantLease with currentGrantClient++
         } else if (oram->mgmt_error) {
@@ -2836,11 +3518,51 @@ void OramDevice::completeOp()
     totalOpCycles += cyc;
     opsCompleted++;
 
+    // E2E: stamp RTL completion
+    if (!cmdQueue.empty() &&
+        cmdQueue.front().phase == CmdEntry::Phase::IN_PROGRESS) {
+        cmdQueue.front().rtlDoneTick = curTick();
+    }
+
     // Progress tracking — always print so user sees forward movement
     inform("ORAM[%u] op %u/%u done (%s, %lu cyc, %.1f us elapsed)",
            instanceId, opsCompleted, numOps,
            currentOpIsPcie ? "PCIe" : "HBM", cyc,
            curTick() / 1e6);
+
+    // HT operation anomaly detection
+    if (oram->dbg_ht_ins_overwritten || oram->dbg_ht_del_overwritten ||
+        oram->dbg_ht_ins_issued != oram->dbg_ht_ins_completed ||
+        oram->dbg_ht_del_issued != oram->dbg_ht_del_completed ||
+        oram->dbg_ht_latch_ins_active || oram->dbg_ht_latch_del_active) {
+        warn("HT_ANOMALY inst=%u op=%u: "
+             "ins=%u/%u del=%u/%u overwrite_ins=%d overwrite_del=%d "
+             "latch_ins=%d latch_del=%d",
+             instanceId, opsCompleted,
+             (unsigned)oram->dbg_ht_ins_issued,
+             (unsigned)oram->dbg_ht_ins_completed,
+             (unsigned)oram->dbg_ht_del_issued,
+             (unsigned)oram->dbg_ht_del_completed,
+             (int)oram->dbg_ht_ins_overwritten,
+             (int)oram->dbg_ht_del_overwritten,
+             (int)oram->dbg_ht_latch_ins_active,
+             (int)oram->dbg_ht_latch_del_active);
+    }
+    // Log HT counters for every READ op (to check the op that LAST accessed a failing slot)
+    if (!currentOpIsWrite) {
+        inform("HT_READ_SUMMARY inst=%u op=%u slotIdx=%u: "
+               "ins=%u/%u del=%u/%u ovr_i=%d ovr_d=%d found_b=%d found_s=%d",
+               instanceId, opsCompleted,
+               (unsigned)((currentOpAddr - LEASE_BASE) / SLOT_SIZE),
+               (unsigned)oram->dbg_ht_ins_issued,
+               (unsigned)oram->dbg_ht_ins_completed,
+               (unsigned)oram->dbg_ht_del_issued,
+               (unsigned)oram->dbg_ht_del_completed,
+               (int)oram->dbg_ht_ins_overwritten,
+               (int)oram->dbg_ht_del_overwritten,
+               (int)oram->dbg_found_in_bucket,
+               (int)oram->dbg_found_in_stash);
+    }
 
     // Round-trip data verification
     if (!currentOpIsWrite && rdataShadowValid[activeHwClient]) {
@@ -2853,10 +3575,10 @@ void OramDevice::completeOp()
                opsCompleted, currentOpAddr);
     }
     if (currentOpIsWrite) {
-        uint32_t seed = opsCompleted - 1;  // opsCompleted was just incremented
         inform("VERIFY-WRITE op=%u addr=0x%lx beat0_wdata[0..3]=%08x %08x %08x %08x",
                opsCompleted, currentOpAddr,
-               seed ^ 0 ^ 0, seed ^ 0 ^ 1, seed ^ 0 ^ 2, seed ^ 0 ^ 3);
+               currentOpWdata[0], currentOpWdata[1],
+               currentOpWdata[2], currentOpWdata[3]);
     }
 
     DPRINTF(Oram, "[%lu] Op %u done: %s 0x%lx %lu cyc (%s)\n",
@@ -2964,14 +3686,27 @@ void OramDevice::completeOp()
         cmdQueue.front().phase == CmdEntry::Phase::IN_PROGRESS) {
         CmdEntry &op = cmdQueue.front();
 
-        if (!currentOpIsWrite) {
+        if (op.op != 1) {  // READ — use op.op, NOT currentOpIsWrite
+                           // (currentOpIsWrite may be stale if next op dispatched)
             if (rdataShadowValid[activeHwClient]) {
                 for (int i = 0; i < 8; i++)
                     op.rdata[i] = rdataShadow[activeHwClient][i];
                 op.rdata_valid = true;
                 rdataShadowValid[activeHwClient] = false;  // consume
+            } else if (oram->client_rdata_valid & (1u << activeHwClient)) {
+                // Shadow missed — capture directly from live RTL signal.
+                // This can happen if client_done and client_rdata_valid
+                // assert on the same cycle but the shadow capture order
+                // within tick() missed it.
+                unsigned rb = activeHwClient * 8;
+                for (int i = 0; i < 8; i++)
+                    op.rdata[i] = oram->client_rdata[rb + i];
+                op.rdata_valid = true;
+                inform("RDATA_LIVE_FALLBACK hw=%u slot=0x%lx "
+                       "(shadow missed, live signal OK)",
+                       activeHwClient, currentOpAddr);
             } else {
-                // Shadow wasn't populated — defensive fallback.
+                // Truly not valid — defensive fallback.
                 for (int i = 0; i < 8; i++) op.rdata[i] = 0;
                 op.rdata_valid = false;
                 warn("CPU-op RD done but rdataShadow not populated "
@@ -3034,8 +3769,28 @@ void OramDevice::printStats()
     inform("  Routing: stash+posmap(HBM=%lu PCIe=%lu) bucket(HBM=%lu PCIe=%lu)",
            stashHbmBeats, stashPcieBeats,
            bucketHbmBeats, bucketPcieBeats);
+    inform("  Metadata HBM beats: PM=%lu HT=%lu IVT=%lu SLOT_R=%lu BUCKET_META=%lu",
+           pmBeats, htBeats, ivtBeats, slotrBeats, bmetaBeats);
     if (stashPcieBeats > 0)
         warn("  STASH ROUTING ERROR: %lu stash beats went to PCIe!", stashPcieBeats);
+
+    // E2E latency summary (cpu_driven mode)
+    if (e2eOpsTracked > 0) {
+        Tick clk = oramClkPeriod;
+        Tick avgRtl = e2eRtlSum / e2eOpsTracked;
+        Tick avgWb  = e2eWritebackSum / e2eOpsTracked;
+        Tick avgSS  = avgRtl + avgWb;
+        inform("  === E2E LATENCY (%lu ops) ===", e2eOpsTracked);
+        inform("    RTL processing:  avg %lu cyc (%.1f ns)",
+               avgRtl / clk, (double)avgRtl / 1000.0);
+        inform("    result write:    avg %lu cyc (%.1f ns)",
+               avgWb / clk, (double)avgWb / 1000.0);
+        inform("    STEADY-STATE:    avg %lu cyc (%.1f ns)  [RTL + writeback]",
+               avgSS / clk, (double)avgSS / 1000.0);
+        inform("    COLD-START:      %lu cyc (%.1f ns)  [first op, incl. ring fetch]",
+               e2eColdStart / clk, (double)e2eColdStart / 1000.0);
+        inform("    (ring fetch is pipelined — overlapped with prev op's RTL)");
+    }
 }
 
 // =============================================================================
@@ -3158,6 +3913,15 @@ Tick OramDevice::CmdPort::recvAtomic(PacketPtr pkt)
             uint32_t v;
             memcpy(&v, pkt->getPtr<uint8_t>(), 4);
 
+            // Debug echo registers written by the C test at end-of-run.
+            // Surface PASS/FAIL to the console so the test verdict is visible
+            // without inspecting the result buffer.
+            if (offset == 0x20) {
+                inform("[%s] CTEST DEBUG_PASS = %u", dev.name().c_str(), v);
+            } else if (offset == 0x24) {
+                inform("[%s] CTEST DEBUG_FAIL = %u", dev.name().c_str(), v);
+            }
+
             if (offset == 0x100) {
                 dev.stagingCmd.slot_addr = v;
             } else if (offset == 0x104) {
@@ -3182,6 +3946,10 @@ Tick OramDevice::CmdPort::recvAtomic(PacketPtr pkt)
                     e.opIdx = dev.cpuOpCount + dev.cmdQueue.size();
                     e.rdata_valid = false;
                     memset(e.rdata, 0, sizeof(e.rdata));
+                    e.fetchTick = curTick();
+                    e.dispatchTick = 0;
+                    e.rtlDoneTick = 0;
+                    e.commitTick = 0;
                     dev.cmdQueue.push_back(e);
                     DPRINTF(Oram, "CPU doorbell: %s slot=0x%x hwC=%u "
                             "lease=%u token=0x%x → queue[%zu] opIdx=%lu\n",
