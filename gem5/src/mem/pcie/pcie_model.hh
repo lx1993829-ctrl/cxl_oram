@@ -63,6 +63,8 @@ class PCIeModel : public ClockedObject
     Tick readLatency, writeLatency, rcLatency, rcThroughputDelay;
     Tick fpgaClockPeriod;  // PCIe Bug #7 fix: from Param.Latency
     std::vector<Tick> bridgeBusyUntil;  // Per-port downstream CDC serialization
+    Tick rcDownstreamBusyUntil;  // Shared RC pipeline throughput (downstream)
+    Tick rcUpstreamBusyUntil;    // Shared RC pipeline throughput (upstream)
 
     // ================================================================
     //  Data Link Layer
@@ -183,6 +185,7 @@ class PCIeModel : public ClockedObject
     void returnPostedCredits(unsigned sp, int dc);
     void returnNonPostedCredits(unsigned sp);
     void returnCompletionCredits(unsigned sp, int dc);
+    void wakeupDrainOnCreditReturn();
 
     struct DeferredCredit {
         enum Type { Posted, NonPosted, Completion } type;
@@ -400,12 +403,16 @@ class PCIeModel : public ClockedObject
     // ================================================================
     std::vector<Tick> perPortLastDrainTick;
     Tick lastPortStuckCheckTick = 0;
+    int rcDbgCount = 0;      // per-instance debug limit (was static local)
+    int rcWrDbgCount = 0;
+    int rcDnDbgCount = 0;
     void dumpPortState(unsigned p, const char *where);
     void checkPortStalls();
 
     struct ResponseEntry {
         PacketPtr pkt;
         int portIdx;
+        Tick readyTick;   // earliest tick this response may be delivered
     };
     // Phase A.1: per-port response queues. Each port can be blocked
     // independently on sendTimingResp; round-robin across ports.

@@ -74,6 +74,8 @@ PCIeModel::PCIeModel(const Params &p)
       // .hh:282-285 — Link serialization shared state
       upstreamBusyUntil(0),
       downstreamBusyUntil(0),
+      rcDownstreamBusyUntil(0),
+      rcUpstreamBusyUntil(0),
       // .hh:370-380 — Pipeline events (declaration order)
       drainDeviceEvent([this]{ drainDeviceRequests(); }, name()),
       upstreamEvent([this]{ processUpstreamQueue(); }, name()),
@@ -163,16 +165,18 @@ PCIeModel::PCIeModel(const Params &p)
     for (uint16_t t = 0; t < maxTags; ++t)
         freeTags.push_back(t);
 
-    // Phase A.1: per-port credit pool init. Each port gets the full
-    // param-specified Max for every credit class.
-    for (unsigned sp = 0; sp < devicePorts.size(); sp++) {
-        credits[sp].phMax = p.credits_ph;
-        credits[sp].pdMax = p.credits_pd;
-        credits[sp].nphMax = p.credits_nph;
-        credits[sp].npdMax = p.credits_npd;
-        credits[sp].cplhMax = p.credits_cplh;
-        credits[sp].cpldMax = p.credits_cpld;
-    }
+    // Phase A.1: SHARED credit pool. All device ports compete for one
+    // link-level credit budget (stored in credits[0]). This models real
+    // PCIe where the RC advertises one credit set per VC, shared by all
+    // functions on the link. Credits consumed by port A reduce the pool
+    // for all other ports — natural contention at high N.
+    credits[0].phMax   = p.credits_ph;
+    credits[0].pdMax   = p.credits_pd;
+    credits[0].nphMax  = p.credits_nph;
+    credits[0].npdMax  = p.credits_npd;
+    credits[0].cplhMax = p.credits_cplh;
+    credits[0].cpldMax = p.credits_cpld;
+    unsigned N = devicePorts.size();
     initCredits();
     // outstandingWrites resized to per-port vector above.
     pendingDeviceRetry = false;
@@ -250,11 +254,8 @@ void PCIeModel::dumpDiagnostics()
         totalHostQ += pendingHostReqs[sp].size();
         totalRespQ += responseQueue[sp].size();
     }
-    int totalNph = 0, totalNphMax = 0;
-    for (unsigned sp = 0; sp < credits.size(); sp++) {
-        totalNph += credits[sp].nphCredits;
-        totalNphMax += credits[sp].nphMax;
-    }
+    int totalNph = credits[0].nphCredits;
+    int totalNphMax = credits[0].nphMax;
     // A9: invariant — sum of per-port outstanding reads must equal
     // the global outstandingReads map size. Catches refactor regressions.
     {
@@ -594,22 +595,16 @@ PCIeModel::buildCompletionTlp(Addr addr, unsigned payloadBytes,
 
 void PCIeModel::initCredits()
 {
-    // Phase A.1: per-port credit pool reset.
-    for (unsigned sp = 0; sp < credits.size(); sp++) {
-        auto &c = credits[sp];
-        c.phCredits = c.phMax;     c.pdCredits = c.pdMax;
-        c.nphCredits = c.nphMax;   c.npdCredits = c.npdMax;
-        c.cplhCredits = c.cplhMax; c.cpldCredits = c.cpldMax;
-    }
-    // Use port 0 as a representative for the inform (all ports init same).
-    if (!credits.empty()) {
-        auto &c0 = credits[0];
-        inform("PCIe credits initialized (per-port, %lu ports): "
-               "ph=%d pd=%d nph=%d npd=%d cplh=%d cpld=%d",
-               credits.size(),
-               c0.phMax, c0.pdMax, c0.nphMax,
-               c0.npdMax, c0.cplhMax, c0.cpldMax);
-    }
+    // Shared pool: only credits[0] holds the link budget.
+    auto &c = credits[0];
+    c.phCredits = c.phMax;     c.pdCredits = c.pdMax;
+    c.nphCredits = c.nphMax;   c.npdCredits = c.npdMax;
+    c.cplhCredits = c.cplhMax; c.cpldCredits = c.cpldMax;
+    inform("PCIe credits initialized (shared pool, %lu ports): "
+           "ph=%d pd=%d nph=%d npd=%d cplh=%d cpld=%d",
+           credits.size(),
+           c.phMax, c.pdMax, c.nphMax,
+           c.npdMax, c.cplhMax, c.cpldMax);
 }
 
 int PCIeModel::dataCreditsNeeded(unsigned pb) const
@@ -623,74 +618,90 @@ bool PCIeModel::hasPostedCredits(unsigned sp, int dc) const
 {
     panic_if(sp >= credits.size(),
              "PCIe hasPostedCredits: bad sp=%u (max=%lu)", sp, credits.size());
-    return credits[sp].phCredits >= 1 && credits[sp].pdCredits >= dc;
+    return credits[0].phCredits >= 1 && credits[0].pdCredits >= dc;
 }
 bool PCIeModel::hasNonPostedCredits(unsigned sp) const
 {
     panic_if(sp >= credits.size(),
              "PCIe hasNonPostedCredits: bad sp=%u (max=%lu)",
              sp, credits.size());
-    return credits[sp].nphCredits >= 1;
+    return credits[0].nphCredits >= 1;
 }
 bool PCIeModel::hasCompletionCredits(unsigned sp, int dc) const
 {
     panic_if(sp >= credits.size(),
              "PCIe hasCompletionCredits: bad sp=%u (max=%lu)",
              sp, credits.size());
-    return credits[sp].cplhCredits >= 1 && credits[sp].cpldCredits >= dc;
+    return credits[0].cplhCredits >= 1 && credits[0].cpldCredits >= dc;
 }
 void PCIeModel::consumePostedCredits(unsigned sp, int dc)
 {
     panic_if(sp >= credits.size(),
              "PCIe consumePostedCredits: bad sp=%u dc=%d (max=%lu)",
              sp, dc, credits.size());
-    credits[sp].phCredits--;
-    credits[sp].pdCredits -= dc;
+    credits[0].phCredits--;
+    credits[0].pdCredits -= dc;
     DPRINTF(PCIe, "  [CR-CONS] port=%u Posted ph=1 pd=%d → ph=%d pd=%d\n",
-            sp, dc, credits[sp].phCredits, credits[sp].pdCredits);
+            sp, dc, credits[0].phCredits, credits[0].pdCredits);
 }
 void PCIeModel::consumeNonPostedCredits(unsigned sp)
 {
     panic_if(sp >= credits.size(),
              "PCIe consumeNonPostedCredits: bad sp=%u (max=%lu)",
              sp, credits.size());
-    credits[sp].nphCredits--;
+    credits[0].nphCredits--;
     DPRINTF(PCIe, "  [CR-CONS] port=%u NonPosted nph=1 → nph=%d\n",
-            sp, credits[sp].nphCredits);
+            sp, credits[0].nphCredits);
 }
 void PCIeModel::consumeCompletionCredits(unsigned sp, int dc)
 {
     panic_if(sp >= credits.size(),
              "PCIe consumeCompletionCredits: bad sp=%u dc=%d (max=%lu)",
              sp, dc, credits.size());
-    credits[sp].cplhCredits--;
-    credits[sp].cpldCredits -= dc;
+    credits[0].cplhCredits--;
+    credits[0].cpldCredits -= dc;
     DPRINTF(PCIe, "  [CR-CONS] port=%u Cpl cplh=1 cpld=%d → "
             "cplh=%d cpld=%d\n",
-            sp, dc, credits[sp].cplhCredits, credits[sp].cpldCredits);
+            sp, dc, credits[0].cplhCredits, credits[0].cpldCredits);
 }
 void PCIeModel::returnPostedCredits(unsigned sp, int dc)
 {
     panic_if(sp >= credits.size(),
              "PCIe returnPostedCredits: bad sp=%u dc=%d (max=%lu)",
              sp, dc, credits.size());
-    credits[sp].phCredits++;
-    credits[sp].pdCredits += dc;
+    credits[0].phCredits++;
+    credits[0].pdCredits += dc;
+    wakeupDrainOnCreditReturn();
 }
 void PCIeModel::returnNonPostedCredits(unsigned sp)
 {
     panic_if(sp >= credits.size(),
              "PCIe returnNonPostedCredits: bad sp=%u (max=%lu)",
              sp, credits.size());
-    credits[sp].nphCredits++;
+    credits[0].nphCredits++;
+    wakeupDrainOnCreditReturn();
 }
 void PCIeModel::returnCompletionCredits(unsigned sp, int dc)
 {
     panic_if(sp >= credits.size(),
              "PCIe returnCompletionCredits: bad sp=%u dc=%d (max=%lu)",
              sp, dc, credits.size());
-    credits[sp].cplhCredits++;
-    credits[sp].cpldCredits += dc;
+    credits[0].cplhCredits++;
+    credits[0].cpldCredits += dc;
+    wakeupDrainOnCreditReturn();
+}
+
+// Shared credit pool: when credits return, ANY port's buffered
+// requests may now be processable. Reschedule the drain event.
+void PCIeModel::wakeupDrainOnCreditReturn()
+{
+    if (drainDeviceEvent.scheduled()) return;
+    for (unsigned p = 0; p < devicePorts.size(); p++) {
+        if (!deviceReadBuffers[p].empty() || !deviceWriteBuffers[p].empty()) {
+            schedule(drainDeviceEvent, curTick());
+            return;
+        }
+    }
 }
 
 // Deferred credit return — per-port queue.
@@ -1063,7 +1074,8 @@ void PCIeModel::deliverCompletions(Tick now)
                 // Phase A.1: per-port responseQueue.
                 for (auto *devPkt : devPkts) {
                     devPkt->makeResponse();
-                    responseQueue[srcPort].push_back({devPkt, srcPort});
+                    responseQueue[srcPort].push_back(
+                        {devPkt, srcPort, curTick()});
                 }
                 // Review item #1: retirement frees RRB entries. Each beat
                 // now retired to AXI R channel releases one RRB slot.
@@ -1214,9 +1226,12 @@ PCIeModel::handleDeviceRequest(PacketPtr pkt, int srcPort)
         respPkt->senderState = pkt->senderState;
         pkt->senderState = nullptr;
 
-        responseQueue[srcPort].push_back({respPkt, srcPort});
+        Tick deliverAt = curTick() + bridgePipelineDelay;
+        responseQueue[srcPort].push_back({respPkt, srcPort, deliverAt});
         if (!responseEvent.scheduled())
-            schedule(responseEvent, curTick() + bridgePipelineDelay);
+            schedule(responseEvent, deliverAt);
+        else if (deliverAt < responseEvent.when())
+            reschedule(responseEvent, deliverAt);
 
         lastBrespDelivered = curTick() + bridgePipelineDelay;
         writeBrespCount++;
@@ -1299,10 +1314,10 @@ PCIeModel::processBufferedRead(PacketPtr pkt, int srcPort)
 
     // Check NPH credit (1 MRd TLP for the entire group). Phase A.1:
     // per-port credit pool — this port's nphCredits.
-    if (credits[srcPort].nphCredits < 1) {
+    if (credits[0].nphCredits < 1) {
         stats.creditStalls++;
         DPRINTF(PCIe, "  RD CREDIT STALL: port=%d nph=%d < 1\n",
-                srcPort, credits[srcPort].nphCredits);
+                srcPort, credits[0].nphCredits);
         return false;  // nothing modified
     }
 
@@ -1388,12 +1403,12 @@ PCIeModel::processBufferedWrite(PacketPtr pkt, int srcPort)
     // Check PH + PD credits for ONE coalesced MWr TLP. Phase A.1:
     // per-port credit pool — this port's ph/pd credits.
     int totalPd = dataCreditsNeeded(totalSize);
-    if (credits[srcPort].phCredits < 1 ||
-        credits[srcPort].pdCredits < totalPd) {
+    if (credits[0].phCredits < 1 ||
+        credits[0].pdCredits < totalPd) {
         stats.creditStalls++;
         DPRINTF(PCIe, "  WR CREDIT STALL: port=%d ph=%d<1 OR pd=%d<%d\n",
-                srcPort, credits[srcPort].phCredits,
-                credits[srcPort].pdCredits, totalPd);
+                srcPort, credits[0].phCredits,
+                credits[0].pdCredits, totalPd);
         return false;  // nothing modified
     }
 
@@ -1599,34 +1614,44 @@ void PCIeModel::processUpstreamQueue()
                     continue;
                 }
 
-                Tick rcDelay;
-                Tick rcGap = now - lastUpstreamRcTick;
-                if (rcGap <= burstWindowTicks) rcDelay = 0;
-                else rcDelay = rcLatency;
-                lastUpstreamRcTick = now;
+                // Upstream RC pipeline (shared, serialized) — same model
+                // as downstream. Cold = pipeline idle. Warm = serialize
+                // at rcThroughputDelay via rcUpstreamBusyUntil.
+                bool rcColdUp = (now > rcUpstreamBusyUntil + burstWindowTicks);
+                Tick rcStartUp, rcEndUp;
+                if (rcColdUp) {
+                    rcStartUp = now + rcLatency;
+                    rcEndUp = rcStartUp;
+                } else {
+                    rcStartUp = std::max(now, rcUpstreamBusyUntil);
+                    rcEndUp = rcStartUp + rcThroughputDelay;
+                }
+                rcUpstreamBusyUntil = rcEndUp;
 
-                DPRINTF(PCIe, "  [UP] RC-window: gap=%llu window=%llu "
-                        "rcDelay=%llu @%llu\n",
-                        rcGap, burstWindowTicks, rcDelay, now);
+                DPRINTF(PCIe, "  [UP] RC: cold=%d pipeIdle=%lld "
+                        "rcEnd=%llu @%llu\n",
+                        rcColdUp,
+                        (long long)now - (long long)rcUpstreamBusyUntil,
+                        rcEndUp, now);
 
-                Tick sendTick = std::max(now + rcDelay, curTick() + 1);
+                Tick sendTick = std::max(rcEndUp, curTick() + 1);
 
                 // Temporary RC debug — first 10 read TLPs only
                 {
-                    static int rcDbgCount = 0;
+                    // Bug 5 fix: now a member variable
                     if (rcDbgCount < 10) {
                         inform("RC-DBG READ[%d] tag=%u "
                                "firstDevReq=%llu tlpCreated=%llu tlpReady=%llu "
-                               "upstreamNow=%llu rcGap=%llu burstWin=%llu "
-                               "rcDelay=%llu sendTick=%llu "
+                               "upstreamNow=%llu cold=%d rcEnd=%llu "
+                               "rcBusy=%llu sendTick=%llu "
                                "upstreamSpan=%llu",
                                rcDbgCount, tlp.tag,
                                rdTracker.firstDevReq,
                                tlp.creationTick,
                                entry.readyTick,
                                now,
-                               rcGap, burstWindowTicks,
-                               rcDelay, sendTick,
+                               rcColdUp, rcEndUp,
+                               rcUpstreamBusyUntil, sendTick,
                                (sendTick > rdTracker.firstDevReq) ?
                                    (sendTick - rdTracker.firstDevReq) : 0);
                         rcDbgCount++;
@@ -1656,9 +1681,9 @@ void PCIeModel::processUpstreamQueue()
                     reschedule(hostSendEvent, sendTick);
 
                 DPRINTF(PCIe, "  [UP] → HostRD port=%u tag=%u addr=0x%x "
-                        "size=%u rcDelay=%llu send@%llu\n",
+                        "size=%u cold=%d rcEnd=%llu send@%llu\n",
                         sp, tlp.tag, it->second.addr,
-                        it->second.totalBytes, rcDelay, sendTick);
+                        it->second.totalBytes, rcColdUp, rcEndUp, sendTick);
 
                 if (rdTracker.firstTlpDone == 0) rdTracker.firstTlpDone = now;
                 rdTracker.lastTlpDone = now;
@@ -1675,29 +1700,35 @@ void PCIeModel::processUpstreamQueue()
 
                 if (!tlp.isLastCompletion) continue;
 
-                Tick rcDelay;
-                Tick rcGap = now - lastUpstreamRcTick;
-                if (rcGap <= burstWindowTicks) rcDelay = 0;
-                else rcDelay = rcLatency;
-                lastUpstreamRcTick = now;
+                // Upstream RC pipeline (shared with reads).
+                bool rcColdUpW = (now > rcUpstreamBusyUntil + burstWindowTicks);
+                Tick rcStartUpW, rcEndUpW;
+                if (rcColdUpW) {
+                    rcStartUpW = now + rcLatency;
+                    rcEndUpW = rcStartUpW;
+                } else {
+                    rcStartUpW = std::max(now, rcUpstreamBusyUntil);
+                    rcEndUpW = rcStartUpW + rcThroughputDelay;
+                }
+                rcUpstreamBusyUntil = rcEndUpW;
 
-                Tick sendTick2 = std::max(now + rcDelay, curTick() + 1);
+                Tick sendTick2 = std::max(rcEndUpW, curTick() + 1);
 
                 // Temporary RC debug — first 10 write TLPs only
                 {
-                    static int rcWrDbgCount = 0;
+                    // Bug 5 fix: now a member variable
                     if (rcWrDbgCount < 10) {
                         inform("RC-DBG WRITE[%d] "
                                "firstDevReq=%llu tlpCreated=%llu tlpReady=%llu "
-                               "upstreamNow=%llu rcGap=%llu burstWin=%llu "
-                               "rcDelay=%llu sendTick=%llu",
+                               "upstreamNow=%llu cold=%d rcEnd=%llu "
+                               "rcBusy=%llu sendTick=%llu",
                                rcWrDbgCount,
                                wrTracker.firstDevReq,
                                tlp.creationTick,
                                entry.readyTick,
                                now,
-                               rcGap, burstWindowTicks,
-                               rcDelay, sendTick2);
+                               rcColdUpW, rcEndUpW,
+                               rcUpstreamBusyUntil, sendTick2);
                         rcWrDbgCount++;
                     }
                 }
@@ -1754,9 +1785,9 @@ void PCIeModel::processUpstreamQueue()
                     reschedule(hostSendEvent, sendTick2);
 
                 DPRINTF(PCIe, "  [UP] → HostWR port=%u addr=0x%x pay=%u "
-                        "rcDelay=%llu send@%llu\n",
+                        "cold=%d rcEnd=%llu send@%llu\n",
                         sp, tlp.addr, tlp.payloadBytes,
-                        rcDelay, sendTick2);
+                        rcColdUpW, rcEndUpW, sendTick2);
 
                 if (wrTracker.firstTlpDone == 0) wrTracker.firstTlpDone = now;
                 wrTracker.lastTlpDone = now;
@@ -1786,15 +1817,11 @@ void PCIeModel::processUpstreamQueue()
         bool canAcceptRead = hasFreeTags();
         // Shared-pool: check global write budget.
         unsigned totalWritesOut = 0;
-        for (unsigned sp = 0; sp < credits.size(); sp++)
+        for (unsigned sp = 0; sp < outstandingWrites.size(); sp++)
             totalWritesOut += outstandingWrites[sp];
-        bool canAcceptWrite = false;
-        for (unsigned sp = 0; sp < credits.size(); sp++) {
-            bool portCanWrite = credits[sp].phCredits > 0 &&
-                (maxOutstandingWrites == 0 ||
-                 totalWritesOut < maxOutstandingWrites);
-            if (portCanWrite) { canAcceptWrite = true; break; }
-        }
+        bool canAcceptWrite = credits[0].phCredits > 0 &&
+            (maxOutstandingWrites == 0 ||
+             totalWritesOut < maxOutstandingWrites);
         if (canAcceptRead || canAcceptWrite)
             retryStarvedPorts();
     }
@@ -2017,75 +2044,122 @@ bool PCIeModel::handleHostResponse(PacketPtr pkt)
     // outstanding-response buffer in PCIeModel that holds pkts
     // internally rather than relying on the xbar's queue.
     int totalCpld = dataCreditsNeeded(combinedSize);
-    if (credits[orecPort].cplhCredits < 1 ||
-        credits[orecPort].cpldCredits < totalCpld) {
+    if (credits[0].cplhCredits < 1 ||
+        credits[0].cpldCredits < totalCpld) {
         DPRINTF(PCIe, "  [CREDIT-WARN] port=%d CplH/CplD depleted "
                 "(H=%d D=%d need H=1 D=%d) — allowing anyway to avoid "
                 "xbar queue overflow @%llu\n",
-                orecPort, credits[orecPort].cplhCredits,
-                credits[orecPort].cpldCredits, totalCpld,
+                orecPort, credits[0].cplhCredits,
+                credits[0].cpldCredits, totalCpld,
                 curTick());
         stats.creditStalls++;
         // Don't drain credits below floor — let the return path
         // catch up naturally.
     }
 
-    // PCIe Bug #4 fix: downstream RC warmth was count-based
-    // (outstandingReads.size() > 1 → rcThroughputDelay). That's weird:
-    // 16 tags outstanding with a 10 µs gap between responses would still
-    // pay rcThroughputDelay, while 1 tag with steady responses would pay
-    // full rcLatency every time. RC pipeline warmth is a function of
-    // TIME since last traversal, not outstanding count. Use the same
-    // burst-window heuristic as upstream, with a separate
-    // lastDownstreamRcTick tracker so upstream/downstream don't
-    // inappropriately warm each other.
+    // ================================================================
+    // Downstream delay: RC pipeline → Gen5 wire → per-port CDC → RTL
     //
-    // Review fix #2: inline the burst-window logic (PCIe has no
-    // computeRcDelay helper — referencing one earlier was a copy-paste
-    // from CXL that wouldn't compile).
+    // Two bugs fixed here:
+    //
+    // Bug A (dead rcThroughputDelay): warm RC gave rcDelay=0, making the
+    //   RC pipeline free at N>1 (burst window always warm). The
+    //   rcThroughputDelay param (5ns/CplD) was stored but never used.
+    //   Fix: serialize RC pipeline throughput via rcDownstreamBusyUntil.
+    //   Cold start → first CplD pays rcLatency (pipeline fill).
+    //   Warm → each CplD pays rcThroughputDelay, queued behind prior
+    //   CplDs from ALL instances on the shared RC pipeline.
+    //
+    // Bug B (CDC↔wire ordering): CDC was computed first and passed as
+    //   earliestStart to enqueueDownstream. Since per-port CDC (6.67ns)
+    //   >> wire per-CplD (~2.2ns), the CDC-done time always dominated
+    //   downstreamBusyUntil, masking wire contention at high N.
+    //   Fix: physical order RC → wire → CDC. Each stage starts only
+    //   after the previous delivers the CplD.
+    // ================================================================
     Tick now = curTick();
-    Tick rcDelay;
-    {
-        Tick rcGap = now - lastDownstreamRcTick;
-        if (rcGap <= burstWindowTicks) {
-            rcDelay = 0;  // warm: pipelined at wire rate
-        } else {
-            rcDelay = rcLatency;  // cold: full RC pipeline fill
-        }
-        lastDownstreamRcTick = now;
-
-        // Temporary downstream RC debug — first 10 completions only
-        static int rcDnDbgCount = 0;
-        if (rcDnDbgCount < 10) {
-            inform("RC-DBG DN-CPL[%d] tag=%u rcGap=%llu burstWin=%llu "
-                   "rcDelay=%llu now=%llu combinedBytes=%u",
-                   rcDnDbgCount, tag, rcGap, burstWindowTicks,
-                   rcDelay, now, combinedSize);
-            rcDnDbgCount++;
-        }
-    }
-    Tick arriveBridge = now + rcDelay;
-    const Tick cdcCycles = 2;
-    // PCIe Bug #7 fix: fpgaClockPeriod is now a class member (from Param)
-    // instead of a hardcoded local. Must match the Python config.
-    const Tick cdcThroughput = cdcCycles * fpgaClockPeriod;
-    unsigned port = orec.srcPortIdx;
-    Tick startCdc = std::max(arriveBridge, bridgeBusyUntil[port]);
-    Tick doneCdc = startCdc + cdcThroughput;
-    bridgeBusyUntil[port] = doneCdc;
-    Tick completionArrival = doneCdc;
 
     DPRINTF(PCIe, "  [COMBINE] FLUSH tag=%u %uB CplD emitted=%u/%u @%llu\n",
-            tag, combinedSize, emittedSoFar, orec.totalBytes, curTick());
+            tag, combinedSize, emittedSoFar, orec.totalBytes, now);
 
     TlpPacket cplTlp = buildCompletionTlp(
         orec.addr + emittedSoFar, combinedSize, tag,
         orec.totalBytes, emittedSoFar,
         pkt, isLastForTag);
-    cplTlp.srcPortIdx = orec.srcPortIdx;
+    unsigned port = orec.srcPortIdx;
+    cplTlp.srcPortIdx = port;
 
-    consumeCompletionCredits((unsigned)orec.srcPortIdx, totalCpld);
-    enqueueDownstream(cplTlp, completionArrival);
+    consumeCompletionCredits((unsigned)port, totalCpld);
+
+    // Stage 1: RC pipeline (shared, serialized).
+    // Cold detection: is the pipeline actually idle? Check whether
+    // rcDownstreamBusyUntil has expired, NOT the DDR5 inter-arrival gap.
+    // The old check (now - lastDownstreamRcTick > burstWindow) was wrong:
+    // at RCB=128B combining, CplDs arrive every ~20 ns. With a 10 ns
+    // burst window, almost every CplD was declared cold, bypassing
+    // the serialized throughput path entirely.
+    bool rcCold = (now > rcDownstreamBusyUntil + burstWindowTicks);
+    Tick rcStart;
+    Tick rcEnd;
+    if (rcCold) {
+        // Cold: pipeline must fill. First CplD exits after rcLatency.
+        // No additional throughput slot — rcLatency IS the full traversal.
+        rcStart = now + rcLatency;
+        rcEnd = rcStart;
+    } else {
+        // Warm: one CplD per rcThroughputDelay, serialized across
+        // all instances on the shared RC pipeline.
+        rcStart = std::max(now, rcDownstreamBusyUntil);
+        rcEnd = rcStart + rcThroughputDelay;
+    }
+    rcDownstreamBusyUntil = rcEnd;
+    lastDownstreamRcTick = now;
+
+    {
+        // Bug 5 fix: now a member variable
+        if (rcDnDbgCount < 10) {
+            inform("RC-DBG DN-CPL[%d] tag=%u cold=%d pipeIdle=%lld "
+                   "rcStart=%llu rcEnd=%llu rcBusy=%llu now=%llu",
+                   rcDnDbgCount, tag, rcCold,
+                   (long long)now - (long long)rcDownstreamBusyUntil,
+                   rcStart, rcEnd, rcDownstreamBusyUntil, now);
+            rcDnDbgCount++;
+        }
+    }
+
+    // Stage 2: Shared Gen5 wire serialization.
+    // Wire can't start until RC delivers the CplD.
+    Tick wireSerDelay = serializationDelay(cplTlp.wireBytes);
+    Tick coreGateTick = (coreClockPeriod > 0 && lastDownstreamEmit > 0) ?
+                        lastDownstreamEmit + coreClockPeriod : 0;
+    Tick wireStart = std::max({rcEnd, downstreamBusyUntil, coreGateTick});
+    Tick wireEnd = wireStart + wireSerDelay;
+    downstreamBusyUntil = wireEnd;
+    lastDownstreamEmit = wireStart;
+
+    // Stage 3: Per-port CDC bridge — can't start until wire delivers.
+    const Tick cdcCycles = 2;
+    const Tick cdcThroughput = cdcCycles * fpgaClockPeriod;
+    Tick startCdc = std::max(wireEnd, bridgeBusyUntil[port]);
+    Tick doneCdc = startCdc + cdcThroughput;
+    bridgeBusyUntil[port] = doneCdc;
+
+    DPRINTF(PCIe, "  [DN RC→WIRE→CDC] port=%u tag=%u wire=%u "
+            "rc=[%llu,%llu] wire=[%llu,%llu] cdc=[%llu,%llu]\n",
+            port, tag, cplTlp.wireBytes,
+            rcStart, rcEnd, wireStart, wireEnd, startCdc, doneCdc);
+
+    // Push to per-port downstream queue at CDC-done time.
+    // Bypass enqueueDownstream (it would re-apply wire delay).
+    panic_if((int)port < 0 || port >= downstreamQueue.size(),
+             "PCIe downstream: bad srcPortIdx=%d", port);
+    downstreamQueue[port].push_back({cplTlp, doneCdc});
+    stats.totalWireBytes += cplTlp.wireBytes;
+
+    if (!downstreamEvent.scheduled())
+        schedule(downstreamEvent, doneCdc);
+    else if (downstreamEvent.when() > doneCdc)
+        reschedule(downstreamEvent, doneCdc);
 
     stats.totalCompletionTLPs++;
     stats.totalCompletionBytes += combinedSize;
@@ -2188,10 +2262,19 @@ void PCIeModel::trySendResponses()
     unsigned n = responseQueue.size();
     if (n == 0) return;
 
+    Tick earliestPending = MaxTick;
     for (unsigned i = 0; i < n; i++) {
         unsigned sp = (nextResponsePort + i) % n;
         while (!responseQueue[sp].empty()) {
             auto &entry = responseQueue[sp].front();
+
+            // Skip entries whose readyTick hasn't arrived yet
+            if (entry.readyTick > curTick()) {
+                if (entry.readyTick < earliestPending)
+                    earliestPending = entry.readyTick;
+                break;  // FIFO — later entries can't be earlier
+            }
+
             PacketPtr pkt = entry.pkt;
             int portIdx = entry.portIdx;
             if (portIdx < 0 || portIdx >= (int)devicePorts.size()) {
@@ -2218,6 +2301,10 @@ void PCIeModel::trySendResponses()
         }
     }
     nextResponsePort = (nextResponsePort + 1) % n;
+
+    // Reschedule for the earliest pending entry not yet ready
+    if (earliestPending != MaxTick && !responseEvent.scheduled())
+        schedule(responseEvent, earliestPending);
 
     if (pendingDeviceRetry) {
         pendingDeviceRetry = false;
@@ -2452,11 +2539,11 @@ PCIeModel::dumpPortState(unsigned p, const char *where)
     if (p < credits.size()) {
         inform("  credits: ph=%d/%d pd=%d/%d nph=%d/%d "
                "cplh=%d/%d cpld=%d/%d",
-               credits[p].phCredits, credits[p].phMax,
-               credits[p].pdCredits, credits[p].pdMax,
-               credits[p].nphCredits, credits[p].nphMax,
-               credits[p].cplhCredits, credits[p].cplhMax,
-               credits[p].cpldCredits, credits[p].cpldMax);
+               credits[0].phCredits, credits[0].phMax,
+               credits[0].pdCredits, credits[0].pdMax,
+               credits[0].nphCredits, credits[0].nphMax,
+               credits[0].cplhCredits, credits[0].cplhMax,
+               credits[0].cpldCredits, credits[0].cpldMax);
     }
     inform("  resources: outWr=%u perPortRds=%u rrb=%u defCred=%lu",
            p < outstandingWrites.size() ? outstandingWrites[p] : 0,
@@ -2491,18 +2578,18 @@ PCIeModel::dumpPortState(unsigned p, const char *where)
     }
 
     if (p < credits.size()) {
-        if (credits[p].nphCredits == 0) {
+        if (credits[0].nphCredits == 0) {
             inform("  >>> NPH-STARVED: 0/%d. Pending returns: %lu.",
-                   credits[p].nphMax,
+                   credits[0].nphMax,
                    p < deferredCredits.size() ? deferredCredits[p].size() : 0);
         }
-        if (credits[p].phCredits == 0) {
+        if (credits[0].phCredits == 0) {
             inform("  >>> PH-STARVED: 0/%d. Pending returns: %lu.",
-                   credits[p].phMax,
+                   credits[0].phMax,
                    p < deferredCredits.size() ? deferredCredits[p].size() : 0);
         }
-        if (credits[p].cplhCredits == 0) {
-            inform("  >>> CPLH-STARVED: 0/%d.", credits[p].cplhMax);
+        if (credits[0].cplhCredits == 0) {
+            inform("  >>> CPLH-STARVED: 0/%d.", credits[0].cplhMax);
         }
     }
 }
