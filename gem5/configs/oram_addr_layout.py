@@ -16,13 +16,16 @@
 #
 # HBM (per-instance, 64-bit):
 #   HBM:              0x100000000 + i * 0x020000000  (16 × 512 MB)
-#     Internal layout per 512 MB instance:
+#     Internal layout per 512 MB instance (matches oram_params.vh / pos_map.v):
 #       buckets:   [0x00000000, variable)        — depends on num_slots
-#       posmap:    [0x10400000, 0x10500000)      — 1 MB
-#       HT slots:  [0x10500000, 0x10600000)      — 1 MB (512 × 32B)
-#       bkt_head:  [0x10600000, 0x10700000)      — 1 MB
-#       bkt_next:  [0x10700000, 0x10700800)      — 2 KB
-#       stash:     [0x1F000000, 0x20000000)      — 16 MB (at HBM_PER - 16 MB)
+#                                                  (num_slots=32764 -> 255 MB)
+#       stash:     [0x10000000, 0x14000000)      — 64 MB (16384 × 4KB, PTR_W=14)
+#       posmap:    [0x14000000, 0x14100000)      — 1 MB
+#       HT slots:  [0x14100000, 0x14200000)      — 1 MB (512 × 32B)
+#       bkt_head:  [0x14200000, 0x14300000)      — 1 MB
+#       bkt_next:  [0x14300000, 0x14308000)      — 32 KB (1024 × 32B, PTR_W=14)
+#       IVT:       [0x14400000, 0x14600000)      — 4 MB (per-physical, ~2MB used)
+#     metadata top = 0x14600000 (326 MB) — fits in 512 MB instance.
 #
 # Shared DDR5 aggregate (CPU-touched + ORAM-only) at 64-bit:
 #   cmd_ring:         0x400000000 - 0x400010000  (16 × 4 KB)
@@ -42,7 +45,22 @@ ORAM_CMD_BASE      = 0x0E0000000
 
 # ---- HBM (per-instance) ----
 HBM_BASE           = 0x100000000    # 4 GB
-HBM_PER_INSTANCE   = 0x020000000   # 512 MB — must hold HT at 0x10500000 (261 MB)
+HBM_PER_INSTANCE   = 0x020000000   # 512 MB — must hold metadata top 0x14600000 (326 MB)
+
+# ---- Per-instance internal metadata offsets (MUST match oram_params.vh) ----
+# Contiguous block above the bucket region. Stash deepened to 64 MB
+# (STASH_PTR_W=14, 16384 entries); IVT is per-physical-slot (4 MB budget).
+STASH_OFFSET        = 0x10000000    # RTL STASH_DDR_BASE
+STASH_REGION_BYTES  = 0x04000000    # 64 MB (16384 × 4KB)
+PM_OFFSET           = 0x14000000    # RTL PM_BASE (pos_map.v)
+HT_SLOT_OFFSET      = 0x14100000
+HT_BKT_HEAD_OFFSET  = 0x14200000
+HT_BKT_NEXT_OFFSET  = 0x14300000
+IVT_OFFSET          = 0x14400000    # per-physical-slot IV/TAG
+METADATA_TOP_OFFSET = 0x14600000    # top of IVT (4 MB budget)
+# Highest bucket-region address the largest num_slots can reach. At
+# num_slots=32764 -> 8191 buckets × 32KB = 255 MB, just under stash base.
+BUCKET_REGION_MAX   = 0x0FF80000    # 8191 × 32768 (num_slots=32764)
 
 # ---- Shared DDR5 aggregate ----
 # Covers cmd_ring + result_buf + per-instance ORAM DDR slabs.
@@ -87,15 +105,19 @@ def _assert_no_overlap(N):
     assert cmd_ring_end <= RESULT_BUF_BASE, f"cmd_ring ends 0x{cmd_ring_end:x} overlaps result_buf"
     assert result_buf_end <= ddr_slab_start, f"result_buf ends 0x{result_buf_end:x} overlaps DDR slabs"
 
-    # Per-instance internal: HT must fit in HBM
-    HT_END_OFFSET = 0x10700800  # bkt_next end
-    assert HT_END_OFFSET <= HBM_PER_INSTANCE, \
-        f"HT region end 0x{HT_END_OFFSET:x} exceeds HBM_PER_INSTANCE 0x{HBM_PER_INSTANCE:x}"
-
-    # stash must not overlap HT/posmap metadata
-    stash_offset = HBM_PER_INSTANCE - 0x01000000
-    assert stash_offset >= HT_END_OFFSET, \
-        f"stash_offset 0x{stash_offset:x} overlaps HT region ending at 0x{HT_END_OFFSET:x}"
+    # =====================================================================
+    # Per-instance internal layout (must match oram_params.vh / pos_map.v).
+    # Metadata is now a contiguous block above the bucket region:
+    #   stash 0x10000000 (64MB) -> posmap -> HT -> IVT, top = 0x14600000.
+    # =====================================================================
+    # buckets must end before the stash base; metadata top must fit in HBM.
+    assert BUCKET_REGION_MAX <= STASH_OFFSET, \
+        f"bucket region max 0x{BUCKET_REGION_MAX:x} overlaps stash base 0x{STASH_OFFSET:x}"
+    assert METADATA_TOP_OFFSET <= HBM_PER_INSTANCE, \
+        f"metadata top 0x{METADATA_TOP_OFFSET:x} exceeds HBM_PER_INSTANCE 0x{HBM_PER_INSTANCE:x}"
+    # stash region (64 MB) must not collide with posmap that follows it
+    assert STASH_OFFSET + STASH_REGION_BYTES <= PM_OFFSET, \
+        f"stash end 0x{STASH_OFFSET + STASH_REGION_BYTES:x} overlaps posmap 0x{PM_OFFSET:x}"
 
 
 _assert_no_overlap(32)
