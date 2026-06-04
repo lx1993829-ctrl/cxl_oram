@@ -91,7 +91,12 @@ module secure_oram_top #(
     input  wire [1:0]            m_axi_bresp,
     input  wire                  m_axi_bvalid,
     output wire                  m_axi_bready,
-    output wire [4:0] dbg_oram_state,
+    output wire [5:0] dbg_oram_state,
+    output wire       dbg_sel_slotr,
+    output wire       dbg_sel_bmeta,
+    output wire       dbg_sel_ivt,
+    output wire       dbg_sel_posmap,
+    output wire       dbg_sel_stash_fsm,
     // Status
     output wire                  oram_busy,
     output wire                  err_stash_overflow,
@@ -115,6 +120,23 @@ module secure_oram_top #(
     output wire        dbg_mux_awvalid,   // post-mux m_axi_awvalid
     output wire        dbg_found_in_bucket,
     output wire        dbg_found_in_stash,
+    output wire [`BUCKET_ID_W-1:0] dbg_req_b,
+    output wire [`BUCKET_ID_W-1:0] dbg_req_b_new,
+    output wire        dbg_same_bucket,
+    output wire        dbg_err_stash_ovf,
+    output wire [PTR_W:0] dbg_stash_occ,
+    output wire        dbg_ht_ins_overwritten,
+    output wire        dbg_ht_del_overwritten,
+    output wire [7:0]  dbg_ht_ins_issued,
+    output wire [7:0]  dbg_ht_ins_completed,
+    output wire [7:0]  dbg_ht_del_issued,
+    output wire [7:0]  dbg_ht_del_completed,
+    output wire        dbg_ht_latch_ins_active,
+    output wire        dbg_ht_latch_del_active,
+    output wire [`AXI_ADDR_W-1:0] dbg_ht_lu_hbm_addr,
+    output wire [3:0]  dbg_ht_lu_valid_bits,
+    output wire        dbg_ht_lu_wb_hit,
+    output wire [`SLOT_ADDR_W-1:0] dbg_ht_lu_slot_looked_up,
 
     // HT FSM debug
     output wire [2:0]  dbg_ht_state,
@@ -276,6 +298,7 @@ module secure_oram_top #(
     wire                     st_ext_lb_rd_en;
     wire [AXI_DW-1:0]       st_ext_lb_rd_data;
     wire                     st_ext_lb_rd_valid;
+    wire [PTR_W-1:0]        st_ext_lb_entry;
 
     // Single-beat command wires (hash table access)
     // Gate HT single-beat commands: WHITELIST of safe states where
@@ -283,7 +306,7 @@ module secure_oram_top #(
     // pos_map AXI activity is unsafe (mux cross-contamination).
     wire                            st_sng_rd_req_raw;
     wire                            st_sng_wr_req_raw;
-    wire [4:0]                      oram_fsm_state = dbg_oram_state;
+    wire [5:0]                      oram_fsm_state = dbg_oram_state;
     // Safe: S_IDLE(0), S_SCAN(3), S_SCAN2(4), S_EXT_IV_RD(5),
     //       S_EXT_DEC_START(6), S_EXT_DEC_FEED(7), S_EXT_DEC_RECV(8),
     //       S_EXT_DEC_WAIT(9), S_EXTRACT_WR(10), S_COMPACT(13), S_EVICT(14),
@@ -305,19 +328,20 @@ module secure_oram_top #(
     // states, blocking HT ops and causing deadlock at S_HT_LOOKUP_WAIT.
     // st_ext_busy removed: sel_stash_fsm whitelist handles mux routing.
     // stash_axi_master ignores cmd_single_read while cmd_busy=1.
-    wire ht_safe = (oram_fsm_state != 5'd1)   // S_POS_LOOKUP
-                && (oram_fsm_state != 5'd2)   // S_DDR_READ
-                && (oram_fsm_state != 5'd11)  // S_STASH_SEARCH
-                && (oram_fsm_state != 5'd12)  // S_STASH_READ
-                && (oram_fsm_state != 5'd19)  // S_DDR_WRITE
-                && (oram_fsm_state != 5'd28)  // S_ST_LOAD
-                && (oram_fsm_state != 5'd29); // S_ST_FLUSH
+    wire ht_safe = (oram_fsm_state != 6'd1)   // S_POS_LOOKUP
+                && (oram_fsm_state != 6'd2)   // S_DDR_READ
+                && (oram_fsm_state != 6'd11)  // S_STASH_SEARCH
+                && (oram_fsm_state != 6'd12)  // S_STASH_READ
+                && (oram_fsm_state != 6'd19)  // S_DDR_WRITE
+                && (oram_fsm_state != 6'd28)  // S_ST_LOAD
+                && (oram_fsm_state != 6'd29); // S_ST_FLUSH
     wire                            st_sng_rd_req = st_sng_rd_req_raw && ht_safe;
     wire                            st_sng_wr_req = st_sng_wr_req_raw && ht_safe;
     wire [`AXI_ADDR_W-1:0]         st_sng_addr;
     wire [`AXI_DATA_W-1:0]         st_sng_wdata;
     wire [`AXI_DATA_W-1:0]         st_sng_rdata;
     wire                            st_sng_done;
+    wire                            st_sng_accepted;
     stash_axi_master u_stash_axi (
         .clk(clk), .rst_n(rst_n),
         .cmd_read(st_ext_rd_req),
@@ -333,9 +357,11 @@ module secure_oram_top #(
         .cmd_single_wdata(st_sng_wdata),
         .cmd_single_rdata(st_sng_rdata),
         .cmd_single_done(st_sng_done),
+        .cmd_single_accepted(st_sng_accepted),
         .lb_wr_data(st_ext_lb_wr_data),
         .lb_wr_addr(st_ext_lb_wr_addr),
         .lb_wr_en(st_ext_lb_wr_en),
+        .lb_entry(st_ext_lb_entry),
         .lb_rd_addr(st_ext_lb_rd_addr),
         .lb_rd_en(st_ext_lb_rd_en),
         .lb_rd_data(st_ext_lb_rd_data),
@@ -346,7 +372,7 @@ module secure_oram_top #(
         .m_axi_arready(st_arready),
         .m_axi_rid(m_axi_rid), .m_axi_rdata(m_axi_rdata),
         .m_axi_rresp(m_axi_rresp), .m_axi_rlast(m_axi_rlast),
-        .m_axi_rvalid(m_axi_rvalid), .m_axi_rready(st_rready),
+        .m_axi_rvalid(st_rvalid_gated), .m_axi_rready(st_rready),
         .m_axi_awid(st_awid), .m_axi_awaddr(st_awaddr),
         .m_axi_awlen(st_awlen), .m_axi_awsize(st_awsize),
         .m_axi_awburst(st_awburst), .m_axi_awvalid(st_awvalid),
@@ -355,7 +381,7 @@ module secure_oram_top #(
         .m_axi_wlast(st_wlast), .m_axi_wvalid(st_wvalid),
         .m_axi_wready(st_wready),
         .m_axi_bid(m_axi_bid), .m_axi_bresp(m_axi_bresp),
-        .m_axi_bvalid(m_axi_bvalid), .m_axi_bready(st_bready)
+        .m_axi_bvalid(st_bvalid_gated), .m_axi_bready(st_bready)
     );
 
     flat_oram_gcm #(
@@ -392,7 +418,7 @@ module secure_oram_top #(
         .m_axi_arready(bkt_arready),
         .m_axi_rid(m_axi_rid), .m_axi_rdata(m_axi_rdata),
         .m_axi_rresp(m_axi_rresp), .m_axi_rlast(m_axi_rlast),
-        .m_axi_rvalid(m_axi_rvalid), .m_axi_rready(bkt_rready),
+        .m_axi_rvalid(bkt_rvalid_gated), .m_axi_rready(bkt_rready),
         .m_axi_awid(bkt_awid), .m_axi_awaddr(bkt_awaddr),
         .m_axi_awlen(bkt_awlen), .m_axi_awsize(bkt_awsize),
         .m_axi_awburst(bkt_awburst), .m_axi_awvalid(bkt_awvalid),
@@ -401,7 +427,7 @@ module secure_oram_top #(
         .m_axi_wlast(bkt_wlast), .m_axi_wvalid(bkt_wvalid),
         .m_axi_wready(bkt_wready),
         .m_axi_bid(m_axi_bid), .m_axi_bresp(m_axi_bresp),
-        .m_axi_bvalid(m_axi_bvalid), .m_axi_bready(bkt_bready),
+        .m_axi_bvalid(bkt_bvalid_gated), .m_axi_bready(bkt_bready),
         // Stash external memory interface -> stash_axi_master
         .st_ext_rd_req(st_ext_rd_req),
         .st_ext_wr_req(st_ext_wr_req),
@@ -409,6 +435,8 @@ module secure_oram_top #(
         .st_ext_rd_done(st_ext_rd_done),
         .st_ext_wr_done(st_ext_wr_done),
         .st_ext_busy(st_ext_busy),
+        .metadata_idle(metadata_idle),
+        .st_ext_lb_entry(st_ext_lb_entry),
         .st_burst_busy(st_burst_busy),
         // Single-beat hash table access
         .st_sng_rd_req(st_sng_rd_req_raw),
@@ -417,6 +445,7 @@ module secure_oram_top #(
         .st_sng_wdata(st_sng_wdata),
         .st_sng_rdata(st_sng_rdata),
         .st_sng_done(st_sng_done),
+        .st_sng_accepted(st_sng_accepted),
         .st_ext_lb_wr_data(st_ext_lb_wr_data),
         .st_ext_lb_wr_addr(st_ext_lb_wr_addr),
         .st_ext_lb_wr_en(st_ext_lb_wr_en),
@@ -426,9 +455,15 @@ module secure_oram_top #(
         .st_ext_lb_rd_valid(st_ext_lb_rd_valid),
         // Debug
         .dbg_state(dbg_oram_state), .dbg_client_done(), .dbg_client_req(),
-        .dbg_req_b(), .dbg_req_b_new(),
+        .dbg_req_b(dbg_req_b), .dbg_req_b_new(dbg_req_b_new),
         .dbg_found_in_bucket(dbg_found_in_bucket), .dbg_found_in_stash(dbg_found_in_stash),
-        .dbg_same_bucket(), .dbg_err_stash_ovf(), .dbg_stash_occ(),
+        .dbg_same_bucket(dbg_same_bucket), .dbg_err_stash_ovf(dbg_err_stash_ovf), .dbg_stash_occ(dbg_stash_occ),
+        .dbg_ht_ins_overwritten(dbg_ht_ins_overwritten), .dbg_ht_del_overwritten(dbg_ht_del_overwritten),
+        .dbg_ht_ins_issued(dbg_ht_ins_issued), .dbg_ht_ins_completed(dbg_ht_ins_completed),
+        .dbg_ht_del_issued(dbg_ht_del_issued), .dbg_ht_del_completed(dbg_ht_del_completed),
+        .dbg_ht_latch_ins_active(dbg_ht_latch_ins_active), .dbg_ht_latch_del_active(dbg_ht_latch_del_active),
+        .dbg_ht_lu_hbm_addr(dbg_ht_lu_hbm_addr), .dbg_ht_lu_valid_bits(dbg_ht_lu_valid_bits),
+        .dbg_ht_lu_wb_hit(dbg_ht_lu_wb_hit), .dbg_ht_lu_slot_looked_up(dbg_ht_lu_slot_looked_up),
         .dbg_gcm_tag_match(dbg_gcm_tag_match),.dbg_gcm_tag_valid(dbg_gcm_tag_valid),
         .dbg_ht_state(dbg_ht_state), .dbg_ht_op(dbg_ht_op),
         .dbg_ht_done(dbg_ht_done),
@@ -469,7 +504,7 @@ module secure_oram_top #(
         .pm_axi_arready(pm_arready),
         .pm_axi_rid(m_axi_rid), .pm_axi_rdata(m_axi_rdata),
         .pm_axi_rresp(m_axi_rresp), .pm_axi_rlast(m_axi_rlast),
-        .pm_axi_rvalid(m_axi_rvalid), .pm_axi_rready(pm_rready),
+        .pm_axi_rvalid(pm_rvalid_gated), .pm_axi_rready(pm_rready),
         .pm_axi_awid(pm_awid), .pm_axi_awaddr(pm_awaddr),
         .pm_axi_awlen(pm_awlen), .pm_axi_awsize(pm_awsize),
         .pm_axi_awburst(pm_awburst), .pm_axi_awvalid(pm_awvalid),
@@ -478,10 +513,121 @@ module secure_oram_top #(
         .pm_axi_wlast(pm_wlast), .pm_axi_wvalid(pm_wvalid),
         .pm_axi_wready(pm_wready),
         .pm_axi_bid(m_axi_bid), .pm_axi_bresp(m_axi_bresp),
-        .pm_axi_bvalid(m_axi_bvalid), .pm_axi_bready(pm_bready),
+        .pm_axi_bvalid(pm_bvalid_gated), .pm_axi_bready(pm_bready),
         .pm_busy(pm_busy_w),
-        .pm_dbg_state(dbg_pm_state)
+        .pm_dbg_state(dbg_pm_state),
+        // IV/TAG master -> mux
+        .ivt_axi_arid(ivt_arid), .ivt_axi_araddr(ivt_araddr),
+        .ivt_axi_arlen(ivt_arlen), .ivt_axi_arsize(ivt_arsize),
+        .ivt_axi_arburst(ivt_arburst), .ivt_axi_arvalid(ivt_arvalid),
+        .ivt_axi_arready(ivt_arready),
+        .ivt_axi_rid(m_axi_rid), .ivt_axi_rdata(m_axi_rdata),
+        .ivt_axi_rresp(m_axi_rresp), .ivt_axi_rlast(m_axi_rlast),
+        .ivt_axi_rvalid(ivt_rvalid_gated), .ivt_axi_rready(ivt_rready),
+        .ivt_axi_awid(ivt_awid), .ivt_axi_awaddr(ivt_awaddr),
+        .ivt_axi_awlen(ivt_awlen), .ivt_axi_awsize(ivt_awsize),
+        .ivt_axi_awburst(ivt_awburst), .ivt_axi_awvalid(ivt_awvalid),
+        .ivt_axi_awready(ivt_awready),
+        .ivt_axi_wdata(ivt_wdata), .ivt_axi_wstrb(ivt_wstrb),
+        .ivt_axi_wlast(ivt_wlast), .ivt_axi_wvalid(ivt_wvalid),
+        .ivt_axi_wready(ivt_wready),
+        .ivt_axi_bid(m_axi_bid), .ivt_axi_bresp(m_axi_bresp),
+        .ivt_axi_bvalid(ivt_bvalid_gated), .ivt_axi_bready(ivt_bready),
+        .ivt_busy(ivt_busy_w),
+        .ivt_dbg_state(dbg_ivt_state),
+        // slot_r master -> mux
+        .sr_axi_arid(sr_arid), .sr_axi_araddr(sr_araddr),
+        .sr_axi_arlen(sr_arlen), .sr_axi_arsize(sr_arsize),
+        .sr_axi_arburst(sr_arburst), .sr_axi_arvalid(sr_arvalid),
+        .sr_axi_arready(sr_arready),
+        .sr_axi_rid(m_axi_rid), .sr_axi_rdata(m_axi_rdata),
+        .sr_axi_rresp(m_axi_rresp), .sr_axi_rlast(m_axi_rlast),
+        .sr_axi_rvalid(sr_rvalid_gated), .sr_axi_rready(sr_rready),
+        .sr_axi_awid(sr_awid), .sr_axi_awaddr(sr_awaddr),
+        .sr_axi_awlen(sr_awlen), .sr_axi_awsize(sr_awsize),
+        .sr_axi_awburst(sr_awburst), .sr_axi_awvalid(sr_awvalid),
+        .sr_axi_awready(sr_awready),
+        .sr_axi_wdata(sr_wdata), .sr_axi_wstrb(sr_wstrb),
+        .sr_axi_wlast(sr_wlast), .sr_axi_wvalid(sr_wvalid),
+        .sr_axi_wready(sr_wready),
+        .sr_axi_bid(m_axi_bid), .sr_axi_bresp(m_axi_bresp),
+        .sr_axi_bvalid(sr_bvalid_gated), .sr_axi_bready(sr_bready),
+        .slotr_busy(slotr_busy_w),
+        .slotr_dbg_state(dbg_slotr_state),
+        // bucket_meta master -> mux
+        .bm_axi_arid(bm_arid), .bm_axi_araddr(bm_araddr),
+        .bm_axi_arlen(bm_arlen), .bm_axi_arsize(bm_arsize),
+        .bm_axi_arburst(bm_arburst), .bm_axi_arvalid(bm_arvalid),
+        .bm_axi_arready(bm_arready),
+        .bm_axi_rid(m_axi_rid), .bm_axi_rdata(m_axi_rdata),
+        .bm_axi_rresp(m_axi_rresp), .bm_axi_rlast(m_axi_rlast),
+        .bm_axi_rvalid(bm_rvalid_gated), .bm_axi_rready(bm_rready),
+        .bm_axi_awid(bm_awid), .bm_axi_awaddr(bm_awaddr),
+        .bm_axi_awlen(bm_awlen), .bm_axi_awsize(bm_awsize),
+        .bm_axi_awburst(bm_awburst), .bm_axi_awvalid(bm_awvalid),
+        .bm_axi_awready(bm_awready),
+        .bm_axi_wdata(bm_wdata), .bm_axi_wstrb(bm_wstrb),
+        .bm_axi_wlast(bm_wlast), .bm_axi_wvalid(bm_wvalid),
+        .bm_axi_wready(bm_wready),
+        .bm_axi_bid(m_axi_bid), .bm_axi_bresp(m_axi_bresp),
+        .bm_axi_bvalid(bm_bvalid_gated), .bm_axi_bready(bm_bready),
+        .bmeta_busy(bmeta_busy_w),
+        .bmeta_dbg_state(dbg_bmeta_state)
     );
+
+    // =========================================================================
+    // Internal AXI wires: IV/TAG master
+    // =========================================================================
+    wire [AXI_IDW-1:0]  ivt_arid, ivt_awid;
+    wire [AXI_AW-1:0]   ivt_araddr, ivt_awaddr;
+    wire [AXI_LENW-1:0] ivt_arlen, ivt_awlen;
+    wire [2:0]           ivt_arsize, ivt_awsize;
+    wire [1:0]           ivt_arburst, ivt_awburst;
+    wire                 ivt_arvalid, ivt_awvalid;
+    wire                 ivt_arready, ivt_awready;
+    wire                 ivt_rready;
+    wire [AXI_DW-1:0]   ivt_wdata;
+    wire [AXI_SW-1:0]   ivt_wstrb;
+    wire                 ivt_wlast, ivt_wvalid, ivt_wready;
+    wire                 ivt_bready;
+    wire                 ivt_busy_w;
+    wire [2:0]           dbg_ivt_state;
+
+    // =========================================================================
+    // Internal AXI wires: slot_r master
+    // =========================================================================
+    wire [AXI_IDW-1:0]  sr_arid, sr_awid;
+    wire [AXI_AW-1:0]   sr_araddr, sr_awaddr;
+    wire [AXI_LENW-1:0] sr_arlen, sr_awlen;
+    wire [2:0]           sr_arsize, sr_awsize;
+    wire [1:0]           sr_arburst, sr_awburst;
+    wire                 sr_arvalid, sr_awvalid;
+    wire                 sr_arready, sr_awready;
+    wire                 sr_rready;
+    wire [AXI_DW-1:0]   sr_wdata;
+    wire [AXI_SW-1:0]   sr_wstrb;
+    wire                 sr_wlast, sr_wvalid, sr_wready;
+    wire                 sr_bready;
+    wire                 slotr_busy_w;
+    wire [2:0]           dbg_slotr_state;
+
+    // =========================================================================
+    // Internal AXI wires: bucket_meta master
+    // =========================================================================
+    wire [AXI_IDW-1:0]  bm_arid, bm_awid;
+    wire [AXI_AW-1:0]   bm_araddr, bm_awaddr;
+    wire [AXI_LENW-1:0] bm_arlen, bm_awlen;
+    wire [2:0]           bm_arsize, bm_awsize;
+    wire [1:0]           bm_arburst, bm_awburst;
+    wire                 bm_arvalid, bm_awvalid;
+    wire                 bm_arready, bm_awready;
+    wire                 bm_rready;
+    wire [AXI_DW-1:0]   bm_wdata;
+    wire [AXI_SW-1:0]   bm_wstrb;
+    wire                 bm_wlast, bm_wvalid, bm_wready;
+    wire                 bm_bready;
+    wire                 bmeta_busy_w;
+    wire [2:0]           dbg_bmeta_state;
 
     // =========================================================================
     // Internal AXI wires: pos_map master
@@ -501,9 +647,45 @@ module secure_oram_top #(
     wire                 pm_busy_w;
 
     // =========================================================================
-    // 3-way AXI Mux: pos_map (priority) > stash > bucket (default)
+    // 4-way AXI Mux: IV/TAG (priority) > pos_map > stash > bucket (default)
     // =========================================================================
-    wire sel_posmap = pm_busy_w;
+    // IVT is busy-keyed and sits at TOP priority, for two reasons:
+    //   1. IVT reads (S_EXT_IV_RD) block the main FSM on the decrypt critical
+    //      path — they must get the bus immediately.
+    //   2. The op-completion interlock (S_DDR_WRITE waits on !ivt_busy) means a
+    //      queued IVT write must be able to drain *while the FSM sits in state
+    //      19*. At that point the bucket master has already finished its burst
+    //      (axim_write_done is high before we wait on ivt_busy) and is back at
+    //      ST_IDLE — not driving AR/AW/W — so handing the bus to IVT does not
+    //      interrupt any in-flight bucket transfer. Bucket's BRESP is already
+    //      consumed by then, so stealing bready is safe.
+    //
+    // IVT and pos_map are never both mid-burst: pos_map runs only at
+    // S_POS_LOOKUP / pm writes, and the FSM serializes IVT access against those
+    // by construction. Top-priority IVT therefore cannot starve a live pos_map
+    // burst — if both ever asserted, pos_map (also busy-keyed) simply holds its
+    // request until IVT's single-beat access completes.
+    // 6-way priority arbitration. slot_r and bucket_meta (new HBM metadata
+    // masters) are inserted at the TOP, above IVT, without changing the relative
+    // order of the existing four (IVT > posmap > stash > bucket). All three
+    // metadata masters are busy-keyed and single-beat; the FSM serializes their
+    // access by construction (each is a distinct read/write step the FSM waits
+    // on or launches async). Mid-burst grant to a metadata master only PAUSES
+    // the bucket burst (AXI wready-gated advance), never corrupts it.
+    //
+    // Priority rationale per concurrency state (verified against the FSM):
+    //   S_POS_LOOKUP/S_DDR_READ: bucket_meta read + bucket data read + posmap
+    //     write coexist. bucket_meta (top) and posmap (busy-keyed) take the bus
+    //     for their single beats, pausing the bucket burst; FSM waits for both
+    //     bm_rd_done and axim_read_done.
+    //   S_EVICT_SLOTR_WAIT: slot_r read; nothing else on the bus -> slot_r wins.
+    //   S_DDR_WRITE: bucket_meta + slot_r writes (async) + bucket data burst.
+    //     Metadata writes pause the burst; op completion is held until all
+    //     metadata busy clears (interlock in flat_oram_gcm S_DDR_WRITE).
+    wire sel_slotr  = slotr_busy_w;
+    wire sel_bmeta  = !sel_slotr && bmeta_busy_w;
+    wire sel_ivt    = !sel_slotr && !sel_bmeta && ivt_busy_w;
+    wire sel_posmap = !sel_slotr && !sel_bmeta && !sel_ivt && pm_busy_w;
     // sel_stash_fsm: route mux to stash for most states, EXCEPT:
     //   - S_POS_LOOKUP(1): posmap AXI
     //   - S_DDR_READ(2): bucket burst read
@@ -513,16 +695,65 @@ module secure_oram_top #(
     //     When st_ext_busy=1 at S_IDLE, a stash write's BRESP is
     //     pending — sel_stash=1 to deliver it.
     wire sel_stash_fsm =
-        (oram_fsm_state == 5'd0)  ? st_ext_busy :  // S_IDLE: conditional
-        (oram_fsm_state != 5'd1)  &&               // S_POS_LOOKUP
-        (oram_fsm_state != 5'd2)  &&               // S_DDR_READ
-        (oram_fsm_state != 5'd19);                  // S_DDR_WRITE
-    wire sel_stash  = !sel_posmap && sel_stash_fsm;
+        (oram_fsm_state == 6'd0)  ? st_ext_busy :  // S_IDLE: conditional
+        (oram_fsm_state != 6'd1)  &&               // S_POS_LOOKUP
+        (oram_fsm_state != 6'd2)  &&               // S_DDR_READ
+        (oram_fsm_state != 6'd19);                  // S_DDR_WRITE
+    wire sel_stash  = !sel_slotr && !sel_bmeta && !sel_ivt && !sel_posmap && sel_stash_fsm;
+    wire sel_bucket = !sel_slotr && !sel_bmeta && !sel_ivt && !sel_posmap && !sel_stash;
     assign sel_stash_out  = sel_stash;
+    assign dbg_sel_slotr     = sel_slotr;
+    assign dbg_sel_bmeta     = sel_bmeta;
+    assign dbg_sel_ivt       = sel_ivt;
+    assign dbg_sel_posmap    = sel_posmap;
+    assign dbg_sel_stash_fsm = sel_stash_fsm;
+
+    // Metadata-idle flag: when all metadata masters are idle, the stash
+    // can safely issue burst reads/writes without mux conflicts.
+    wire metadata_idle = !sel_slotr && !sel_bmeta && !sel_ivt && !sel_posmap;
     assign sel_posmap_out = sel_posmap;
     assign st_burst_busy_out = st_burst_busy;
     assign st_ext_busy_out = st_ext_busy;
     assign pm_busy_out = pm_busy_w;
+
+    // =========================================================================
+    // Debug: mux grant tracing + contention watchdog (sim only)
+    // Logs every change in which master owns the AXI bus, and flags the
+    // (by-design impossible) case of IVT and pos_map both requesting at once,
+    // so any future FSM change that breaks the serialization assumption is
+    // caught immediately rather than as a silent BRESP-routing corruption.
+    // =========================================================================
+    `ifndef SYNTHESIS
+    reg [2:0] dbg_prev_grant;   // 0=bucket 1=stash 2=posmap 3=ivt 4=bmeta 5=slotr
+    wire [2:0] dbg_grant = sel_slotr  ? 3'd5 :
+                           sel_bmeta  ? 3'd4 :
+                           sel_ivt    ? 3'd3 :
+                           sel_posmap ? 3'd2 :
+                           sel_stash  ? 3'd1 : 3'd0;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            dbg_prev_grant <= 3'd0;
+        end else begin
+            if (dbg_grant != dbg_prev_grant) begin
+                $display("[MUX] t=%0t grant %0d -> %0d (slotr=%b bmeta=%b ivt=%b pm=%b st_ext=%b fsm=%0d)",
+                         $time, dbg_prev_grant, dbg_grant,
+                         slotr_busy_w, bmeta_busy_w, ivt_busy_w, pm_busy_w,
+                         st_ext_busy, oram_fsm_state);
+                dbg_prev_grant <= dbg_grant;
+            end
+            // Watchdog: IVT and pos_map should never both be busy.
+            if (ivt_busy_w && pm_busy_w)
+                $display("[MUX] WARN t=%0t IVT and PM both busy (fsm=%0d) — serialization assumption violated!",
+                         $time, oram_fsm_state);
+            // NOTE: slot_r/bucket_meta granted during a bucket burst window
+            // (S_DDR_READ=2, S_DDR_WRITE=19) is EXPECTED — they pause the burst
+            // for a single beat. Logged for inspection, not an error.
+            if ((sel_slotr || sel_bmeta) && (oram_fsm_state == 6'd2 || oram_fsm_state == 6'd19))
+                $display("[MUX] NOTE t=%0t metadata master granted during bucket burst (fsm=%0d) — burst paused, will resume",
+                         $time, oram_fsm_state);
+        end
+    end
+    `endif
 
     // Debug: expose pos_map AXI internals for SimObject probing
     assign dbg_pm_awvalid  = pm_awvalid;
@@ -531,42 +762,171 @@ module secure_oram_top #(
     assign dbg_pm_bready   = pm_bready;
     assign dbg_mux_awvalid = m_axi_awvalid;  // final muxed output
 
+    // =====================================================================
+    // AR-issuer tracking FIFO: records which module issued each AR so the
+    // R-channel response is delivered ONLY to that module.  Fixes the bug
+    // where all modules see m_axi_rvalid simultaneously and a module that
+    // didn't issue the read can capture (and consume) someone else's data.
+    // =====================================================================
+    localparam RFIFO_DEPTH = 128;       // 7-bit pointers — generous for production
+    localparam RFIFO_AW    = 7;
+    reg  [2:0] rfifo_data [0:RFIFO_DEPTH-1]; // issuer tag per AR
+    reg  [RFIFO_AW-1:0] rfifo_wr, rfifo_rd;
+    wire [RFIFO_AW-1:0] rfifo_count = rfifo_wr - rfifo_rd;
+    wire rfifo_empty = (rfifo_wr == rfifo_rd);
+
+    // Issuer encoding at AR-handshake time
+    wire [2:0] ar_issuer = sel_slotr  ? 3'd5 :
+                            sel_bmeta  ? 3'd4 :
+                            sel_ivt    ? 3'd3 :
+                            sel_posmap ? 3'd2 :
+                            sel_stash  ? 3'd1 : 3'd0;
+
+    wire ar_fire = m_axi_arvalid && m_axi_arready;
+    wire r_fire  = m_axi_rvalid  && m_axi_rready;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            rfifo_wr <= 0;
+            rfifo_rd <= 0;
+        end else begin
+            if (ar_fire) begin
+                rfifo_data[rfifo_wr] <= ar_issuer;
+                rfifo_wr <= rfifo_wr + 1;
+                `ifndef SYNTHESIS
+                if (rfifo_count == RFIFO_DEPTH-1)
+                    $display("[RFIFO] ERROR t=%0t AR-issuer FIFO overflow! wr=%0d rd=%0d",
+                             $time, rfifo_wr, rfifo_rd);
+                `endif
+            end
+            if (r_fire && m_axi_rlast) begin
+                rfifo_rd <= rfifo_rd + 1;
+            end
+        end
+    end
+
+    // Response target: who should receive the current R beat
+    wire [2:0] resp_tgt  = rfifo_empty ? 3'd0 : rfifo_data[rfifo_rd];
+    wire resp_for_bkt    = (resp_tgt == 3'd0);
+    wire resp_for_stash  = (resp_tgt == 3'd1);
+    wire resp_for_posmap = (resp_tgt == 3'd2);
+    wire resp_for_ivt    = (resp_tgt == 3'd3);
+    wire resp_for_bmeta  = (resp_tgt == 3'd4);
+    wire resp_for_slotr  = (resp_tgt == 3'd5);
+
+    // Gated rvalid per module
+    wire st_rvalid_gated  = m_axi_rvalid && resp_for_stash;
+    wire bkt_rvalid_gated = m_axi_rvalid && resp_for_bkt;
+    wire pm_rvalid_gated  = m_axi_rvalid && resp_for_posmap;
+    wire ivt_rvalid_gated = m_axi_rvalid && resp_for_ivt;
+    wire bm_rvalid_gated  = m_axi_rvalid && resp_for_bmeta;
+    wire sr_rvalid_gated  = m_axi_rvalid && resp_for_slotr;
+
+    // =====================================================================
+    // AW-issuer tracking FIFO: same pattern for B (write-response) channel
+    // =====================================================================
+    reg  [2:0] bfifo_data [0:RFIFO_DEPTH-1];
+    reg  [RFIFO_AW-1:0] bfifo_wr, bfifo_rd;
+    wire bfifo_empty = (bfifo_wr == bfifo_rd);
+
+    wire [2:0] aw_issuer = sel_slotr  ? 3'd5 :
+                            sel_bmeta  ? 3'd4 :
+                            sel_ivt    ? 3'd3 :
+                            sel_posmap ? 3'd2 :
+                            sel_stash  ? 3'd1 : 3'd0;
+
+    wire aw_fire = m_axi_awvalid && m_axi_awready;
+    wire b_fire  = m_axi_bvalid  && m_axi_bready;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            bfifo_wr <= 0;
+            bfifo_rd <= 0;
+        end else begin
+            if (aw_fire) begin
+                bfifo_data[bfifo_wr] <= aw_issuer;
+                bfifo_wr <= bfifo_wr + 1;
+                `ifndef SYNTHESIS
+                if ((bfifo_wr - bfifo_rd) == RFIFO_DEPTH-1)
+                    $display("[BFIFO] ERROR t=%0t AW-issuer FIFO overflow! wr=%0d rd=%0d",
+                             $time, bfifo_wr, bfifo_rd);
+                `endif
+            end
+            if (b_fire) begin
+                bfifo_rd <= bfifo_rd + 1;
+            end
+        end
+    end
+
+    wire [2:0] bresp_tgt    = bfifo_empty ? 3'd0 : bfifo_data[bfifo_rd];
+    wire bresp_for_bkt    = (bresp_tgt == 3'd0);
+    wire bresp_for_stash  = (bresp_tgt == 3'd1);
+    wire bresp_for_posmap = (bresp_tgt == 3'd2);
+    wire bresp_for_ivt    = (bresp_tgt == 3'd3);
+    wire bresp_for_bmeta  = (bresp_tgt == 3'd4);
+    wire bresp_for_slotr  = (bresp_tgt == 3'd5);
+
+    wire st_bvalid_gated  = m_axi_bvalid && bresp_for_stash;
+    wire bkt_bvalid_gated = m_axi_bvalid && bresp_for_bkt;
+    wire pm_bvalid_gated  = m_axi_bvalid && bresp_for_posmap;
+    wire ivt_bvalid_gated = m_axi_bvalid && bresp_for_ivt;
+    wire bm_bvalid_gated  = m_axi_bvalid && bresp_for_bmeta;
+    wire sr_bvalid_gated  = m_axi_bvalid && bresp_for_slotr;
+
     // AR channel
-    assign m_axi_arid    = sel_posmap ? pm_arid    : sel_stash ? st_arid    : bkt_arid;
-    assign m_axi_araddr  = sel_posmap ? pm_araddr  : sel_stash ? st_araddr  : bkt_araddr;
-    assign m_axi_arlen   = sel_posmap ? pm_arlen   : sel_stash ? st_arlen   : bkt_arlen;
-    assign m_axi_arsize  = sel_posmap ? pm_arsize  : sel_stash ? st_arsize  : bkt_arsize;
-    assign m_axi_arburst = sel_posmap ? pm_arburst : sel_stash ? st_arburst : bkt_arburst;
-    assign m_axi_arvalid = sel_posmap ? pm_arvalid : sel_stash ? st_arvalid : bkt_arvalid;
+    assign m_axi_arid    = sel_slotr ? sr_arid    : sel_bmeta ? bm_arid    : sel_ivt ? ivt_arid    : sel_posmap ? pm_arid    : sel_stash ? st_arid    : bkt_arid;
+    assign m_axi_araddr  = sel_slotr ? sr_araddr  : sel_bmeta ? bm_araddr  : sel_ivt ? ivt_araddr  : sel_posmap ? pm_araddr  : sel_stash ? st_araddr  : bkt_araddr;
+    assign m_axi_arlen   = sel_slotr ? sr_arlen   : sel_bmeta ? bm_arlen   : sel_ivt ? ivt_arlen   : sel_posmap ? pm_arlen   : sel_stash ? st_arlen   : bkt_arlen;
+    assign m_axi_arsize  = sel_slotr ? sr_arsize  : sel_bmeta ? bm_arsize  : sel_ivt ? ivt_arsize  : sel_posmap ? pm_arsize  : sel_stash ? st_arsize  : bkt_arsize;
+    assign m_axi_arburst = sel_slotr ? sr_arburst : sel_bmeta ? bm_arburst : sel_ivt ? ivt_arburst : sel_posmap ? pm_arburst : sel_stash ? st_arburst : bkt_arburst;
+    assign m_axi_arvalid = sel_slotr ? sr_arvalid : sel_bmeta ? bm_arvalid : sel_ivt ? ivt_arvalid : sel_posmap ? pm_arvalid : sel_stash ? st_arvalid : bkt_arvalid;
+    assign sr_arready    = sel_slotr  ? m_axi_arready : 1'b0;
+    assign bm_arready    = sel_bmeta  ? m_axi_arready : 1'b0;
+    assign ivt_arready   = sel_ivt    ? m_axi_arready : 1'b0;
     assign pm_arready    = sel_posmap ? m_axi_arready : 1'b0;
     assign st_arready    = sel_stash  ? m_axi_arready : 1'b0;
-    assign bkt_arready   = (!sel_posmap && !sel_stash) ? m_axi_arready : 1'b0;
+    assign bkt_arready   = sel_bucket ? m_axi_arready : 1'b0;
 
-    // R channel
-    assign m_axi_rready  = sel_posmap ? pm_rready  : sel_stash ? st_rready  : bkt_rready;
+    // R channel — rready routed by response-issuer FIFO, not current sel_*
+    assign m_axi_rready  = resp_for_slotr  ? sr_rready :
+                            resp_for_bmeta  ? bm_rready :
+                            resp_for_ivt    ? ivt_rready :
+                            resp_for_posmap ? pm_rready :
+                            resp_for_stash  ? st_rready : bkt_rready;
 
     // AW channel
-    assign m_axi_awid    = sel_posmap ? pm_awid    : sel_stash ? st_awid    : bkt_awid;
-    assign m_axi_awaddr  = sel_posmap ? pm_awaddr  : sel_stash ? st_awaddr  : bkt_awaddr;
-    assign m_axi_awlen   = sel_posmap ? pm_awlen   : sel_stash ? st_awlen   : bkt_awlen;
-    assign m_axi_awsize  = sel_posmap ? pm_awsize  : sel_stash ? st_awsize  : bkt_awsize;
-    assign m_axi_awburst = sel_posmap ? pm_awburst : sel_stash ? st_awburst : bkt_awburst;
-    assign m_axi_awvalid = sel_posmap ? pm_awvalid : sel_stash ? st_awvalid : bkt_awvalid;
+    assign m_axi_awid    = sel_slotr ? sr_awid    : sel_bmeta ? bm_awid    : sel_ivt ? ivt_awid    : sel_posmap ? pm_awid    : sel_stash ? st_awid    : bkt_awid;
+    assign m_axi_awaddr  = sel_slotr ? sr_awaddr  : sel_bmeta ? bm_awaddr  : sel_ivt ? ivt_awaddr  : sel_posmap ? pm_awaddr  : sel_stash ? st_awaddr  : bkt_awaddr;
+    assign m_axi_awlen   = sel_slotr ? sr_awlen   : sel_bmeta ? bm_awlen   : sel_ivt ? ivt_awlen   : sel_posmap ? pm_awlen   : sel_stash ? st_awlen   : bkt_awlen;
+    assign m_axi_awsize  = sel_slotr ? sr_awsize  : sel_bmeta ? bm_awsize  : sel_ivt ? ivt_awsize  : sel_posmap ? pm_awsize  : sel_stash ? st_awsize  : bkt_awsize;
+    assign m_axi_awburst = sel_slotr ? sr_awburst : sel_bmeta ? bm_awburst : sel_ivt ? ivt_awburst : sel_posmap ? pm_awburst : sel_stash ? st_awburst : bkt_awburst;
+    assign m_axi_awvalid = sel_slotr ? sr_awvalid : sel_bmeta ? bm_awvalid : sel_ivt ? ivt_awvalid : sel_posmap ? pm_awvalid : sel_stash ? st_awvalid : bkt_awvalid;
+    assign sr_awready    = sel_slotr  ? m_axi_awready : 1'b0;
+    assign bm_awready    = sel_bmeta  ? m_axi_awready : 1'b0;
+    assign ivt_awready   = sel_ivt    ? m_axi_awready : 1'b0;
     assign pm_awready    = sel_posmap ? m_axi_awready : 1'b0;
     assign st_awready    = sel_stash  ? m_axi_awready : 1'b0;
-    assign bkt_awready   = (!sel_posmap && !sel_stash) ? m_axi_awready : 1'b0;
+    assign bkt_awready   = sel_bucket ? m_axi_awready : 1'b0;
 
     // W channel
-    assign m_axi_wdata   = sel_posmap ? pm_wdata   : sel_stash ? st_wdata   : bkt_wdata;
-    assign m_axi_wstrb   = sel_posmap ? pm_wstrb   : sel_stash ? st_wstrb   : bkt_wstrb;
-    assign m_axi_wlast   = sel_posmap ? pm_wlast   : sel_stash ? st_wlast   : bkt_wlast;
-    assign m_axi_wvalid  = sel_posmap ? pm_wvalid  : sel_stash ? st_wvalid  : bkt_wvalid;
+    assign m_axi_wdata   = sel_slotr ? sr_wdata   : sel_bmeta ? bm_wdata   : sel_ivt ? ivt_wdata   : sel_posmap ? pm_wdata   : sel_stash ? st_wdata   : bkt_wdata;
+    assign m_axi_wstrb   = sel_slotr ? sr_wstrb   : sel_bmeta ? bm_wstrb   : sel_ivt ? ivt_wstrb   : sel_posmap ? pm_wstrb   : sel_stash ? st_wstrb   : bkt_wstrb;
+    assign m_axi_wlast   = sel_slotr ? sr_wlast   : sel_bmeta ? bm_wlast   : sel_ivt ? ivt_wlast   : sel_posmap ? pm_wlast   : sel_stash ? st_wlast   : bkt_wlast;
+    assign m_axi_wvalid  = sel_slotr ? sr_wvalid  : sel_bmeta ? bm_wvalid  : sel_ivt ? ivt_wvalid  : sel_posmap ? pm_wvalid  : sel_stash ? st_wvalid  : bkt_wvalid;
+    assign sr_wready     = sel_slotr  ? m_axi_wready : 1'b0;
+    assign bm_wready     = sel_bmeta  ? m_axi_wready : 1'b0;
+    assign ivt_wready    = sel_ivt    ? m_axi_wready : 1'b0;
     assign pm_wready     = sel_posmap ? m_axi_wready : 1'b0;
     assign st_wready     = sel_stash  ? m_axi_wready : 1'b0;
-    assign bkt_wready    = (!sel_posmap && !sel_stash) ? m_axi_wready : 1'b0;
+    assign bkt_wready    = sel_bucket ? m_axi_wready : 1'b0;
 
     // B channel
-    assign m_axi_bready  = sel_posmap ? pm_bready  : sel_stash ? st_bready  : bkt_bready;
+    // B channel — bready routed by AW-issuer FIFO
+    assign m_axi_bready  = bresp_for_slotr  ? sr_bready :
+                            bresp_for_bmeta  ? bm_bready :
+                            bresp_for_ivt    ? ivt_bready :
+                            bresp_for_posmap ? pm_bready :
+                            bresp_for_stash  ? st_bready : bkt_bready;
 
     // =========================================================================
     // Route outputs to correct client

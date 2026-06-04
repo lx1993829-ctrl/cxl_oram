@@ -39,11 +39,15 @@ module stash_axi_master #(
     input  wire [AXI_DW-1:0]   cmd_single_wdata,
     output reg  [AXI_DW-1:0]   cmd_single_rdata,
     output wire                 cmd_single_done,
+    output reg                  cmd_single_accepted,  // 1-cyc pulse: single read accepted
 
     // Line buffer write port (AXI read -> line buffer)
     output reg  [AXI_DW-1:0]   lb_wr_data,
     output reg  [BEAT_AW-1:0]  lb_wr_addr,
     output reg                  lb_wr_en,
+    // Latched entry index for line buffer addressing (valid throughout the
+    // burst, unlike the live cmd_entry which the FSM changes mid-burst).
+    output reg  [PTR_W-1:0]    lb_entry,
 
     // Line buffer read port (line buffer -> AXI write)
     output reg  [BEAT_AW-1:0]  lb_rd_addr,
@@ -153,14 +157,27 @@ module stash_axi_master #(
             m_axi_awvalid <= 0; m_axi_wvalid  <= 0;
             m_axi_wlast   <= 0; m_axi_bready  <= 0;
             lb_wr_en      <= 0; lb_rd_en      <= 0;
+            lb_entry      <= 0;
             hold_buf      <= 0; hold_valid    <= 0;
             cmd_single_rdata <= 0;
+            cmd_single_accepted <= 0;
         end else begin
             rd_done_r <= 0;
             wr_done_r <= 0;
             sng_done_r <= 0;
+            cmd_single_accepted <= 0;
             lb_wr_en  <= 0;
             lb_rd_en  <= 0;
+            `ifndef SYNTHESIS
+            // Bug-2 probe: a single-read request that arrives while the FSM is
+            // NOT in ST_IDLE cannot issue an AR this cycle. If the HT FSM then
+            // observes sng_done (a leftover/spurious pulse) it will consume stale
+            // cmd_single_rdata. Flag the request-while-busy condition and what
+            // cmd_single_rdata currently holds (the stale value that would be read).
+            if (cmd_single_read && fsm_state != ST_IDLE)
+                $display("[SAM_SNG_RD_BUSY] t=%0t req addr=0x%010h but fsm_state=%0d (NOT IDLE) -> no AR; stale cmd_single_rdata=0x%016h",
+                         $time, cmd_single_addr, fsm_state, cmd_single_rdata);
+            `endif
 
             case (fsm_state)
 
@@ -169,6 +186,7 @@ module stash_axi_master #(
                 hold_valid <= 0;
                 if (cmd_read) begin
                     // Burst read: 128-beat stash entry
+                    lb_entry      <= cmd_entry;   // latch for line buffer addressing
                     m_axi_arid    <= 0;
                     m_axi_araddr  <= entry_base;
                     m_axi_arlen   <= SUB_LEN[AXI_LENW-1:0];
@@ -184,6 +202,7 @@ module stash_axi_master #(
                     fsm_state     <= ST_READ;
                 end else if (cmd_write) begin
                     // Burst write: 128-beat stash entry
+                    lb_entry      <= cmd_entry;   // latch for line buffer addressing
                     m_axi_awid    <= 0;
                     m_axi_awaddr  <= entry_base;
                     m_axi_awlen   <= SUB_LEN[AXI_LENW-1:0];
@@ -211,6 +230,11 @@ module stash_axi_master #(
                     m_axi_arvalid <= 1;
                     m_axi_rready  <= 1;
                     fsm_state     <= ST_SNG_READ;
+                    cmd_single_accepted <= 1;
+                    `ifndef SYNTHESIS
+                    $display("[SAM_SNG_RD_ISSUE] t=%0t addr=0x%010h (AR issued, ST_IDLE->ST_SNG_READ)",
+                             $time, cmd_single_addr);
+                    `endif
                 end else if (cmd_single_write) begin
                     // Single-beat write: hash table update
                     m_axi_awid    <= 0;
@@ -373,6 +397,10 @@ module stash_axi_master #(
                     m_axi_rready     <= 0;
                     sng_done_r       <= 1;
                     fsm_state        <= ST_IDLE;
+                    `ifndef SYNTHESIS
+                    $display("[SAM_SNG_RD_DONE] t=%0t araddr=0x%010h rdata=0x%016h (R captured, sng_done<=1)",
+                             $time, m_axi_araddr, m_axi_rdata);
+                    `endif
                 end
             end
 

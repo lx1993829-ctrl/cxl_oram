@@ -13,7 +13,7 @@
 //   - Full AXI4 master interface for HBM access.
 //
 // HBM layout: entries packed 16 per AXI beat (each padded to 16 bits).
-//   beat_addr = PM_BASE + (slot_index / 16) * 32
+//   beat_addr = PM_BASE + (slot_index / 16) * 32    (PM_BASE = 0x14000000)
 //
 // Read:  single-beat AXI4 read  (ARLEN=0), extract 16-bit entry from beat.
 // Write: single-beat AXI4 write (AWLEN=0), WSTRB masks the 2 target bytes.
@@ -37,7 +37,7 @@ module pos_map #(
     parameter EPB_W      = $clog2(EPB),          // 4
     parameter ENTRY_BYTES = PACK_W / 8,          // 2
     parameter BEAT_BYTES = AXI_DW / 8,           // 32
-    parameter PM_BASE    = 34'h0_1040_0000
+    parameter PM_BASE    = 34'h0_1400_0000
 )(
     input  wire                 clk,
     input  wire                 rst_n,
