@@ -28,7 +28,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from phase_d_layout import (
+from oram_addr_layout import (
     MAIN_DRAM_BASE, MAIN_DRAM_SIZE,
     HBM_PER_INSTANCE, DDR_PER_INSTANCE,
     HBM_BASE, DDR_AGG_BASE, DDR_SLAB_BASE,
