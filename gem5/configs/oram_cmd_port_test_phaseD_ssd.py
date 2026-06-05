@@ -43,11 +43,12 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from oram_addr_layout import (
+from phase_d_layout import (
     MAIN_DRAM_BASE, MAIN_DRAM_SIZE,
     HBM_PER_INSTANCE, DDR_PER_INSTANCE,
     HBM_BASE, DDR_AGG_BASE, DDR_SLAB_BASE,
     CMD_RING_BASE, RESULT_BUF_BASE, ORAM_CMD_BASE,
+    STASH_OFFSET,
     per_instance_addrs, ddr_aggregate_size,
 )
 
@@ -298,7 +299,7 @@ if need_oram:
             num_ops=args.num_ops,
             hbm_base       = a['hbm'],
             host_base      = oram_host_base,
-            stash_offset   = HBM_PER_INSTANCE - 0x01000000,
+            stash_offset   = STASH_OFFSET,
             cpu_driven     = True,
             num_logical_clients = 2,
             cmd_base       = a['cmd_port'],
@@ -493,10 +494,10 @@ for i, p in enumerate(processes):
     # SimpleSSD sample.cfg).
     if args.use_nvme:
         max_lba = DDR_PER_INSTANCE // 512  # = 131072 for 64 MB / 512
-        p.cmd = [args.binary, str(N), str(i), str(args.num_ops // 2),
+        p.cmd = [args.binary, str(N), str(i), str(args.num_ops // 2), str(args.num_slots),
                  hex(args.nvme_bar0), str(max_lba)]
     else:
-        p.cmd = [args.binary, str(N), str(i), str(args.num_ops // 2)]
+        p.cmd = [args.binary, str(N), str(i), str(args.num_ops // 2), str(args.num_slots), str(args.num_slots)]
 
 system.workload = m5.objects.SEWorkload.init_compatible(args.binary)
 for i in range(N):
