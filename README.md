@@ -1,4 +1,4 @@
-This is for continue debugging nvme SSD. 
+This is for continue debugging nvme SSD and run experiments for host mem and local mem. 
 
 
 Step 1 Install and build Gem5, Verilator
