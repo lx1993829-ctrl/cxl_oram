@@ -33,6 +33,8 @@ from phase_d_layout import (
     HBM_PER_INSTANCE, DDR_PER_INSTANCE,
     HBM_BASE, DDR_AGG_BASE, DDR_SLAB_BASE,
     CMD_RING_BASE, RESULT_BUF_BASE, ORAM_CMD_BASE,
+    STASH_OFFSET,
+    STASH_OFFSET,
     per_instance_addrs, ddr_aggregate_size,
 )
 
@@ -86,7 +88,7 @@ parser.add_argument('--local-pct',      type=int, default=0)
 args = parser.parse_args()
 
 N = args.num_instances
-assert 1 <= N <= 16
+assert 1 <= N <= 32
 
 
 # =============================================================================
@@ -172,16 +174,43 @@ system.main_mem.port = system.membus.mem_side_ports
 # --- N OramDevices, each with its own HBM ---
 oram_list, hbm_xbar_list, hbm_ctrl_list = [], [], []
 
+# HBM topology:
+#   N <= 16: partitioned — each ORAM gets private xbar + private controller.
+#   N > 16:  grouped — 16 physical channels, pairs of instances share
+#            one xbar + one controller (models HBM2 pseudo-channel sharing).
+#            ORAM 0,1 → ctrl 0; ORAM 2,3 → ctrl 1; ... ORAM 30,31 → ctrl 15.
+NUM_HBM_CONTROLLERS = min(N, 16)
+instances_per_ctrl = (N + NUM_HBM_CONTROLLERS - 1) // NUM_HBM_CONTROLLERS
+
+# Create controllers and xbars first
+for c in range(NUM_HBM_CONTROLLERS):
+    hbm_xbar_c = NoncoherentXBar(
+        width=128, clk_domain=system.clk_domain,
+        frontend_latency=1, forward_latency=1, response_latency=1,
+    )
+    hbm_ctrl_c = MemCtrl()
+    hbm_ctrl_c.dram = HBM_2000_4H_1x64()
+    # Controller range covers all instances mapped to this channel
+    first_inst = c * instances_per_ctrl
+    n_inst = min(instances_per_ctrl, N - first_inst)
+    ctrl_base = HBM_BASE + first_inst * HBM_PER_INSTANCE
+    ctrl_size = n_inst * HBM_PER_INSTANCE
+    hbm_ctrl_c.dram.range = AddrRange(ctrl_base, size=ctrl_size)
+    hbm_ctrl_c.port = hbm_xbar_c.mem_side_ports
+    hbm_xbar_list.append(hbm_xbar_c)
+    hbm_ctrl_list.append(hbm_ctrl_c)
+
+# Create ORAM instances and connect to appropriate xbar
 for i in range(N):
     a = per_instance_addrs(i)
     oram_i = OramDevice(
         oram_freq='300MHz',
         local_pct=args.local_pct,
         num_slots=args.num_slots,
-        num_ops=args.num_ops,
+        num_ops=args.num_ops * 2,  # each iteration = write + read pair
         hbm_base       = a['hbm'],
         host_base      = a['ddr'],
-        stash_offset   = HBM_PER_INSTANCE - 0x01000000,
+        stash_offset   = STASH_OFFSET,
         cpu_driven     = True,
         num_logical_clients = 2,
         cmd_base       = a['cmd_port'],
@@ -191,21 +220,9 @@ for i in range(N):
         cmd_ring_depth = 16,
         cmd_queue_depth= 16,
     )
-
-    hbm_xbar_i = NoncoherentXBar(
-        width=128, clk_domain=system.clk_domain,
-        frontend_latency=1, forward_latency=1, response_latency=1,
-    )
-    oram_i.hbm_port = hbm_xbar_i.cpu_side_ports
-
-    hbm_ctrl_i = MemCtrl()
-    hbm_ctrl_i.dram = HBM_2000_4H_1x64()
-    hbm_ctrl_i.dram.range = hbm_ranges[i]
-    hbm_ctrl_i.port = hbm_xbar_i.mem_side_ports
-
+    ctrl_idx = i // instances_per_ctrl
+    oram_i.hbm_port = hbm_xbar_list[ctrl_idx].cpu_side_ports
     oram_list.append(oram_i)
-    hbm_xbar_list.append(hbm_xbar_i)
-    hbm_ctrl_list.append(hbm_ctrl_i)
 
 system.oram     = oram_list
 system.hbm_xbar = hbm_xbar_list
@@ -216,11 +233,11 @@ system.cxl = CxlModel(
     gen=5,
     lanes=16,
     cxl_core_clock='1ns',
-    max_tags=1024,
-    max_outstanding=512,
-    max_outstanding_writes=512,
+    max_tags=256,
+    max_outstanding=64,
+    max_outstanding_writes=128,
     flit_credits=128,
-    completion_buffer_depth=128,
+    completion_buffer_depth=2048,
     host_inject_interval='1ns',
 )
 system.cxl.clk_domain = SrcClockDomain(clock='1GHz', voltage_domain=VoltageDomain())
@@ -258,15 +275,18 @@ for i, ctrl in enumerate(system.cxl_ddr5_ctrls):
 # v4: small_mem deleted. cmd_ring + result_buf are inside ddr_agg_range
 # above and are interleaved across the 8 DDR5 channels.
 
-# --- CPU traffic through fabric ---
-# Bridge filters everything CPU-touched outside main_mem: the DDR5
-# aggregate (which now contains cmd_ring + result_buf + ORAM slabs).
+# --- CPU traffic through host xbar (NOT through CXL) ---
+# Bug fix: CPU is on the HOST side of the CXL link. CPU accesses to
+# cmd_ring/result_buf in DDR5 go through the host memory controller,
+# not through the CXL device endpoint. Routing CPU through CXL would
+# (a) add false CXL latency to ring ops and (b) pollute CXL link
+# utilization with non-DMA traffic. Matches PCIe config's fix.
 system.cpu_fabric_bridge = Bridge(
     delay='2ns',
     ranges=[ddr_agg_range],
 )
 system.cpu_fabric_bridge.cpu_side_port = system.membus.mem_side_ports
-system.cpu_fabric_bridge.mem_side_port = system.cxl.device_side_port
+system.cpu_fabric_bridge.mem_side_port = system.cxl_host_xbar.cpu_side_ports
 
 # --- CPU MMIO path: iobridge → iobus → N cmd_ports ---
 system.iobus = NoncoherentXBar(
