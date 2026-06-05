@@ -19,7 +19,7 @@ set -e
 
 GEM5=build/ALL/gem5.opt
 CFGDIR=configs
-BIN=$CFGDIR/test_random
+BIN=$CFGDIR/oram_workload
 SLOTS=32768
 OPS=100000
 OUTDIR=m5out/scaling_sweep
