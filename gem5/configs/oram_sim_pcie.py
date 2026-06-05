@@ -4,7 +4,7 @@
 #
 # v5 changes (from v3):
 #  - phase_d_layout v5: HBM_PER_INSTANCE=512MB (was 32MB, HT didn't fit),
-#    DDR_AGG_BASE=0x400000000 (was 0x200000000, overlapped HBM at N>8).
+#    DDR_AGG_BASE=0x600000000 (was 0x400000000, overlapped HBM at N>16).
 #  - Bug 1 fix: PCIe max_tags=256, max_outstanding=32 (realistic Xilinx
 #    AXI-PCIe bridge limits). Previous 512/1024 hid link contention.
 #  - Bug 2 fix: cpu_fabric_bridge routes to cxl_host_xbar directly, not
@@ -36,6 +36,7 @@ from oram_addr_layout import (
     HBM_PER_INSTANCE, DDR_PER_INSTANCE,
     HBM_BASE, DDR_AGG_BASE, DDR_SLAB_BASE,
     CMD_RING_BASE, RESULT_BUF_BASE, ORAM_CMD_BASE,
+    STASH_OFFSET,
     per_instance_addrs, ddr_aggregate_size,
 )
 
@@ -89,7 +90,7 @@ parser.add_argument('--local-pct',      type=int, default=0)
 args = parser.parse_args()
 
 N = args.num_instances
-assert 1 <= N <= 16
+assert 1 <= N <= 32
 
 
 # =============================================================================
@@ -175,16 +176,43 @@ system.main_mem.port = system.membus.mem_side_ports
 # --- N OramDevices, each with its own HBM ---
 oram_list, hbm_xbar_list, hbm_ctrl_list = [], [], []
 
+# HBM topology:
+#   N <= 16: partitioned — each ORAM gets private xbar + private controller.
+#   N > 16:  grouped — 16 physical channels, pairs of instances share
+#            one xbar + one controller (models HBM2 pseudo-channel sharing).
+#            ORAM 0,1 → ctrl 0; ORAM 2,3 → ctrl 1; ... ORAM 30,31 → ctrl 15.
+NUM_HBM_CONTROLLERS = min(N, 16)
+instances_per_ctrl = (N + NUM_HBM_CONTROLLERS - 1) // NUM_HBM_CONTROLLERS
+
+# Create controllers and xbars first
+for c in range(NUM_HBM_CONTROLLERS):
+    hbm_xbar_c = NoncoherentXBar(
+        width=128, clk_domain=system.clk_domain,
+        frontend_latency=1, forward_latency=1, response_latency=1,
+    )
+    hbm_ctrl_c = MemCtrl()
+    hbm_ctrl_c.dram = HBM_2000_4H_1x64()
+    # Controller range covers all instances mapped to this channel
+    first_inst = c * instances_per_ctrl
+    n_inst = min(instances_per_ctrl, N - first_inst)
+    ctrl_base = HBM_BASE + first_inst * HBM_PER_INSTANCE
+    ctrl_size = n_inst * HBM_PER_INSTANCE
+    hbm_ctrl_c.dram.range = AddrRange(ctrl_base, size=ctrl_size)
+    hbm_ctrl_c.port = hbm_xbar_c.mem_side_ports
+    hbm_xbar_list.append(hbm_xbar_c)
+    hbm_ctrl_list.append(hbm_ctrl_c)
+
+# Create ORAM instances and connect to appropriate xbar
 for i in range(N):
     a = per_instance_addrs(i)
     oram_i = OramDevice(
         oram_freq='300MHz',
         local_pct=args.local_pct,
         num_slots=args.num_slots,
-        num_ops=args.num_ops,
+        num_ops=args.num_ops * 2,  # each iteration = write + read pair
         hbm_base       = a['hbm'],
         host_base      = a['ddr'],
-        stash_offset   = HBM_PER_INSTANCE - 0x01000000,
+        stash_offset   = STASH_OFFSET,   # RTL STASH_DDR_BASE = 0x10000000 (64 MB region)
         cpu_driven     = True,
         num_logical_clients = 2,
         cmd_base       = a['cmd_port'],
@@ -194,21 +222,9 @@ for i in range(N):
         cmd_ring_depth = 16,
         cmd_queue_depth= 16,
     )
-
-    hbm_xbar_i = NoncoherentXBar(
-        width=128, clk_domain=system.clk_domain,
-        frontend_latency=1, forward_latency=1, response_latency=1,
-    )
-    oram_i.hbm_port = hbm_xbar_i.cpu_side_ports
-
-    hbm_ctrl_i = MemCtrl()
-    hbm_ctrl_i.dram = HBM_2000_4H_1x64()
-    hbm_ctrl_i.dram.range = hbm_ranges[i]
-    hbm_ctrl_i.port = hbm_xbar_i.mem_side_ports
-
+    ctrl_idx = i // instances_per_ctrl
+    oram_i.hbm_port = hbm_xbar_list[ctrl_idx].cpu_side_ports
     oram_list.append(oram_i)
-    hbm_xbar_list.append(hbm_xbar_i)
-    hbm_ctrl_list.append(hbm_ctrl_i)
 
 system.oram     = oram_list
 system.hbm_xbar = hbm_xbar_list
@@ -225,8 +241,11 @@ system.pcie = PCIeModel(
     lanes=16,
     pcie_core_clock='1ns',
     max_tags=256,
-    max_outstanding=32,
+    max_outstanding=64,
     max_outstanding_writes=128,
+    credits_ph=128,
+    credits_pd=256,
+    credits_nph=128,
     completion_reorder_depth=256,
     host_inject_interval='1ns',
 )
@@ -322,11 +341,13 @@ for proc in processes:
 
 print('=' * 60)
 print(f'oram_cmd_port_test_pcie_phaseD v5 (PCIe): N={N}')
-print(f'  fabric:  PCIeModel(gen=5, lanes=16, tags=256, maxOut=32/128)')
+print(f'  fabric:  PCIeModel(gen=5, lanes=16, tags=256, maxOut=64/128, ph=128/pd=256/nph=128)')
 print(f'  CPU→DDR: cpu_fabric_bridge → cxl_host_xbar (bypasses PCIe)')
 print(f'  HBM:     {N} controllers, [0x{HBM_BASE:09x}, 0x{HBM_BASE + N*HBM_PER_INSTANCE:09x}) ({N}×{HBM_PER_INSTANCE//(1024*1024)} MB)')
+print(f'  metadata/inst: stash@0x{STASH_OFFSET:08x}(64MB) pm@0x14000000 HT@0x14100000 IVT@0x14400000(4MB) top=0x14600000')
 print(f'  DDR5:    16 subchannels, [0x{DDR_AGG_BASE:09x}, 0x{DDR_AGG_BASE + ddr_agg_size:09x}) (incl. cmd_ring + result_buf)')
 print(f'  ORAM cmd MMIO: [0x{ORAM_CMD_BASE:09x}, 0x{ORAM_CMD_BASE + N*0x1000:09x})')
+print(f'  local_pct={args.local_pct}  (100 = all data on HBM; PCIe data path idle)')
 print(f'  binary: {args.binary}')
 print('=' * 60)
 
