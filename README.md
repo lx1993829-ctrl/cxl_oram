@@ -25,7 +25,7 @@ Step 7 "cd gem5/tests", "gcc -O2 -static -Wall -Wextra -o nvme_io_test nvme_io_t
 
 Step 8 "cd gem5/ and compile .c "musl-gcc -O0 -static -o configs/oram_workload configs/oram_workload.c"
 
-Step 9: 
+Step 9: bash gem5/configs/sweep_scaling.sh and gem5/configs/plot_local_pct.py
 
 
 
