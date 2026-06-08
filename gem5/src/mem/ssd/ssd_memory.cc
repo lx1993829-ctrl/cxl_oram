@@ -217,6 +217,30 @@ SsdMemory::ssdLatency(Addr byteAddr, unsigned size, bool isRead)
            isRead ? "RD" : "WR", slpn, byteAddr, size,
            latency, latency / 1e6, curTick());
 
+    // DIAG: classify ICL hit vs NAND read, identify instance
+    if (isRead) {
+        // Instance identification: inst0 at [0, DDR_PER_INST), inst1 at [DDR_PER_INST, 2*DDR_PER_INST), etc.
+        unsigned inst = (unsigned)(byteAddr / 0x020000000ULL);
+        double lat_us = latency / 1e6;
+        bool iclHit = (lat_us < 20.0);  // NAND tR minimum is 40us
+        static uint64_t hitCount[16] = {}, missCount[16] = {};
+        static uint64_t totalHitLat[16] = {}, totalMissLat[16] = {};
+        if (iclHit) {
+            hitCount[inst]++;
+            totalHitLat[inst] += latency;
+        } else {
+            missCount[inst]++;
+            totalMissLat[inst] += latency;
+        }
+        inform("SSD-CLASS inst=%u page=%lu %s lat=%.1fus "
+               "cumulative: hits=%lu(avg=%.1fus) misses=%lu(avg=%.1fus)",
+               inst, slpn, iclHit ? "ICL-HIT" : "NAND-RD", lat_us,
+               hitCount[inst],
+               hitCount[inst] ? (double)totalHitLat[inst]/hitCount[inst]/1e6 : 0,
+               missCount[inst],
+               missCount[inst] ? (double)totalMissLat[inst]/missCount[inst]/1e6 : 0);
+    }
+
     return latency;
 }
 
@@ -458,6 +482,12 @@ SsdMemory::MemoryPort::recvAtomic(PacketPtr pkt)
     unsigned size = pkt->getSize();
     Addr offset = owner.toOffset(addr);
 
+    // DIAG: address range check
+    if (!owner.addrRange.contains(addr)) {
+        warn("SSD-MISROUTE: recvAtomic addr=0x%lx size=%u OUTSIDE "
+             "range [0x%lx, 0x%lx)",
+             addr, size, owner.addrRange.start(), owner.addrRange.end());
+    }
     if (pkt->isRead()) {
         pkt->setData(owner.pmem + offset);
     } else if (pkt->isWrite()) {
@@ -478,13 +508,40 @@ SsdMemory::MemoryPort::recvAtomic(PacketPtr pkt)
 void
 SsdMemory::MemoryPort::recvFunctional(PacketPtr pkt)
 {
+    // DIAG 1: address range check
+    if (!owner.addrRange.contains(pkt->getAddr())) {
+        warn("SSD-MISROUTE: recvFunctional addr=0x%lx size=%u OUTSIDE "
+             "range [0x%lx, 0x%lx)",
+             pkt->getAddr(), pkt->getSize(),
+             owner.addrRange.start(), owner.addrRange.end());
+    }
+
+    // DIAG 2: log all functional accesses (first 20 + every 1000th)
+    static uint64_t funcCount = 0;
+    funcCount++;
+    if (funcCount <= 20 || (funcCount % 1000 == 0)) {
+        inform("SSD-FUNC #%lu: %s addr=0x%lx size=%u pendingQ=%zu",
+               funcCount, pkt->isRead() ? "RD" : "WR",
+               pkt->getAddr(), pkt->getSize(),
+               owner.pendingReqs.size());
+    }
+
+    // DIAG 3: check if trySatisfyFunctional modifies pending packets
     for (auto &pending : owner.pendingReqs) {
         if (pkt->trySatisfyFunctional(pending.pkt)) {
+            warn("SSD-SNOOP-HIT: functional %s addr=0x%lx satisfied by "
+                 "pending %s addr=0x%lx — DATA MODIFIED",
+                 pkt->isRead() ? "RD" : "WR", pkt->getAddr(),
+                 pending.pkt->isRead() ? "RD" : "WR",
+                 pending.pkt->getAddr());
             pkt->makeResponse();
             return;
         }
     }
     if (owner.retryPkt && pkt->trySatisfyFunctional(owner.retryPkt)) {
+        warn("SSD-SNOOP-HIT: functional addr=0x%lx satisfied by retryPkt "
+             "addr=0x%lx — DATA MODIFIED",
+             pkt->getAddr(), owner.retryPkt->getAddr());
         pkt->makeResponse();
         return;
     }
@@ -507,6 +564,21 @@ SsdMemory::MemoryPort::recvTimingReq(PacketPtr pkt)
     unsigned size = pkt->getSize();
     Addr offset = owner.toOffset(addr);
 
+    // DIAG 1: address range check
+    if (!owner.addrRange.contains(addr)) {
+        warn("SSD-MISROUTE: recvTimingReq addr=0x%lx size=%u OUTSIDE "
+             "range [0x%lx, 0x%lx)",
+             addr, size, owner.addrRange.start(), owner.addrRange.end());
+    }
+
+    // DIAG 2: log first 20 timing requests + every 1000th
+    static uint64_t timingCount = 0;
+    timingCount++;
+    if (timingCount <= 20 || (timingCount % 1000 == 0)) {
+        inform("SSD-TIMING #%lu: %s addr=0x%lx size=%u tick=%lu pendingQ=%zu",
+               timingCount, pkt->isRead() ? "RD" : "WR",
+               addr, size, curTick(), owner.pendingReqs.size());
+    }
     DPRINTF(SsdMemory, "timing %s addr=%#lx size=%u\n",
             pkt->isRead() ? "read" : "write", addr, size);
 

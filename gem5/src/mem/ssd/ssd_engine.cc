@@ -18,6 +18,7 @@
 #include "sim/config_reader.hh"
 #include "sim/cpu.hh"
 #include "sim/log.hh"
+#include <iostream>
 
 namespace gem5
 {
@@ -141,7 +142,7 @@ SsdEngine::allocateEvent(SimpleSSD::EventFunction func)
     auto iter = eventList.insert({++counter, func});
 
     if (!iter.second) {
-        panic("SsdEngine: failed to allocate event");
+        SimpleSSD::ssd_panic("SsdEngine: failed to allocate event");
     }
 
     DPRINTF(SsdMemory, "[ALLOC_EVENT] eid=%lu\n", counter);
@@ -154,7 +155,7 @@ SsdEngine::scheduleEvent(SimpleSSD::Event eid, uint64_t tick)
     auto iter = eventList.find(eid);
 
     if (iter == eventList.end()) {
-        panic(
+        SimpleSSD::ssd_panic(
             "SsdEngine: event %" PRIu64 " does not exist", eid);
         return;
     }
@@ -205,7 +206,7 @@ SsdEngine::descheduleEvent(SimpleSSD::Event eid)
     auto iter = eventList.find(eid);
 
     if (iter == eventList.end()) {
-        panic(
+        SimpleSSD::ssd_panic(
             "SsdEngine: event %" PRIu64 " does not exist", eid);
         return;
     }
@@ -226,7 +227,7 @@ SsdEngine::isScheduled(SimpleSSD::Event eid, uint64_t *pTick)
     auto iter = eventList.find(eid);
 
     if (iter == eventList.end()) {
-        panic(
+        SimpleSSD::ssd_panic(
             "SsdEngine: event %" PRIu64 " does not exist", eid);
     }
 
@@ -239,7 +240,7 @@ SsdEngine::deallocateEvent(SimpleSSD::Event eid)
     auto iter = eventList.find(eid);
 
     if (iter == eventList.end()) {
-        panic(
+        SimpleSSD::ssd_panic(
             "SsdEngine: event %" PRIu64 " does not exist", eid);
         return;
     }
@@ -270,7 +271,7 @@ initSimpleSSD(SsdEngine *engine, const std::string &configPath)
     SimpleSSD::ConfigReader conf;
 
     SimpleSSD::setSimulator(engine);
-    SimpleSSD::initLogSystem(nullptr, nullptr);
+    SimpleSSD::initLogSystem(&std::cerr, &std::cerr);
 
     if (!conf.init(configPath)) {
         panic("SimpleSSD: failed to open config file '%s'",

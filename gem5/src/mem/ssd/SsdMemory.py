@@ -47,13 +47,14 @@ class SsdMemory(ClockedObject):
         "and validate against NAND specs in sample.cfg.")
 
     # ---- Page coalescing ----
-    coalesce_window = Param.Latency('10us',
+    coalesce_window = Param.Latency('500ns',
         "Time window for page coalescing. If a second access to the "
-        "same 4KB page arrives within this window of the first, it "
-        "gets the coalesced (fast) latency instead of a full SSD "
-        "access. 0 = disabled. 10us is a good default (covers one "
-        "SSD page read time so back-to-back beats to the same page "
-        "are absorbed).")
+        "same 16KB NAND page arrives within this window of the first, "
+        "it gets the coalesced (fast) latency instead of a full SSD "
+        "access. 0 = disabled. 500ns covers intra-page AXI beats "
+        "(~255ns burst) with margin, without falsely coalescing "
+        "across inter-page gaps (1.7us) or DDR_READ/WRITE phases "
+        "(10-95us).")
 
     coalesce_latency = Param.Latency('100ns',
         "Latency returned for a coalesced (same-page) access. "
