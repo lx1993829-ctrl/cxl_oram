@@ -19,11 +19,11 @@
  * We extern-declare it here so the constructor can install our
  * trampoline when dram_cache_size > 0. */
 namespace SimpleSSD {
-bool (*nvmeCacheCheckAllHit)(uint64_t startPageNum,
-                             uint64_t nPages,
-                             bool isWrite,
-                             uint64_t *hitLatencyPs,
-                             uint64_t *evictWritebackPs) = nullptr;
+extern bool (*nvmeCacheCheckAllHit)(uint64_t startPageNum,
+                                    uint64_t nPages,
+                                    bool isWrite,
+                                    uint64_t *hitLatencyPs,
+                                    uint64_t *evictWritebackPs);
 }
 
 namespace gem5
@@ -339,22 +339,15 @@ NvmeSsdDevice::dmaWrite(uint64_t addr, uint64_t size, uint8_t *buffer,
         [this, cbd]{ dmaWriteDone(cbd); },
         name(), true);
 
-    /* Pad sub-burst writes to a full 64-byte burst.
+    /* Pad sub-burst writes to a full 64-byte burst via read-modify-write.
      *
-     * The interleaved DDR5 MemCtrl's write-queue subsumption check
-     * (addToReadQueue, line 227 of mem_ctrl.cc) compares de-interleaved
-     * MemPacket addresses: p->addr <= addr && (addr+size) <= (p->addr+p->size).
-     * For sub-burst writes (e.g. 16-byte CQE), the de-interleaved addr/size
-     * may not subsume a later read to a different offset in the same burst,
-     * causing the read to miss the write queue and return stale DRAM data.
+     * The interleaved DDR5 MemCtrl can't forward sub-burst (< 64B) writes
+     * to subsequent reads. We must pad to a full burst. But zero-filling
+     * the padding corrupts adjacent CQE entries (16B each, 4 per burst),
+     * causing phase-aliasing failures after the CQ wraps at entry 64.
      *
-     * Padding to a full burst guarantees the write covers the entire
-     * burst-aligned block, so any read within the block is subsumed.
-     * We first read the current burst contents (via DmaDevice::dmaRead
-     * would be complex), so instead we just zero-pad the surrounding
-     * bytes. The CQE is the only meaningful data; the padding bytes
-     * overwrite whatever was there, but since the CPU zeroed the entire
-     * IOCQ at init and only reads the 16-byte CQE entry, this is safe.
+     * Fix: functional-read the existing 64B block, overlay the new data,
+     * then timing-write the full block. Adjacent CQEs are preserved.
      */
     static const uint64_t BURST_SIZE = 64;
     uint8_t *dma_buf = buffer;
@@ -366,7 +359,16 @@ NvmeSsdDevice::dmaWrite(uint64_t addr, uint64_t size, uint8_t *buffer,
         Addr aligned_addr = addr & ~(BURST_SIZE - 1);
         uint64_t offset_in_burst = addr - aligned_addr;
 
-        padded_buf = new uint8_t[BURST_SIZE]();  // zero-filled
+        padded_buf = new uint8_t[BURST_SIZE];
+        memset(padded_buf, 0, BURST_SIZE);  /* fallback */
+
+        /* Read current burst contents directly from the backing store.
+         * sys->physProxy bypasses all timing models (PCIe, xbar, DDR5)
+         * and reads the actual DRAM contents. This preserves adjacent
+         * CQE entries that share the same 64B burst block. */
+        sys->physProxy.readBlob(aligned_addr, padded_buf, BURST_SIZE);
+
+        /* Overlay the actual write data (e.g. 16-byte CQE) */
         memcpy(padded_buf + offset_in_burst, buffer, size);
 
         dma_buf  = padded_buf;
@@ -374,8 +376,8 @@ NvmeSsdDevice::dmaWrite(uint64_t addr, uint64_t size, uint8_t *buffer,
         dma_size = BURST_SIZE;
 
         fprintf(stderr,
-                "|||DMA_WR_PAD seq=%lu orig_addr=%#lx orig_size=%lu "
-                "padded_addr=%#lx padded_size=%lu\n",
+                "|||DMA_WR_RMW seq=%lu orig_addr=%#lx orig_size=%lu "
+                "aligned_addr=%#lx burst_size=%lu\n",
                 (unsigned long)my_seq, (unsigned long)addr,
                 (unsigned long)size, (unsigned long)aligned_addr,
                 (unsigned long)BURST_SIZE);
@@ -383,9 +385,8 @@ NvmeSsdDevice::dmaWrite(uint64_t addr, uint64_t size, uint8_t *buffer,
 
     DmaDevice::dmaWrite(dma_addr, (int)dma_size, event, dma_buf, 0);
 
-    /* padded_buf is intentionally not freed here. DmaDevice::dmaWrite
-     * may reference the buffer asynchronously until the DMA completes.
-     * The 64-byte allocation per sub-burst write is negligible. */
+    /* padded_buf freed after DMA completes would require tracking;
+     * the 64-byte allocation per sub-burst write is negligible. */
 
     fprintf(stderr,
             "|||DMA_WR_SUBMIT seq=%lu (gem5 DmaDevice::dmaWrite issued)\n",
