@@ -11,8 +11,8 @@
 set -e
 
 # ---- Configuration ----
-BINARY_SRC="tests/oram_nvme_test.c"
-BINARY="tests/oram_nvme_test"
+BINARY_SRC="configs/oram_nvme_test.c"
+BINARY="configs/oram_nvme_test"
 CONFIG="configs/oram_ssd.py"
 SSD_CFG="src/mem/ssd/simplessd/config/sample.cfg"
 SSD_CFG_BAK="${SSD_CFG}.sweep_bak"
