@@ -20,14 +20,17 @@ NUM_OPS=100000
 NUM_SLOTS=32768
 OUTDIR="m5out"
 
-# Total usable NAND pages (from NAND geometry in sample.cfg):
-#   8ch × 4pkg × 2die × 2plane × 512blk × 512pg = 33,554,432 raw pages
-#   Usable = 33,554,432 / 1.25 (OverProvisioningRatio) = 26,843,545 pages
-TOTAL_NAND_PAGES=26843545
+# Total usable NAND logical pages (from SimpleSSD FTL log with
+# EnableMultiPlaneOperation=0):
+#   FTL::PageMapping: Total logical pages: 3145728
+# This differs from the raw calculation because SimpleSSD's page
+# counting depends on MultiPlane setting. With MultiPlane=0, each
+# plane is counted separately, doubling the logical page count.
+TOTAL_NAND_PAGES=3145728
 
-# Pages per ORAM instance: DDR_PER_INSTANCE / PageSize
-#   = 0x020000000 (512 MB) / 16384 = 32768 pages
-PAGES_PER_INSTANCE=32768
+# Pages per ORAM instance bucket data: 8192 buckets × 32KB / 16KB page = 16384 pages
+# SSD allocation per instance: DDR_PER_INSTANCE = 512 MB / 16KB = 32768 pages
+# Instance i starts at page i × 32768, accesses pages i×32768 to i×32768+16383
 
 # ---- Step 0: Compile binary ----
 echo "=== Compiling $BINARY_SRC ==="
@@ -46,7 +49,7 @@ echo ""
 for N in 1 2 3 4; do
     # ---- Compute per-N SimpleSSD parameters ----
     CACHE=$((8388608 * N))
-    FILL=$(python3 -c "needed=$N*$PAGES_PER_INSTANCE; print(f'{needed/$TOTAL_NAND_PAGES:.5f}')")
+    FILL=$(python3 -c "highest=($N-1)*32768+16384; print(f'{highest/$TOTAL_NAND_PAGES:.5f}')")
     LOGFILE="${OUTDIR}/n${N}_ssd_100k.log"
 
     echo "=== N=$N  CacheSize=$CACHE  FillRatio=$FILL ==="
@@ -77,11 +80,12 @@ for N in 1 2 3 4; do
 
     # FIX 3: Scale FillRatio with N
     # REASON: FillRatio fills pages sequentially from LBA 0. Each ORAM
-    # instance occupies DDR_PER_INSTANCE = 512 MB = 32768 pages of SSD
-    # address space. With N instances, the SSD range is N × 512 MB.
-    # FillRatio must cover all N × 32768 pages so every page has a
-    # valid FTL mapping. Without scaling, reads to unmapped pages
-    # return zero latency (no physical page allocated → FTL skips PAL).
+    # instance uses 256 MB of bucket data (8192 buckets × 32 KB) within
+    # a 512 MB SSD allocation. Instance i starts at page i × 32768.
+    # The highest accessed page is (N-1) × 32768 + 16384. FillRatio
+    # must cover all pages up to this point so every page has a valid
+    # FTL mapping. Without this, reads to unmapped pages skip the PAL
+    # entirely and return zero NAND latency.
     sed -i "s/^FillRatio = 0.002/FillRatio = $FILL/" "$SSD_CFG"
 
     # ---- Run simulation ----
