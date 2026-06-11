@@ -102,6 +102,7 @@
 #define ORAM_CMD_BASE      0x0E0000000ULL
 #define CMD_RING_BASE      0x600000000ULL
 #define RESULT_BUF_BASE    0x610000000ULL
+#define RESULT_BUF_ENTRIES (0x100000 / 64)   /* 1 MB / 64 B = 16384 entries */
 #define DDR_SLAB_BASE      0x700000000ULL
 #define DDR_SLAB_STRIDE    0x020000000ULL   /* 512 MB per instance */
 
@@ -602,6 +603,7 @@ int main(int argc, char **argv) {
 
     for (uint32_t iter = 0; iter < (uint32_t)n_iters; iter++) {
         uint64_t op = (uint64_t)iter;
+        uint64_t result_seq = op % RESULT_BUF_ENTRIES;
 
         uint32_t wdata_i[8];
         for (int j = 0; j < 8; j++)
@@ -616,11 +618,11 @@ int main(int argc, char **argv) {
             *(volatile uint32_t *)(uintptr_t)(base + 0x08) =
                 (cur_lease_id & 0xffu) | (1u << 8) | (cur_client_id << 16);
             *(volatile uint32_t *)(uintptr_t)(base + 0x0C) =
-                (uint32_t)(op & 0xFFFFFFFFu);
+                (uint32_t)(result_seq & 0xFFFFFFFFu);
             for (int j = 0; j < 8; j++)
                 *(volatile uint32_t *)(uintptr_t)(base + 0x10 + j*4) = wdata_i[j];
             *(volatile uint32_t *)(uintptr_t)(base + 0x30) =
-                (uint32_t)((op >> 32) & 0xFFFFFFFFu);
+                (uint32_t)((result_seq >> 32) & 0xFFFFFFFFu);
             __asm__ __volatile__("" ::: "memory");
             *(volatile uint32_t *)(uintptr_t)(base + 0x34) = 1u;
             *(volatile uint32_t *)(uintptr_t)(base + 0x38) = 0;
@@ -640,7 +642,7 @@ int main(int argc, char **argv) {
             COMPUTE_SLOT(rng, nxt_slot, nxt_client_id, nxt_lease_id,
                          nxt_token, nxt_oram_addr, nxt_bucket, nxt_lba, nxt_slab);
             BUILD_PRP(prplist_rd, nxt_slab);
-            next_rd_cid = (uint16_t)(0xC000u + iter + 1);
+            next_rd_cid = (uint16_t)(0xC000u | ((iter + 1) & 0x0FFFu));
             submit_nvme_io(iosq, &io_sq_tail, sq_dbell,
                            IO_OPC_READ, next_rd_cid, nxt_slab,
                            (uint64_t)(uintptr_t)prplist_rd,
@@ -665,7 +667,7 @@ int main(int argc, char **argv) {
         /* ---- Submit write-back ---- */
         BUILD_PRP(prplist_wr, cur_slab);
         {
-            uint16_t cur_wr_cid = (uint16_t)(0xD000u + iter);
+            uint16_t cur_wr_cid = (uint16_t)(0xD000u | (iter & 0x0FFFu));
             submit_nvme_io(iosq, &io_sq_tail, sq_dbell,
                            IO_OPC_WRITE, cur_wr_cid, cur_slab,
                            (uint64_t)(uintptr_t)prplist_wr,
@@ -694,6 +696,21 @@ int main(int argc, char **argv) {
     se_puts("|||pass2_reads_start\n");
     rng = rng_init;  /* reset PRNG — same slot sequence as pass 1 */
 
+    /* Pre-compute last_writer map in O(n): for each slot, record the
+     * last pass-1 iteration that wrote to it.  Handles PRNG collisions
+     * where the same slot is written multiple times. */
+    int32_t last_writer_map[32768];
+    memset(last_writer_map, -1, sizeof(last_writer_map));
+    {
+        uint32_t rng_pre = rng_init;
+        for (uint32_t j = 0; j < (uint32_t)n_iters; j++) {
+            rng_pre = (rng_pre ^ ((rng_pre << 13) & 0xFFFFFFFFu));
+            rng_pre = (rng_pre ^ (rng_pre >> 17));
+            rng_pre = (rng_pre ^ ((rng_pre << 5) & 0xFFFFFFFFu));
+            last_writer_map[rng_pre % (uint32_t)num_slots] = (int32_t)j;
+        }
+    }
+
     COMPUTE_SLOT(rng, cur_slot, cur_client_id, cur_lease_id, cur_token,
                  cur_oram_addr, cur_bucket, cur_lba, cur_slab);
 
@@ -710,21 +727,16 @@ int main(int argc, char **argv) {
 
     for (uint32_t iter = 0; iter < (uint32_t)n_iters; iter++) {
         uint64_t op = (uint64_t)n_iters + (uint64_t)iter;
+        uint64_t result_seq = op % RESULT_BUF_ENTRIES;
 
-        /* Reconstruct expected wdata: find the LAST write to this slot
-         * in pass 1. If the same slot was written multiple times (PRNG
-         * collision), only the last write's data survives. */
-        uint32_t last_writer = iter;
-        {
-            uint32_t rng_scan = rng_init;
-            for (uint32_t j = 0; j < (uint32_t)n_iters; j++) {
-                rng_scan = (rng_scan ^ ((rng_scan << 13) & 0xFFFFFFFFu));
-                rng_scan = (rng_scan ^ (rng_scan >> 17));
-                rng_scan = (rng_scan ^ ((rng_scan << 5) & 0xFFFFFFFFu));
-                if ((rng_scan % (uint32_t)num_slots) == cur_slot)
-                    last_writer = j;
-            }
-        }
+        /* Clear stale DONE bit from pass 1 (same result slot may
+         * have been used by an earlier op that wrapped around) */
+        *(volatile uint64_t *)(uintptr_t)
+            (result_buf_base + result_seq * 64 + RES_STATUS_OFF) = 0;
+
+        /* Lookup last writer from precomputed map */
+        uint32_t last_writer = (last_writer_map[cur_slot] >= 0)
+                             ? (uint32_t)last_writer_map[cur_slot] : iter;
         uint32_t wdata_i[8];
         for (int j = 0; j < 8; j++)
             wdata_i[j] = 0xABCD0000u | (last_writer << 8) | (uint32_t)j;
@@ -738,11 +750,11 @@ int main(int argc, char **argv) {
             *(volatile uint32_t *)(uintptr_t)(base + 0x08) =
                 (cur_lease_id & 0xffu) | (0u << 8) | (cur_client_id << 16);
             *(volatile uint32_t *)(uintptr_t)(base + 0x0C) =
-                (uint32_t)(op & 0xFFFFFFFFu);
+                (uint32_t)(result_seq & 0xFFFFFFFFu);
             for (int j = 0; j < 8; j++)
                 *(volatile uint32_t *)(uintptr_t)(base + 0x10 + j*4) = 0;
             *(volatile uint32_t *)(uintptr_t)(base + 0x30) =
-                (uint32_t)((op >> 32) & 0xFFFFFFFFu);
+                (uint32_t)((result_seq >> 32) & 0xFFFFFFFFu);
             __asm__ __volatile__("" ::: "memory");
             *(volatile uint32_t *)(uintptr_t)(base + 0x34) = 1u;
             *(volatile uint32_t *)(uintptr_t)(base + 0x38) = 0;
@@ -762,7 +774,7 @@ int main(int argc, char **argv) {
             COMPUTE_SLOT(rng, nxt_slot, nxt_client_id, nxt_lease_id,
                          nxt_token, nxt_oram_addr, nxt_bucket, nxt_lba, nxt_slab);
             BUILD_PRP(prplist_rd, nxt_slab);
-            next_rd_cid = (uint16_t)(0xE000u + iter + 1);
+            next_rd_cid = (uint16_t)(0xE000u | ((iter + 1) & 0x0FFFu));
             submit_nvme_io(iosq, &io_sq_tail, sq_dbell,
                            IO_OPC_READ, next_rd_cid, nxt_slab,
                            (uint64_t)(uintptr_t)prplist_rd,
@@ -785,7 +797,7 @@ int main(int argc, char **argv) {
         }
 
         /* ---- Verify rdata (poll DONE bit) ---- */
-        uint64_t res_addr = result_buf_base + op * 64;
+        uint64_t res_addr = result_buf_base + result_seq * 64;
         uint64_t status;
         while (!((status = *(volatile uint64_t *)
                   (uintptr_t)(res_addr + RES_STATUS_OFF)) & RES_DONE_BIT)) {
@@ -806,7 +818,7 @@ int main(int argc, char **argv) {
         /* ---- Submit write-back (ORAM modifies bucket on every access) ---- */
         BUILD_PRP(prplist_wr, cur_slab);
         {
-            uint16_t cur_wr_cid = (uint16_t)(0xF000u + iter);
+            uint16_t cur_wr_cid = (uint16_t)(0xF000u | (iter & 0x0FFFu));
             submit_nvme_io(iosq, &io_sq_tail, sq_dbell,
                            IO_OPC_WRITE, cur_wr_cid, cur_slab,
                            (uint64_t)(uintptr_t)prplist_wr,
