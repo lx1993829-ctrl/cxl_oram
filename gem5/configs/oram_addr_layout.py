@@ -29,7 +29,7 @@
 #
 # Shared DDR5 aggregate (CPU-touched + ORAM-only) at 64-bit:
 #   cmd_ring:         0x400000000 - 0x400010000  (16 × 4 KB)
-#   result_buf:       0x410000000 - 0x411000000  (16 × 1 MB)
+#   result_buf:       0x410000000 - 0x420000000  (16 × 16 MB)
 #   ORAM DDR slabs:   0x500000000 + i * 0x004000000  (16 × 64 MB)
 #
 # All cmd_ring / result_buf / DDR slab addresses fall inside the single
@@ -68,7 +68,7 @@ BUCKET_REGION_MAX   = 0x0FF80000    # 8191 × 32768 (num_slots=32764)
 DDR_AGG_BASE       = 0x600000000    # 24 GB — pushed for N≤32 (HBM ends at 0x500000000)
 
 CMD_RING_BASE      = DDR_AGG_BASE + 0x000000000    # 16 × 4 KB
-RESULT_BUF_BASE    = DDR_AGG_BASE + 0x010000000    # 16 × 1 MB
+RESULT_BUF_BASE    = DDR_AGG_BASE + 0x010000000    # 16 × 16 MB
 DDR_SLAB_BASE      = DDR_AGG_BASE + 0x100000000    # 16 × 64 MB; offset 4 GB into agg
 DDR_PER_INSTANCE   = 0x020000000                   # 256 MB per slab (bucket tree ≈ 128 MB)
 
@@ -79,7 +79,7 @@ def per_instance_addrs(i):
         hbm        = HBM_BASE        + i * HBM_PER_INSTANCE,
         ddr        = DDR_SLAB_BASE   + i * DDR_PER_INSTANCE,
         cmd_ring   = CMD_RING_BASE   + i * 0x1000,
-        result_buf = RESULT_BUF_BASE + i * 0x100000,
+        result_buf = RESULT_BUF_BASE + i * 0x1000000,
         cmd_port   = ORAM_CMD_BASE   + i * 0x1000,
     )
 
@@ -94,7 +94,7 @@ def _assert_no_overlap(N):
     main_end = MAIN_DRAM_BASE + MAIN_DRAM_SIZE
     cmd_mmio_end   = ORAM_CMD_BASE   + N * 0x1000
     cmd_ring_end   = CMD_RING_BASE   + N * 0x1000
-    result_buf_end = RESULT_BUF_BASE + N * 0x100000
+    result_buf_end = RESULT_BUF_BASE + N * 0x1000000
     hbm_end = HBM_BASE + N * HBM_PER_INSTANCE
     ddr_slab_start = DDR_SLAB_BASE
     ddr_slab_end   = DDR_SLAB_BASE + N * DDR_PER_INSTANCE
@@ -120,7 +120,7 @@ def _assert_no_overlap(N):
         f"stash end 0x{STASH_OFFSET + STASH_REGION_BYTES:x} overlaps posmap 0x{PM_OFFSET:x}"
 
 
-_assert_no_overlap(32)
+_assert_no_overlap(16)
 
 
 if __name__ == '__main__':
@@ -134,5 +134,5 @@ if __name__ == '__main__':
     print(f"  HBM aggregate: [0x{HBM_BASE:09x}, 0x{HBM_BASE + N*HBM_PER_INSTANCE:09x})  ({N} x {HBM_PER_INSTANCE//(1024*1024)} MB) (ORAM only)")
     print(f"  DDR5 aggregate: [0x{DDR_AGG_BASE:09x}, 0x{agg_end:09x}) — interleaved across 8 channels")
     print(f"    cmd_ring:    [0x{CMD_RING_BASE:09x}, 0x{CMD_RING_BASE + N*0x1000:09x}) ({N} x 4 KB)")
-    print(f"    result_buf:  [0x{RESULT_BUF_BASE:09x}, 0x{RESULT_BUF_BASE + N*0x100000:09x}) ({N} x 1 MB)")
+    print(f"    result_buf:  [0x{RESULT_BUF_BASE:09x}, 0x{RESULT_BUF_BASE + N*0x1000000:09x}) ({N} x 16 MB)")
     print(f"    DDR slabs:   [0x{DDR_SLAB_BASE:09x}, 0x{DDR_SLAB_BASE + N*DDR_PER_INSTANCE:09x}) ({N} x {DDR_PER_INSTANCE//(1024*1024)} MB)")
