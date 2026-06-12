@@ -51,6 +51,7 @@
 #define DEFAULT_N_ITERS        100
 #define DEFAULT_NUM_SLOTS      128
 #define MAX_SLOTS              32768
+#define MAX_ITERS              131072
 
 static inline uint32_t rd32(uint64_t a){return *(volatile uint32_t*)(uintptr_t)a;}
 static inline void     wr32(uint64_t a,uint32_t v){*(volatile uint32_t*)(uintptr_t)a=v;}
@@ -92,6 +93,7 @@ int main(int argc,char**argv){
     (void)N;
 
     if(instance_id<0||instance_id>=32){fprintf(stderr,"bad instance_id\n");return 1;}
+    if(n_iters>MAX_ITERS){fprintf(stderr,"n_iters %d exceeds MAX_ITERS %d\n",n_iters,MAX_ITERS);return 1;}
     if(num_slots<1||num_slots>MAX_SLOTS){fprintf(stderr,"bad num_slots\n");return 1;}
 
     uint64_t cmd_base=ORAM_CMD_BASE+(uint64_t)instance_id*0x1000ULL;
@@ -114,8 +116,8 @@ int main(int argc,char**argv){
     memset(last_write_iter,0xFF,sizeof(last_write_iter));
 
     /* Track which slots were written and the slot index for each write/read op. */
-    static uint32_t write_slot[MAX_SLOTS];  /* write_slot[i] = slotIdx for write i */
-    static uint32_t read_slot[MAX_SLOTS];   /* read_slot[i] = slotIdx for read i */
+    static uint32_t write_slot[MAX_ITERS];  /* write_slot[i] = slotIdx for write i */
+    static uint32_t read_slot[MAX_ITERS];   /* read_slot[i] = slotIdx for read i */
 
     /* Collect written slots for read-phase random selection. */
     static uint32_t written_set[MAX_SLOTS];
