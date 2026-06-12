@@ -102,7 +102,6 @@
 #define ORAM_CMD_BASE      0x0E0000000ULL
 #define CMD_RING_BASE      0x600000000ULL
 #define RESULT_BUF_BASE    0x610000000ULL
-#define RESULT_BUF_ENTRIES (0x100000 / 64)   /* 1 MB / 64 B = 16384 entries */
 #define DDR_SLAB_BASE      0x700000000ULL
 #define DDR_SLAB_STRIDE    0x020000000ULL   /* 512 MB per instance */
 
@@ -315,7 +314,7 @@ int main(int argc, char **argv) {
     /* ---- Per-instance addresses (from phase_d_layout.py) ---- */
     uint64_t oram_cmd_base   = ORAM_CMD_BASE   + (uint64_t)instance_id * 0x1000ULL;
     uint64_t cmd_ring_base   = CMD_RING_BASE   + (uint64_t)instance_id * 0x1000ULL;
-    uint64_t result_buf_base = RESULT_BUF_BASE + (uint64_t)instance_id * 0x100000ULL;
+    uint64_t result_buf_base = RESULT_BUF_BASE + (uint64_t)instance_id * 0x1000000ULL;
     uint64_t oram_host_base  = DDR_SLAB_BASE   + (uint64_t)instance_id * DDR_SLAB_STRIDE;
     uint64_t inst_lba_base   = (uint64_t)instance_id * max_lba;
 
@@ -603,7 +602,6 @@ int main(int argc, char **argv) {
 
     for (uint32_t iter = 0; iter < (uint32_t)n_iters; iter++) {
         uint64_t op = (uint64_t)iter;
-        uint64_t result_seq = op % RESULT_BUF_ENTRIES;
 
         uint32_t wdata_i[8];
         for (int j = 0; j < 8; j++)
@@ -618,11 +616,11 @@ int main(int argc, char **argv) {
             *(volatile uint32_t *)(uintptr_t)(base + 0x08) =
                 (cur_lease_id & 0xffu) | (1u << 8) | (cur_client_id << 16);
             *(volatile uint32_t *)(uintptr_t)(base + 0x0C) =
-                (uint32_t)(result_seq & 0xFFFFFFFFu);
+                (uint32_t)(op & 0xFFFFFFFFu);
             for (int j = 0; j < 8; j++)
                 *(volatile uint32_t *)(uintptr_t)(base + 0x10 + j*4) = wdata_i[j];
             *(volatile uint32_t *)(uintptr_t)(base + 0x30) =
-                (uint32_t)((result_seq >> 32) & 0xFFFFFFFFu);
+                (uint32_t)((op >> 32) & 0xFFFFFFFFu);
             __asm__ __volatile__("" ::: "memory");
             *(volatile uint32_t *)(uintptr_t)(base + 0x34) = 1u;
             *(volatile uint32_t *)(uintptr_t)(base + 0x38) = 0;
@@ -727,12 +725,6 @@ int main(int argc, char **argv) {
 
     for (uint32_t iter = 0; iter < (uint32_t)n_iters; iter++) {
         uint64_t op = (uint64_t)n_iters + (uint64_t)iter;
-        uint64_t result_seq = op % RESULT_BUF_ENTRIES;
-
-        /* Clear stale DONE bit from pass 1 (same result slot may
-         * have been used by an earlier op that wrapped around) */
-        *(volatile uint64_t *)(uintptr_t)
-            (result_buf_base + result_seq * 64 + RES_STATUS_OFF) = 0;
 
         /* Lookup last writer from precomputed map */
         uint32_t last_writer = (last_writer_map[cur_slot] >= 0)
@@ -750,11 +742,11 @@ int main(int argc, char **argv) {
             *(volatile uint32_t *)(uintptr_t)(base + 0x08) =
                 (cur_lease_id & 0xffu) | (0u << 8) | (cur_client_id << 16);
             *(volatile uint32_t *)(uintptr_t)(base + 0x0C) =
-                (uint32_t)(result_seq & 0xFFFFFFFFu);
+                (uint32_t)(op & 0xFFFFFFFFu);
             for (int j = 0; j < 8; j++)
                 *(volatile uint32_t *)(uintptr_t)(base + 0x10 + j*4) = 0;
             *(volatile uint32_t *)(uintptr_t)(base + 0x30) =
-                (uint32_t)((result_seq >> 32) & 0xFFFFFFFFu);
+                (uint32_t)((op >> 32) & 0xFFFFFFFFu);
             __asm__ __volatile__("" ::: "memory");
             *(volatile uint32_t *)(uintptr_t)(base + 0x34) = 1u;
             *(volatile uint32_t *)(uintptr_t)(base + 0x38) = 0;
@@ -797,7 +789,7 @@ int main(int argc, char **argv) {
         }
 
         /* ---- Verify rdata (poll DONE bit) ---- */
-        uint64_t res_addr = result_buf_base + result_seq * 64;
+        uint64_t res_addr = result_buf_base + op * 64;
         uint64_t status;
         while (!((status = *(volatile uint64_t *)
                   (uintptr_t)(res_addr + RES_STATUS_OFF)) & RES_DONE_BIT)) {
