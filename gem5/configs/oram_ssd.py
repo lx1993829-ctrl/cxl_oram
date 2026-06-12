@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # =============================================================================
-# oram_cmd_port_test_phaseD_ssd.py — Phase D CXL config
+# oram_ssd.py — Phase D CXL config (GitHub name)
+# Local name: oram_cmd_port_test_phaseD_ssd.py
 #
 # Storage backend modes (mutually exclusive):
 #   default        : ORAM bucket storage in DDR5
@@ -22,18 +23,18 @@
 # only where it physically exists (DDR5 bandwidth at the host xbar).
 #
 # Run (DDR5 default, same as before):
-#   ./build/ALL/gem5.opt configs/oram_cmd_port_test_phaseD_ssd.py \
-#       --binary=/path/to/cmd_port_test_step9_phaseD \
+#   ./build/ALL/gem5.opt configs/oram_ssd.py \
+#       --binary=configs/oram_workload \
 #       --num-instances=N
 #
 # Run (SSD via SsdMemory):
-#   ./build/ALL/gem5.opt configs/oram_cmd_port_test_phaseD_ssd.py \
-#       --binary=/path/to/cmd_port_test_step9_phaseD \
+#   ./build/ALL/gem5.opt configs/oram_ssd.py \
+#       --binary=configs/oram_workload \
 #       --num-instances=N --use-ssd
 #
 # Run (PCIe NVMe SSD):
-#   ./build/ALL/gem5.opt configs/oram_cmd_port_test_phaseD_ssd.py \
-#       --binary=/path/to/nvme_test_binary \
+#   ./build/ALL/gem5.opt configs/oram_ssd.py \
+#       --binary=configs/oram_nvme_test \
 #       --num-instances=1 --use-nvme
 # =============================================================================
 
@@ -48,6 +49,7 @@ from oram_addr_layout import (
     HBM_PER_INSTANCE, DDR_PER_INSTANCE,
     HBM_BASE, DDR_AGG_BASE, DDR_SLAB_BASE,
     CMD_RING_BASE, RESULT_BUF_BASE, ORAM_CMD_BASE,
+    STASH_OFFSET,
     per_instance_addrs, ddr_aggregate_size,
 )
 
@@ -100,7 +102,10 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--binary',         type=str, required=True)
 parser.add_argument('--num-instances',  type=int, default=1)
 parser.add_argument('--num-slots',      type=int, default=16)
-parser.add_argument('--num-ops',        type=int, default=1)
+parser.add_argument('--num-ops',        type=int, default=20,
+                    help='Total ops per instance (writes + reads). '
+                         'Must be even. Binary gets n_iters = num_ops/2. '
+                         'Default 20 (= 10 write + 10 read).')
 parser.add_argument('--local-pct',      type=int, default=0)
 
 # Backend selection (mutually exclusive)
@@ -117,10 +122,6 @@ parser.add_argument('--ssd-config',     type=str,
                     default='src/mem/ssd/simplessd/config/sample.cfg',
                     help='Path to SimpleSSD config file (used by both '
                          '--use-ssd and --use-nvme).')
-parser.add_argument('--n-iters',        type=int, default=10,
-                    help='Number of write+read iteration pairs the test '
-                         'binary submits. Total ops = 2 * n_iters. '
-                         'Default 10 (= 20 ops). Use 1 for quick SSD tests.')
 parser.add_argument('--dram-cache',     type=str, default='0B',
                     help='On-device DRAM cache size for SsdMemory '
                          '(e.g. 4MB). 0B = disabled. Ignored for --use-nvme.')
@@ -150,7 +151,7 @@ assert 1 <= N <= 16
 #
 # NVMe-only correctness/smoke tests (nvme_*, aliasing_test, minimal_test,
 # ddr5_latency) don't touch ORAM. Instantiating ORAM + CXL + HBM + Verilator
-# RTL for these tests adds ~5-10× wallclock cost for nothing — Verilator
+# RTL for these tests adds ~5-10x wallclock cost for nothing — Verilator
 # steps the entire ORAM datapath every cycle even when idle.
 #
 # Convention: any binary whose basename starts with one of NO_ORAM_PREFIXES
@@ -192,7 +193,7 @@ nvme_bar0_range = (AddrRange(args.nvme_bar0, size=args.nvme_bar0_size)
 
 # NVMe shared region (Option Z): a dedicated SimpleMemory range used for
 # NVMe queues, PRP-list pool, and stage buffers. Carved out OUTSIDE the
-# DDR5 aggregate to avoid the CPU↔DMA address-aliasing problem we hit
+# DDR5 aggregate to avoid the CPU<->DMA address-aliasing problem we hit
 # when these structures lived inside the interleaved DDR5 range.
 #
 # Layout (16 MB total at 0x600000000):
@@ -206,10 +207,6 @@ nvme_bar0_range = (AddrRange(args.nvme_bar0, size=args.nvme_bar0_size)
 #   +0x200000  Stage buffer 1     (1 MB)
 #   ...        Stage buffer N-1   (one per ORAM instance)
 #
-# Latency: 55 ns flat, calibrated against measured DDR5 round-trip from
-# this build's PCIe model (HostSend→HostResp = 54.2 ns observed in
-# pcie_model.cc:2293 trace). This makes the timing comparable to the
-# DDR5 aggregate without the address-translation conflicts.
 # Bug fix A1+A2: was 0x220000000 which overlaps HBM instance 9 at N>=10.
 # Moved INSIDE DDR_AGG so the existing 8-channel DDR5 controllers serve
 # it — both CPU loads/stores and NVMe DMAs route through cxl_host_xbar
@@ -222,7 +219,7 @@ nvme_shared_range = (AddrRange(NVME_SHARED_BASE, size=NVME_SHARED_SIZE)
                      if args.use_nvme else None)
 
 # Sanity: NVME_SHARED must sit inside DDR_AGG and not overlap result_buf or DDR slabs.
-_result_buf_end = RESULT_BUF_BASE + N * 0x1000000
+_result_buf_end = RESULT_BUF_BASE + N * 0x100000
 assert NVME_SHARED_BASE >= _result_buf_end, \
     f"NVME_SHARED 0x{NVME_SHARED_BASE:x} overlaps result_buf ending at 0x{_result_buf_end:x}"
 assert NVME_SHARED_BASE + NVME_SHARED_SIZE <= DDR_SLAB_BASE, \
@@ -299,12 +296,12 @@ if need_oram:
             num_ops=args.num_ops,
             hbm_base       = a['hbm'],
             host_base      = oram_host_base,
-            stash_offset   = HBM_PER_INSTANCE - 0x01000000,
+            stash_offset   = STASH_OFFSET,
             cpu_driven     = True,
             num_logical_clients = 2,
             cmd_base       = a['cmd_port'],
             result_buf_base= a['result_buf'],
-            result_buf_size= 0x1000000,
+            result_buf_size= 0x100000,
             cmd_ring_base  = a['cmd_ring'],
             cmd_ring_depth = 16,
             cmd_queue_depth= 16,
@@ -337,11 +334,11 @@ if need_oram:
         gen=5,
         lanes=16,
         cxl_core_clock='1ns',
-        max_tags=1024,
-        max_outstanding=512,
-        max_outstanding_writes=512,
+        max_tags=256,
+        max_outstanding=64,
+        max_outstanding_writes=128,
         flit_credits=128,
-        completion_buffer_depth=1024,  # must be >= max_tags (CxlModel.py)
+        completion_buffer_depth=2048,
         host_inject_interval='1ns',
     )
     system.cxl.clk_domain = SrcClockDomain(clock='1GHz', voltage_domain=VoltageDomain())
@@ -379,7 +376,7 @@ if args.use_ssd:
     system.ssd_mem = SsdMemory(
         ssd_config=args.ssd_config,
         range=AddrRange(SSD_BASE, size=SSD_TOTAL),
-        coalesce_window='0ns',
+        coalesce_window='500ns',
         dram_cache_size=args.dram_cache,
         dram_cache_warm_after=args.cache_warm_after,
     )
@@ -389,8 +386,8 @@ if args.use_ssd:
 # NVMe queues (ASQ/ACQ/IOSQ/IOCQ), PRP-list pool, and stage buffers
 # live at NVME_SHARED_BASE, which is inside DDR_AGG. The 8-channel DDR5
 # controllers already claim and serve this address range. Both CPU
-# loads/stores (CPU → membus → cpu_fabric_bridge → cxl_host_xbar) and
-# NVMe DMAs (nvme_ssd.dma → system.pcie → cxl_host_xbar) hit the same
+# loads/stores (CPU -> membus -> cpu_fabric_bridge -> cxl_host_xbar) and
+# NVMe DMAs (nvme_ssd.dma -> system.pcie -> cxl_host_xbar) hit the same
 # DDR5 backing — no separate SimpleMemory needed.
 
 # --- CPU traffic through fabric ---
@@ -463,16 +460,10 @@ if args.use_nvme:
         max_outstanding_writes=64,
         rrb_depth=128,
         completion_reorder_depth=32,
-        # Gen5 x4 wire rate is ~16 GB/s; 64B at 4ns = 16 GB/s, so the
-        # PCIe core's assembly stage matches the link bandwidth. (At
-        # 1ns/64B the assembly would be 64 GB/s, dwarfing the wire
-        # and effectively zeroing the assembly bottleneck — fine if
-        # you want link-bandwidth-only modeling.)
         pcie_core_clock='4ns',
         pcie_core_width=64,
         pcie_tlp_gap='4ns',
         host_inject_interval='1ns',
-        # Endpoint identity distinct from ORAM's 0x0100 default.
         requester_id=0x0200,  # bus=2, dev=0, func=0
     )
     system.pcie.clk_domain = SrcClockDomain(
@@ -494,10 +485,10 @@ for i, p in enumerate(processes):
     # SimpleSSD sample.cfg).
     if args.use_nvme:
         max_lba = DDR_PER_INSTANCE // 512  # = 131072 for 64 MB / 512
-        p.cmd = [args.binary, str(N), str(i), str(args.n_iters),
+        p.cmd = [args.binary, str(N), str(i), str(args.num_ops // 2), str(args.num_slots),
                  hex(args.nvme_bar0), str(max_lba)]
     else:
-        p.cmd = [args.binary, str(N), str(i), str(args.n_iters)]
+        p.cmd = [args.binary, str(N), str(i), str(args.num_ops // 2), str(args.num_slots), str(args.num_slots)]
 
 system.workload = m5.objects.SEWorkload.init_compatible(args.binary)
 for i in range(N):
@@ -516,29 +507,14 @@ for proc in processes:
     for i in range(N):
         a = per_instance_addrs(i)
         proc.map(a['cmd_port'],   a['cmd_port'],   0x1000,   False)
-        proc.map(a['result_buf'], a['result_buf'], 0x1000000, False)
+        proc.map(a['result_buf'], a['result_buf'], 0x100000, False)
         proc.map(a['cmd_ring'],   a['cmd_ring'],   0x1000,   False)
     # Map NVMe BAR0 uncached so the binary can MMIO doorbells/regs.
     if args.use_nvme:
         proc.map(args.nvme_bar0, args.nvme_bar0,
                  args.nvme_bar0_size, False)
-        # Option Z: a single dedicated SimpleMemory range covers ASQ/ACQ/
-        # IOSQ/IOCQ + Identify buffer + PRP-list pool + stage buffers.
-        # Map uncached because the host xbar (NoncoherentXBar) doesn't
-        # snoop CPU caches: if the CPU caches a CQE line and the device
-        # DMAs a new CQE, the CPU never sees the update without
-        # uncached access.
-        #
-        # See `nvme_shared_range` definition for layout details.
         proc.map(NVME_SHARED_BASE, NVME_SHARED_BASE,
                  NVME_SHARED_SIZE, False)
-        # ORAM slab regions are NOT directly DMA-shared with the NVMe
-        # device under Option Z. The CPU memcpys between the slab
-        # (DDR5 aggregate) and stage buffers (NVMe shared region), so
-        # the slab's mapping for CPU access matters only when the CPU
-        # actually touches it during the stage memcpy. We keep the slab
-        # mappings here (uncached) so that staging memcpys see the
-        # correct slab data through the cache-bypassing path.
         for i in range(N):
             slab_addr = DDR_SLAB_BASE + i * DDR_PER_INSTANCE
             proc.map(slab_addr, slab_addr, DDR_PER_INSTANCE, False)
