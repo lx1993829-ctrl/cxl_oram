@@ -69,12 +69,14 @@ for N in 1 2 3 4; do
     grep -E 'CacheSize|FillRatio|EnableMultiPlane' "$SSD_CFG" | sed 's/^/    /'
 
     # ---- Run simulation ----
+    N_ITERS=$((NUM_OPS / 2))
     ./build/ALL/gem5.opt "$CONFIG" \
         --binary="$BINARY" \
         --num-instances=$N \
         --use-nvme \
         --nvme-bar0=$NVME_BAR0 \
         --num-ops=$NUM_OPS \
+        --n-iters=$N_ITERS \
         --num-slots=$NUM_SLOTS \
         --dram-cache=0B \
         > "$LOGFILE" 2>&1
