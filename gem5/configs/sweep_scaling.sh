@@ -16,22 +16,18 @@
 #   python3 configs/plot_scaling.py m5out/scaling_sweep/results.csv
 # =============================================================================
 set -e
+
 GEM5=build/ALL/gem5.opt
 CFGDIR=configs
 BIN=$CFGDIR/oram_workload
 SLOTS=32768
-OPS=100000
+OPS=100000            # total ops: 50k writes + 50k reads
 OUTDIR=m5out/scaling_sweep
 RESULTS=$OUTDIR/results.csv
+
 mkdir -p $OUTDIR
-
-# Compile binary
-echo "=== Compiling ${BIN}.c ==="
-musl-gcc -O0 -static -o "$BIN" "${BIN}.c"
-echo "  Binary: $(stat -c '%s %n' $BIN)"
-echo ""
-
 echo "type,N,e2e_cyc,rtl_cyc,ddr_read_cyc,ddr_write_cyc" > $RESULTS
+
 extract() {
     local LOG=$1
     # E2E: last "Avg: XXX.X cyc/op"
@@ -42,23 +38,28 @@ extract() {
     local RD=$(grep "DDR_READ" "$LOG" | grep "cyc" | tail -1 | grep -oP '\d+(?=\s*cyc)')
     # DDR_WRITE: "DDR_WRITE              XXXX cyc"
     local WR=$(grep "DDR_WRITE" "$LOG" | grep "cyc" | tail -1 | grep -oP '\d+(?=\s*cyc)')
+
     echo "${E2E:-NA},${RTL:-NA},${RD:-NA},${WR:-NA}"
 }
+
 run_one() {
     local TYPE=$1 N=$2 CFG=$3 EXTRA_ARGS=$4
     local TAG="${TYPE}_N${N}"
     local LOGDIR="$OUTDIR/$TAG"
     local LOG="$OUTDIR/${TAG}.log"
+
     echo "=== $TAG ==="
     $GEM5 -d "$LOGDIR" "$CFGDIR/$CFG" \
         --binary=$BIN --num-instances=$N --num-ops=$OPS --num-slots=$SLOTS \
         $EXTRA_ARGS \
         2>&1 | tee "$LOG" | tail -3
+
     local VALS=$(extract "$LOG")
     echo "$TYPE,$N,$VALS" >> $RESULTS
     echo "  → $VALS"
     echo ""
 }
+
 for N in 1 2 3 4 5 6 7 8; do
     run_one "hbm2"        $N oram_sim_pcie.py "--local-pct=100 --local-mem=hbm2"
     run_one "lpddr5_1x16" $N oram_sim_pcie.py "--local-pct=100 --local-mem=lpddr5_1x16"
@@ -66,6 +67,7 @@ for N in 1 2 3 4 5 6 7 8; do
     run_one "pcie"        $N oram_sim_pcie.py  "--local-pct=0"
     run_one "cxl"         $N oram_sim_cxl.py   "--local-pct=0"
 done
+
 echo ""
 echo "=== RESULTS ==="
 column -t -s, $RESULTS
