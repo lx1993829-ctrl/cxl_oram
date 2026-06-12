@@ -34,7 +34,6 @@ from oram_addr_layout import (
     HBM_BASE, DDR_AGG_BASE, DDR_SLAB_BASE,
     CMD_RING_BASE, RESULT_BUF_BASE, ORAM_CMD_BASE,
     STASH_OFFSET,
-    STASH_OFFSET,
     per_instance_addrs, ddr_aggregate_size,
 )
 
