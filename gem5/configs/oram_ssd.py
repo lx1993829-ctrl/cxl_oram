@@ -219,7 +219,7 @@ nvme_shared_range = (AddrRange(NVME_SHARED_BASE, size=NVME_SHARED_SIZE)
                      if args.use_nvme else None)
 
 # Sanity: NVME_SHARED must sit inside DDR_AGG and not overlap result_buf or DDR slabs.
-_result_buf_end = RESULT_BUF_BASE + N * 0x100000
+_result_buf_end = RESULT_BUF_BASE + N * 0x1000000
 assert NVME_SHARED_BASE >= _result_buf_end, \
     f"NVME_SHARED 0x{NVME_SHARED_BASE:x} overlaps result_buf ending at 0x{_result_buf_end:x}"
 assert NVME_SHARED_BASE + NVME_SHARED_SIZE <= DDR_SLAB_BASE, \
@@ -301,7 +301,7 @@ if need_oram:
             num_logical_clients = 2,
             cmd_base       = a['cmd_port'],
             result_buf_base= a['result_buf'],
-            result_buf_size= 0x100000,
+            result_buf_size= 0x1000000,
             cmd_ring_base  = a['cmd_ring'],
             cmd_ring_depth = 16,
             cmd_queue_depth= 16,
@@ -507,7 +507,7 @@ for proc in processes:
     for i in range(N):
         a = per_instance_addrs(i)
         proc.map(a['cmd_port'],   a['cmd_port'],   0x1000,   False)
-        proc.map(a['result_buf'], a['result_buf'], 0x100000, False)
+        proc.map(a['result_buf'], a['result_buf'], 0x1000000, False)
         proc.map(a['cmd_ring'],   a['cmd_ring'],   0x1000,   False)
     # Map NVMe BAR0 uncached so the binary can MMIO doorbells/regs.
     if args.use_nvme:
