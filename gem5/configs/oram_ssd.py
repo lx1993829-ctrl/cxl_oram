@@ -43,12 +43,11 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from phase_d_layout import (
+from oram_addr_layout import (
     MAIN_DRAM_BASE, MAIN_DRAM_SIZE,
     HBM_PER_INSTANCE, DDR_PER_INSTANCE,
     HBM_BASE, DDR_AGG_BASE, DDR_SLAB_BASE,
     CMD_RING_BASE, RESULT_BUF_BASE, ORAM_CMD_BASE,
-    STASH_OFFSET,
     per_instance_addrs, ddr_aggregate_size,
 )
 
@@ -101,10 +100,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--binary',         type=str, required=True)
 parser.add_argument('--num-instances',  type=int, default=1)
 parser.add_argument('--num-slots',      type=int, default=16)
-parser.add_argument('--num-ops',        type=int, default=20,
-                    help='Total ops per instance (writes + reads). '
-                         'Must be even. Binary gets n_iters = num_ops/2. '
-                         'Default 20 (= 10 write + 10 read).')
+parser.add_argument('--num-ops',        type=int, default=1)
 parser.add_argument('--local-pct',      type=int, default=0)
 
 # Backend selection (mutually exclusive)
@@ -121,6 +117,10 @@ parser.add_argument('--ssd-config',     type=str,
                     default='src/mem/ssd/simplessd/config/sample.cfg',
                     help='Path to SimpleSSD config file (used by both '
                          '--use-ssd and --use-nvme).')
+parser.add_argument('--n-iters',        type=int, default=10,
+                    help='Number of write+read iteration pairs the test '
+                         'binary submits. Total ops = 2 * n_iters. '
+                         'Default 10 (= 20 ops). Use 1 for quick SSD tests.')
 parser.add_argument('--dram-cache',     type=str, default='0B',
                     help='On-device DRAM cache size for SsdMemory '
                          '(e.g. 4MB). 0B = disabled. Ignored for --use-nvme.')
@@ -222,7 +222,7 @@ nvme_shared_range = (AddrRange(NVME_SHARED_BASE, size=NVME_SHARED_SIZE)
                      if args.use_nvme else None)
 
 # Sanity: NVME_SHARED must sit inside DDR_AGG and not overlap result_buf or DDR slabs.
-_result_buf_end = RESULT_BUF_BASE + N * 0x100000
+_result_buf_end = RESULT_BUF_BASE + N * 0x1000000
 assert NVME_SHARED_BASE >= _result_buf_end, \
     f"NVME_SHARED 0x{NVME_SHARED_BASE:x} overlaps result_buf ending at 0x{_result_buf_end:x}"
 assert NVME_SHARED_BASE + NVME_SHARED_SIZE <= DDR_SLAB_BASE, \
@@ -299,12 +299,12 @@ if need_oram:
             num_ops=args.num_ops,
             hbm_base       = a['hbm'],
             host_base      = oram_host_base,
-            stash_offset   = STASH_OFFSET,
+            stash_offset   = HBM_PER_INSTANCE - 0x01000000,
             cpu_driven     = True,
             num_logical_clients = 2,
             cmd_base       = a['cmd_port'],
             result_buf_base= a['result_buf'],
-            result_buf_size= 0x100000,
+            result_buf_size= 0x1000000,
             cmd_ring_base  = a['cmd_ring'],
             cmd_ring_depth = 16,
             cmd_queue_depth= 16,
@@ -337,11 +337,11 @@ if need_oram:
         gen=5,
         lanes=16,
         cxl_core_clock='1ns',
-        max_tags=256,
-        max_outstanding=64,
-        max_outstanding_writes=128,
+        max_tags=1024,
+        max_outstanding=512,
+        max_outstanding_writes=512,
         flit_credits=128,
-        completion_buffer_depth=2048,
+        completion_buffer_depth=1024,  # must be >= max_tags (CxlModel.py)
         host_inject_interval='1ns',
     )
     system.cxl.clk_domain = SrcClockDomain(clock='1GHz', voltage_domain=VoltageDomain())
@@ -379,7 +379,7 @@ if args.use_ssd:
     system.ssd_mem = SsdMemory(
         ssd_config=args.ssd_config,
         range=AddrRange(SSD_BASE, size=SSD_TOTAL),
-        coalesce_window='500ns',
+        coalesce_window='0ns',
         dram_cache_size=args.dram_cache,
         dram_cache_warm_after=args.cache_warm_after,
     )
@@ -494,10 +494,10 @@ for i, p in enumerate(processes):
     # SimpleSSD sample.cfg).
     if args.use_nvme:
         max_lba = DDR_PER_INSTANCE // 512  # = 131072 for 64 MB / 512
-        p.cmd = [args.binary, str(N), str(i), str(args.num_ops // 2), str(args.num_slots),
+        p.cmd = [args.binary, str(N), str(i), str(args.n_iters),
                  hex(args.nvme_bar0), str(max_lba)]
     else:
-        p.cmd = [args.binary, str(N), str(i), str(args.num_ops // 2), str(args.num_slots), str(args.num_slots)]
+        p.cmd = [args.binary, str(N), str(i), str(args.n_iters)]
 
 system.workload = m5.objects.SEWorkload.init_compatible(args.binary)
 for i in range(N):
@@ -516,7 +516,7 @@ for proc in processes:
     for i in range(N):
         a = per_instance_addrs(i)
         proc.map(a['cmd_port'],   a['cmd_port'],   0x1000,   False)
-        proc.map(a['result_buf'], a['result_buf'], 0x100000, False)
+        proc.map(a['result_buf'], a['result_buf'], 0x1000000, False)
         proc.map(a['cmd_ring'],   a['cmd_ring'],   0x1000,   False)
     # Map NVMe BAR0 uncached so the binary can MMIO doorbells/regs.
     if args.use_nvme:
