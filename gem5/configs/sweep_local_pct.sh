@@ -17,23 +17,19 @@
 #   python3 configs/plot_local_pct.py m5out/local_pct_sweep/results.csv
 # =============================================================================
 set -e
+
 GEM5=build/ALL/gem5.opt
 CFGDIR=configs
 BIN=$CFGDIR/oram_workload
 SLOTS=32768
-OPS=100000
+OPS=100000            # total ops: 50k writes + 50k reads
 N=1
 OUTDIR=m5out/local_pct_sweep
 RESULTS=$OUTDIR/results.csv
+
 mkdir -p $OUTDIR
-
-# Compile binary
-echo "=== Compiling ${BIN}.c ==="
-musl-gcc -O0 -static -o "$BIN" "${BIN}.c"
-echo "  Binary: $(stat -c '%s %n' $BIN)"
-echo ""
-
 echo "fabric,local_pct,e2e_cyc,rtl_cyc,ddr_read_cyc,ddr_write_cyc" > $RESULTS
+
 extract() {
     local LOG=$1
     local E2E=$(grep "cyc/op" "$LOG" | tail -1 | sed 's/.*Avg: \([0-9.]*\) cyc.*/\1/')
@@ -42,6 +38,7 @@ extract() {
     local WR=$(grep "DDR_WRITE" "$LOG" | grep "cyc" | tail -1 | grep -oP '\d+(?=\s*cyc)')
     echo "${E2E:-NA},${RTL:-NA},${RD:-NA},${WR:-NA}"
 }
+
 for PCT in 0 10 20 30 40 50 60 70 80 90 100; do
     echo "=== PCIe local_pct=$PCT ==="
     TAG="pcie_pct${PCT}"
@@ -52,6 +49,7 @@ for PCT in 0 10 20 30 40 50 60 70 80 90 100; do
     VALS=$(extract "$OUTDIR/${TAG}.log")
     echo "pcie,$PCT,$VALS" >> $RESULTS
     echo "  → $VALS"
+
     echo "=== CXL local_pct=$PCT ==="
     TAG="cxl_pct${PCT}"
     $GEM5 -d "$OUTDIR/$TAG" "$CFGDIR/oram_sim_cxl.py" \
@@ -63,6 +61,7 @@ for PCT in 0 10 20 30 40 50 60 70 80 90 100; do
     echo "  → $VALS"
     echo ""
 done
+
 echo ""
 echo "=== RESULTS ==="
 column -t -s, $RESULTS
