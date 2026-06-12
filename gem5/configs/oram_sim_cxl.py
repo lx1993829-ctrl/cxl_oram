@@ -88,7 +88,7 @@ parser.add_argument('--local-pct',      type=int, default=0)
 args = parser.parse_args()
 
 N = args.num_instances
-assert 1 <= N <= 32
+assert 1 <= N <= 16
 
 
 # =============================================================================
@@ -215,7 +215,7 @@ for i in range(N):
         num_logical_clients = 2,
         cmd_base       = a['cmd_port'],
         result_buf_base= a['result_buf'],
-        result_buf_size= 0x100000,
+        result_buf_size= 0x1000000,
         cmd_ring_base  = a['cmd_ring'],
         cmd_ring_depth = 16,
         cmd_queue_depth= 16,
@@ -329,9 +329,9 @@ m5.instantiate()
 for proc in processes:
     for i in range(N):
         a = per_instance_addrs(i)
-        proc.map(a['cmd_port'],   a['cmd_port'],   0x1000,   False)
-        proc.map(a['result_buf'], a['result_buf'], 0x100000, False)
-        proc.map(a['cmd_ring'],   a['cmd_ring'],   0x1000,   False)
+        proc.map(a['cmd_port'],   a['cmd_port'],   0x1000,     False)
+        proc.map(a['result_buf'], a['result_buf'], 0x1000000,  False)
+        proc.map(a['cmd_ring'],   a['cmd_ring'],   0x1000,     False)
 
 
 print('=' * 60)
