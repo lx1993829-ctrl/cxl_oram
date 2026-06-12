@@ -96,7 +96,7 @@ int main(int argc,char**argv){
 
     uint64_t cmd_base=ORAM_CMD_BASE+(uint64_t)instance_id*0x1000ULL;
     uint64_t ring_base=CMD_RING_BASE+(uint64_t)instance_id*0x1000ULL;
-    uint64_t result_base=RESULT_BUF_BASE+(uint64_t)instance_id*0x100000ULL;
+    uint64_t result_base=RESULT_BUF_BASE+(uint64_t)instance_id*0x1000000ULL;
     const uint32_t TOTAL_OPS=2u*(uint32_t)n_iters;
     uint32_t rng=(uint32_t)(instance_id+1)*2654435761u;
 
