@@ -86,7 +86,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--binary',         type=str, required=True)
 parser.add_argument('--num-instances',  type=int, default=1)
 parser.add_argument('--num-slots',      type=int, default=16)
-parser.add_argument('--num-ops',        type=int, default=1)
+parser.add_argument('--num-ops',        type=int, default=20,
+    help='Total ops per instance (writes + reads). Must be even. '
+         'Binary gets n_iters = num_ops/2. E.g. 200000 = 100k writes + 100k reads.')
 parser.add_argument('--local-pct',      type=int, default=0)
 parser.add_argument('--local-mem',      type=str, default='hbm2',
     choices=['hbm2', 'lpddr5_1x16', 'lpddr5_2x16'],
@@ -222,7 +224,7 @@ for i in range(N):
         oram_freq='300MHz',
         local_pct=args.local_pct,
         num_slots=args.num_slots,
-        num_ops=args.num_ops * 2,  # each iteration = write + read pair
+        num_ops=args.num_ops,          # total ops (writes + reads)
         hbm_base       = a['hbm'],
         host_base      = a['ddr'],
         stash_offset   = STASH_OFFSET,   # RTL STASH_DDR_BASE = 0x10000000 (64 MB region)
@@ -328,7 +330,7 @@ for i in range(N):
 # =============================================================================
 processes = [Process(pid=100 + i) for i in range(N)]
 for i, p in enumerate(processes):
-    p.cmd = [args.binary, str(N), str(i), str(args.num_ops), str(args.num_slots)]
+    p.cmd = [args.binary, str(N), str(i), str(args.num_ops // 2), str(args.num_slots)]
 
 system.workload = m5.objects.SEWorkload.init_compatible(args.binary)
 for i in range(N):
