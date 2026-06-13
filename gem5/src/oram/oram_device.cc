@@ -127,6 +127,17 @@ bool OramDevice::MemPort::recvTimingResp(PacketPtr pkt)
 
     // Step 9: command-ring fetch responses — handled by ring fetcher.
     if (auto *css = dynamic_cast<OramDevice::CmdRingFetchSenderState*>(ss)) {
+        // DIAG: dump raw packet data at arrival from CxlModel
+        if (css->kind == OramDevice::CmdRingFetchSenderState::Kind::CMD_ENTRY &&
+            pkt->hasData()) {
+            uint8_t *raw = pkt->getPtr<uint8_t>();
+            uint32_t rawSlot = 0;
+            memcpy(&rawSlot, raw, 4);
+            if(0) inform("RING-RECV slot=%lu addr=0x%lx size=%u raw_slot_addr=0x%x "
+                   "bytes[0..3]=%02x %02x %02x %02x",
+                   css->ringSlot, pkt->getAddr(), pkt->getSize(), rawSlot,
+                   raw[0], raw[1], raw[2], raw[3]);
+        }
         d.handleCmdRingResp(pkt, css);
         delete ss;
         delete pkt;
@@ -516,7 +527,7 @@ void OramDevice::tick()
         uint8_t curBurstBusy = oram->st_burst_busy_out;
         uint8_t curSelPosmap = oram->sel_posmap_out;
         if (curBurstBusy != prevBurstBusy[instanceId] || curSelPosmap != prevSelPosmap[instanceId]) {
-            inform("[cyc %lu] MUX-SWITCH: burst_busy %d->%d, sel_pm %d->%d, rQ=%d flushed "
+            if(0) inform("[cyc %lu] MUX-SWITCH: burst_busy %d->%d, sel_pm %d->%d, rQ=%d flushed "
                    "FSM=%d ht_st=%d sel_st=%d",
                    oramCycle,
                    (int)prevBurstBusy[instanceId], (int)curBurstBusy,
@@ -564,7 +575,7 @@ void OramDevice::tick()
 
         // S_STASH_READ (12): reading from line_buf to client after HBM load
         if (fsm == 12 && stashMonCount[instanceId] < 50) {
-            inform("[cyc %lu] R-MON STASH_READ: rQ=%d reorder=%d rvalid=%d "
+            if(0) inform("[cyc %lu] R-MON STASH_READ: rQ=%d reorder=%d rvalid=%d "
                    "rready=%d sel_st=%d sel_pm=%d pendBursts=%d wFifo=%d",
                    oramCycle, rqBefore, reorderReady,
                    (int)oram->m_axi_rvalid, (int)oram->m_axi_rready,
@@ -575,7 +586,7 @@ void OramDevice::tick()
 
         // S_ST_LOAD (28): loading stash entry from HBM into line_buf
         if (fsm == 28 && stLoadMonCount[instanceId] < 50) {
-            inform("[cyc %lu] STASH-LOAD: sel_st=%d arV=%d arR=%d rV=%d rR=%d "
+            if(0) inform("[cyc %lu] STASH-LOAD: sel_st=%d arV=%d arR=%d rV=%d rR=%d "
                    "rQ=%d pendBursts=%d reorder=%d",
                    oramCycle,
                    (int)oram->sel_stash_out,
@@ -588,7 +599,7 @@ void OramDevice::tick()
 
         // S_ST_FLUSH (29): flushing line_buf to HBM
         if (fsm == 29 && stFlushMonCount[instanceId] < 50) {
-            inform("[cyc %lu] STASH-FLUSH: sel_st=%d awV=%d awR=%d wV=%d wR=%d "
+            if(0) inform("[cyc %lu] STASH-FLUSH: sel_st=%d awV=%d awR=%d wV=%d wR=%d "
                    "bV=%d bR=%d wFifo=%d sel_sr=%d sel_bm=%d sel_iv=%d sel_pm=%d stFSM=%d",
                    oramCycle,
                    (int)oram->sel_stash_out,
@@ -604,7 +615,7 @@ void OramDevice::tick()
 
         // S_EXTRACT_WR (10): writing client data to line_buf
         if (fsm == 10 && extractWrMonCount[instanceId] < 10) {
-            inform("[cyc %lu] EXTRACT_WR: beat=%d wdata_valid=%d",
+            if(0) inform("[cyc %lu] EXTRACT_WR: beat=%d wdata_valid=%d",
                    oramCycle, (int)oram->oram_beat_cnt,
                    (int)oram->client_wdata_valid);
             extractWrMonCount[instanceId]++;
@@ -612,14 +623,14 @@ void OramDevice::tick()
 
         // S_EVICT (14): finding stash entries to evict
         if (fsm == 14 && evictMonCount[instanceId] < 10) {
-            inform("[cyc %lu] EVICT: sel_st=%d",
+            if(0) inform("[cyc %lu] EVICT: sel_st=%d",
                    oramCycle, (int)oram->sel_stash_out);
             evictMonCount[instanceId]++;
         }
 
         // DDR_READ (2)
         if (fsm == 2 && ddrMonCount[instanceId] < 30) {
-            inform("[cyc %lu] R-MON DDR_READ: rQ=%d reorder=%d rvalid=%d "
+            if(0) inform("[cyc %lu] R-MON DDR_READ: rQ=%d reorder=%d rvalid=%d "
                    "rready=%d pendBursts=%d",
                    oramCycle, rqBefore, reorderReady,
                    (int)oram->m_axi_rvalid, (int)oram->m_axi_rready,
@@ -763,7 +774,7 @@ void OramDevice::tick()
 
     // Log token and request details at op dispatch
     if (oram->client_req && ctrlState == OramState::PROCESSING) {
-        inform("[cyc %lu] OP-DISPATCH: req=%d op=%d addr=0x%lx "
+        if(0) inform("[cyc %lu] OP-DISPATCH: req=%d op=%d addr=0x%lx "
                "token=0x%lx lease_id=%d wdata_valid=%d",
                oramCycle, (int)oram->client_req,
                (int)oram->client_op,
@@ -824,7 +835,7 @@ void OramDevice::tick()
         
         // Data round-trip tracker: log read burst address
         Addr gem5ArAddr = pcie ? (hostBase + s_araddr) : (hbmBase + s_araddr);
-        inform("[cyc %lu] AR-ISSUE: addr=0x%lx (axi=0x%lx) len=%d seq=%lu FSM=%d %s "
+        if(0) inform("[cyc %lu] AR-ISSUE: addr=0x%lx (axi=0x%lx) len=%d seq=%lu FSM=%d %s "
                "ht_st=%d ht_op=%d sel_st=%d burst_busy=%d",
                oramCycle, gem5ArAddr, (uint64_t)s_araddr, (int)s_arlen,
                seq, (int)oram->dbg_oram_state,
@@ -909,7 +920,7 @@ void OramDevice::tick()
             Addr htRegionStart = hbmBase + HT_SLOT_BASE_ADDR;
             Addr htRegionEnd   = hbmBase + HT_REGION_END;   // through end of IVT
             if (gem5AwAddr >= htRegionStart && gem5AwAddr < htRegionEnd) {
-                inform("[cyc %lu] HT_AW_WRITE: addr=0x%lx (axi=0x%lx) len=%d "
+                if(0) inform("[cyc %lu] HT_AW_WRITE: addr=0x%lx (axi=0x%lx) len=%d "
                        "FSM=%d ht_st=%d sel_st=%d sel_pm=%d burst_busy=%d isStash=%d",
                        oramCycle, gem5AwAddr, (uint64_t)axiAddr, (int)s_awlen,
                        (int)oram->dbg_oram_state, (int)oram->dbg_ht_state,
@@ -932,7 +943,7 @@ void OramDevice::tick()
             Addr htRegionStart = hbmBase + HT_SLOT_BASE_ADDR;
             Addr htRegionEnd   = hbmBase + HT_REGION_END;   // through end of IVT
             if (gem5Addr >= htRegionStart && gem5Addr < htRegionEnd) {
-                inform("[cyc %lu] HT_W_DATA: addr=0x%lx beat=%d wstrb=0x%x "
+                if(0) inform("[cyc %lu] HT_W_DATA: addr=0x%lx beat=%d wstrb=0x%x "
                        "data[0..7]=0x%02x%02x%02x%02x%02x%02x%02x%02x "
                        "FSM=%d ht_st=%d sel_st=%d",
                        oramCycle, gem5Addr, wb.beatsRecv, (unsigned)s_wstrb,
@@ -1006,7 +1017,7 @@ void OramDevice::tick()
                 if (earlyIt != earlyWriteResps.end()) {
                     pwb.responsesRecv = earlyIt->second;
                     earlyWriteResps.erase(earlyIt);
-                    inform("PM-EARLY-PICKUP[%s] inst=%u cyc=%lu: posmap PWB "
+                    if(0) inform("PM-EARLY-PICKUP[%s] inst=%u cyc=%lu: posmap PWB "
                            "seq=%lu picked up %d early resp → immediate BRESP",
                            name(), instanceId, oramCycle, pwb.seq,
                            pwb.responsesRecv);
@@ -1041,12 +1052,12 @@ void OramDevice::tick()
                     std::array<uint8_t, 32> e;
                     memcpy(e.data(), s_wdata, AXI_DATA_BYTES);
                     htSlotShadow[gem5Addr] = e;
-                    inform("[cyc %lu] HT_SHADOW_REC at 0x%lx [0..7]=0x%02x%02x%02x%02x%02x%02x%02x%02x (mapsz=%zu)",
+                    if(0) inform("[cyc %lu] HT_SHADOW_REC at 0x%lx [0..7]=0x%02x%02x%02x%02x%02x%02x%02x%02x (mapsz=%zu)",
                            oramCycle, (uint64_t)gem5Addr,
                            e[7],e[6],e[5],e[4],e[3],e[2],e[1],e[0], htSlotShadow.size());
                 } else if (gem5Addr >= htSlotStart && gem5Addr < htSlotEnd) {
                     // In HT range but failed beatBytes guard — the diagnostic case.
-                    inform("[cyc %lu] HT_SHADOW_SKIP at 0x%lx (beatBytes=%d < %d)",
+                    if(0) inform("[cyc %lu] HT_SHADOW_SKIP at 0x%lx (beatBytes=%d < %d)",
                            oramCycle, (uint64_t)gem5Addr, beatBytes, AXI_DATA_BYTES);
                 }
             }
@@ -1054,7 +1065,7 @@ void OramDevice::tick()
             // Cycle-by-cycle stash W data trace (FSM=29 S_ST_FLUSH) — EVERY beat
             if (curFsmState == 29) {
                 uint32_t *dw = (uint32_t *)s_wdata;
-                inform("[cyc %lu] STASH_W_DATA: beat=%d addr=0x%lx data[0..3]=%08x %08x %08x %08x",
+                if(0) inform("[cyc %lu] STASH_W_DATA: beat=%d addr=0x%lx data[0..3]=%08x %08x %08x %08x",
                        oramCycle, wb.beatsRecv, (uint64_t)gem5Addr,
                        dw[0], dw[1], dw[2], dw[3]);
             }
@@ -1338,7 +1349,7 @@ void OramDevice::tick()
             uint64_t *d = (uint64_t*)buf;
             if (d[0] != lastGoodData[0] || d[1] != lastGoodData[1] ||
                 d[2] != lastGoodData[2] || d[3] != lastGoodData[3]) {
-                warn("WATCHPOINT HIT cyc=%lu addr=0x%lx: "
+                if(0) warn("WATCHPOINT HIT cyc=%lu addr=0x%lx: "
                      "OLD=[%016lx %016lx %016lx %016lx] "
                      "NEW=[%016lx %016lx %016lx %016lx] "
                      "FSM=%d ht_st=%d ht_op=%d sel_st=%d sel_pm=%d "
@@ -1374,7 +1385,7 @@ void OramDevice::tick()
                 rdataShadow[hw][i] = oram->client_rdata[rb + i];
             rdataShadowValid[hw] = true;
             if (!rdataValidEverSeen[hw]) {
-                inform("RDATA_FIRST_SEEN hw=%u cycle=%lu data[0]=%08x FSM=%d",
+                if(0) inform("RDATA_FIRST_SEEN hw=%u cycle=%lu data[0]=%08x FSM=%d",
                        hw, oramCycle, rdataShadow[hw][0],
                        (int)oram->dbg_oram_state);
             }
@@ -1545,7 +1556,7 @@ void OramDevice::tick()
 
     // Periodic heartbeat — full state dump every 10000 cycles
     if (oramCycle % 10000 == 0 && oramCycle > 0) {
-        inform("HEARTBEAT[%s] cyc=%lu ctrlState=%d fsm=%d "
+        if(0) inform("HEARTBEAT[%s] cyc=%lu ctrlState=%d fsm=%d "
                "initIdx=%d initPh=%d grantPh=%d wrInitIdx=%d "
                "opsComp=%u/%u oram_busy=%d client_req=%d client_done=%d "
                "init_mode=%d pm_busy=%d mgmt_req=%d mgmt_ack=%d "
@@ -1943,6 +1954,66 @@ void OramDevice::handleCmdRingResp(PacketPtr pkt, CmdRingFetchSenderState *ss)
     e.phase       = CmdEntry::Phase::PENDING;
     e.rdata_valid = false;
 
+    // ====== ROOT CAUSE DIAGNOSTICS: ring entry data corruption ======
+    {
+        Addr entryAddr = pkt->getAddr();
+
+        // 1. Dump raw timing response bytes
+        if(0) inform("RING-TRACE slot=%lu addr=0x%lx pktSize=%u timing_bytes[0..15]="
+               "%02x %02x %02x %02x  %02x %02x %02x %02x  "
+               "%02x %02x %02x %02x  %02x %02x %02x %02x  "
+               "parsed: slot_addr=0x%x token=0x%x hwC=%u lease=%u op=%u opIdx=%lu",
+               ss->ringSlot, entryAddr, pkt->getSize(),
+               data[0],  data[1],  data[2],  data[3],
+               data[4],  data[5],  data[6],  data[7],
+               data[8],  data[9],  data[10], data[11],
+               data[12], data[13], data[14], data[15],
+               e.slot_addr, e.token, e.hw_client, e.lease_id,
+               e.op, e.opIdx);
+
+        // 2. Functional read: bypass timing, read directly from DDR5 pmem
+        auto fReq = std::make_shared<Request>(entryAddr, 64, 0, reqId);
+        PacketPtr fPkt = new Packet(fReq, MemCmd::ReadReq);
+        fPkt->allocate();
+        pciePort.sendFunctional(fPkt);
+        uint8_t *fData = fPkt->getPtr<uint8_t>();
+
+        uint32_t funcSlotAddr = 0;
+        memcpy(&funcSlotAddr, fData, 4);
+
+        if(0) inform("RING-FUNC  slot=%lu addr=0x%lx func_bytes[0..15]="
+               "%02x %02x %02x %02x  %02x %02x %02x %02x  "
+               "%02x %02x %02x %02x  %02x %02x %02x %02x  "
+               "func_slot_addr=0x%x",
+               ss->ringSlot, entryAddr,
+               fData[0],  fData[1],  fData[2],  fData[3],
+               fData[4],  fData[5],  fData[6],  fData[7],
+               fData[8],  fData[9],  fData[10], fData[11],
+               fData[12], fData[13], fData[14], fData[15],
+               funcSlotAddr);
+
+        // 3. Byte-level comparison
+        bool mismatch = false;
+        for (int b = 0; b < 64; b++) {
+            if (data[b] != fData[b]) {
+                if (!mismatch) {
+                    if(0) warn("RING-CORRUPT slot=%lu: timing vs functional MISMATCH!",
+                         ss->ringSlot);
+                    mismatch = true;
+                }
+                warn("  byte[%d]: timing=0x%02x functional=0x%02x (XOR=0x%02x)",
+                     b, data[b], fData[b], data[b] ^ fData[b]);
+            }
+        }
+        if (!mismatch && ss->ringSlot <= 5) {
+            if(0) inform("RING-OK    slot=%lu: timing == functional (slot_addr=0x%x)",
+                   ss->ringSlot, e.slot_addr);
+        }
+
+        delete fPkt;
+    }
+    // ====== END DIAGNOSTICS ======
+
     if (valid != 1) {
         warn("cmd-ring entry slot=%lu had valid=%u (expected 1) — "
              "CPU/ORAM ordering bug?", ss->ringSlot, valid);
@@ -2198,7 +2269,7 @@ void OramDevice::handleMemResp(PacketPtr pkt)
                 bool differs = (memcmp(it->second.data(), rdData,
                                 std::min(pmRmw->writeSize, (int)sizeof(it->second))) != 0);
                 if (differs)
-                    inform("[cyc %lu] PM_SHADOW_FIX at 0x%lx: shadow differs from timing-read "
+                    if(0) inform("[cyc %lu] PM_SHADOW_FIX at 0x%lx: shadow differs from timing-read "
                            "(stale read corrected)",
                            oramCycle, (uint64_t)pmRmw->writeAddr);
             } else {
@@ -2287,11 +2358,11 @@ void OramDevice::handleMemResp(PacketPtr pkt)
                     uint8_t *pd = pkt->getPtr<uint8_t>();
                     bool differs = (memcmp(pd, it->second.data(), AXI_DATA_BYTES) != 0);
                     memcpy(pd, it->second.data(), AXI_DATA_BYTES);
-                    inform("[cyc %lu] HT_FWD at 0x%lx: shadow hit differs=%d [0..7]=0x%02x%02x%02x%02x%02x%02x%02x%02x",
+                    if(0) inform("[cyc %lu] HT_FWD at 0x%lx: shadow hit differs=%d [0..7]=0x%02x%02x%02x%02x%02x%02x%02x%02x",
                            oramCycle, pktAddr, differs,
                            pd[7], pd[6], pd[5], pd[4], pd[3], pd[2], pd[1], pd[0]);
                 } else {
-                    inform("[cyc %lu] HT_FWD_MISS at 0x%lx: no shadow entry (mapsz=%zu)",
+                    if(0) inform("[cyc %lu] HT_FWD_MISS at 0x%lx: no shadow entry (mapsz=%zu)",
                            oramCycle, pktAddr, htSlotShadow.size());
                 }
             }
@@ -2314,7 +2385,7 @@ void OramDevice::handleMemResp(PacketPtr pkt)
                     bool differs = (memcmp(pd, it->second.data(), AXI_DATA_BYTES) != 0);
                     memcpy(pd, it->second.data(), AXI_DATA_BYTES);
                     if (differs)
-                        inform("[cyc %lu] PM_RD_FWD at 0x%lx: shadow corrected stale pos_map read",
+                        if(0) inform("[cyc %lu] PM_RD_FWD at 0x%lx: shadow corrected stale pos_map read",
                                oramCycle, pktAddr);
                 }
             }
@@ -2335,7 +2406,7 @@ void OramDevice::handleMemResp(PacketPtr pkt)
                     bool differs = (memcmp(pd, it->second.data(), AXI_DATA_BYTES) != 0);
                     memcpy(pd, it->second.data(), AXI_DATA_BYTES);
                     if (differs)
-                        inform("[cyc %lu] STASH_FWD at 0x%lx: shadow corrected stale stash read",
+                        if(0) inform("[cyc %lu] STASH_FWD at 0x%lx: shadow corrected stale stash read",
                                oramCycle, pktAddr);
                 }
             }
@@ -2356,7 +2427,7 @@ void OramDevice::handleMemResp(PacketPtr pkt)
                     bool differs = (memcmp(pd, it->second.data(), AXI_DATA_BYTES) != 0);
                     memcpy(pd, it->second.data(), AXI_DATA_BYTES);
                     if (differs)
-                        inform("[cyc %lu] HEAD_FWD at 0x%lx: shadow corrected stale BKT_HEAD read",
+                        if(0) inform("[cyc %lu] HEAD_FWD at 0x%lx: shadow corrected stale BKT_HEAD read",
                                oramCycle, pktAddr);
                 }
             }
@@ -2375,7 +2446,7 @@ void OramDevice::handleMemResp(PacketPtr pkt)
                     bool differs = (memcmp(pd, it->second.data(), AXI_DATA_BYTES) != 0);
                     memcpy(pd, it->second.data(), AXI_DATA_BYTES);
                     if (differs)
-                        inform("[cyc %lu] NEXT_FWD at 0x%lx: shadow corrected stale BKT_NEXT read",
+                        if(0) inform("[cyc %lu] NEXT_FWD at 0x%lx: shadow corrected stale BKT_NEXT read",
                                oramCycle, pktAddr);
                 }
             }
@@ -2400,7 +2471,7 @@ void OramDevice::handleMemResp(PacketPtr pkt)
                 bool match = (memcmp(pkt->getConstPtr<uint8_t>(), fBuf,
                               std::min((int)pkt->getSize(), AXI_DATA_BYTES)) == 0);
                 if (!match) {
-                    inform("[cyc %lu] HT_XCHECK MISMATCH at 0x%lx: "
+                    if(0) inform("[cyc %lu] HT_XCHECK MISMATCH at 0x%lx: "
                            "timing[0..7]=0x%02x%02x%02x%02x%02x%02x%02x%02x "
                            "func[0..7]=0x%02x%02x%02x%02x%02x%02x%02x%02x",
                            oramCycle, pktAddr,
@@ -2411,7 +2482,7 @@ void OramDevice::handleMemResp(PacketPtr pkt)
                            fBuf[7], fBuf[6], fBuf[5], fBuf[4],
                            fBuf[3], fBuf[2], fBuf[1], fBuf[0]);
                 } else {
-                    inform("[cyc %lu] HT_XCHECK OK at 0x%lx: [0..7]=0x%02x%02x%02x%02x%02x%02x%02x%02x",
+                    if(0) inform("[cyc %lu] HT_XCHECK OK at 0x%lx: [0..7]=0x%02x%02x%02x%02x%02x%02x%02x%02x",
                            oramCycle, pktAddr,
                            pkt->getConstPtr<uint8_t>()[7], pkt->getConstPtr<uint8_t>()[6],
                            pkt->getConstPtr<uint8_t>()[5], pkt->getConstPtr<uint8_t>()[4],
@@ -2464,7 +2535,7 @@ void OramDevice::handleMemResp(PacketPtr pkt)
             earlyWriteResps[ss->burstSeq] += respCount;
             bool earlyIsPm = (posmapWriteSeqs.count(ss->burstSeq) > 0);
             if (earlyIsPm) {
-                warn("EARLY-PM-BRESP[%s] inst=%u cyc=%lu: posmap write resp "
+                if(0) warn("EARLY-PM-BRESP[%s] inst=%u cyc=%lu: posmap write resp "
                      "seq=%lu arrived before PendingWriteBurst created "
                      "(earlyCount=%d, FSM=%d, pm_busy=%d)",
                      name(), instanceId, oramCycle, ss->burstSeq,
@@ -2507,7 +2578,7 @@ void OramDevice::flushCompletedReads()
             if (beat.isSingle) {
                 for (auto &q : rQueue) {
                     if (q.isSingle) {
-                        inform("[cyc %lu] RQ_SINGLE_COEXIST: pushing single beat while "
+                        if(0) inform("[cyc %lu] RQ_SINGLE_COEXIST: pushing single beat while "
                                "another single beat already in rQueue (size=%zu) — "
                                "out-of-order delivery possible",
                                oramCycle, rQueue.size());
@@ -2571,7 +2642,7 @@ void OramDevice::driveAxiR()
         uint8_t fsm = oram->dbg_oram_state;
         if (fsm == 28) {
             uint32_t *dw = (uint32_t *)b.data;
-            inform("[cyc %lu] STASH_R_DATA: data[0..3]=%08x %08x %08x %08x (last=%d)",
+            if(0) inform("[cyc %lu] STASH_R_DATA: data[0..3]=%08x %08x %08x %08x (last=%d)",
                    oramCycle, dw[0], dw[1], dw[2], dw[3], b.last);
         }
     } else {
@@ -3535,7 +3606,7 @@ void OramDevice::completeOp()
         oram->dbg_ht_ins_issued != oram->dbg_ht_ins_completed ||
         oram->dbg_ht_del_issued != oram->dbg_ht_del_completed ||
         oram->dbg_ht_latch_ins_active || oram->dbg_ht_latch_del_active) {
-        warn("HT_ANOMALY inst=%u op=%u: "
+        if(0) warn("HT_ANOMALY inst=%u op=%u: "
              "ins=%u/%u del=%u/%u overwrite_ins=%d overwrite_del=%d "
              "latch_ins=%d latch_del=%d",
              instanceId, opsCompleted,
@@ -3550,7 +3621,7 @@ void OramDevice::completeOp()
     }
     // Log HT counters for every READ op (to check the op that LAST accessed a failing slot)
     if (!currentOpIsWrite) {
-        inform("HT_READ_SUMMARY inst=%u op=%u slotIdx=%u: "
+        if(0) inform("HT_READ_SUMMARY inst=%u op=%u slotIdx=%u: "
                "ins=%u/%u del=%u/%u ovr_i=%d ovr_d=%d found_b=%d found_s=%d",
                instanceId, opsCompleted,
                (unsigned)((currentOpAddr - LEASE_BASE) / SLOT_SIZE),
@@ -3566,16 +3637,16 @@ void OramDevice::completeOp()
 
     // Round-trip data verification
     if (!currentOpIsWrite && rdataShadowValid[activeHwClient]) {
-        inform("VERIFY-READ op=%u addr=0x%lx rdata[0..3]=%08x %08x %08x %08x",
+        if(0) inform("VERIFY-READ op=%u addr=0x%lx rdata[0..3]=%08x %08x %08x %08x",
                opsCompleted, currentOpAddr,
                rdataShadow[activeHwClient][0], rdataShadow[activeHwClient][1],
                rdataShadow[activeHwClient][2], rdataShadow[activeHwClient][3]);
     } else if (!currentOpIsWrite) {
-        inform("VERIFY-READ op=%u addr=0x%lx NO RDATA SHADOW", 
+        if(0) inform("VERIFY-READ op=%u addr=0x%lx NO RDATA SHADOW", 
                opsCompleted, currentOpAddr);
     }
     if (currentOpIsWrite) {
-        inform("VERIFY-WRITE op=%u addr=0x%lx beat0_wdata[0..3]=%08x %08x %08x %08x",
+        if(0) inform("VERIFY-WRITE op=%u addr=0x%lx beat0_wdata[0..3]=%08x %08x %08x %08x",
                opsCompleted, currentOpAddr,
                currentOpWdata[0], currentOpWdata[1],
                currentOpWdata[2], currentOpWdata[3]);
@@ -3609,36 +3680,36 @@ void OramDevice::completeOp()
 
     // DDR_WRITE debug breakdown
     if (wrDbg.totalCycles > 0) {
-        inform("  DDR_WRITE W-channel debug (%lu cycles):", wrDbg.totalCycles);
-        inform("    W handshakes:  %lu (RTL wvalid && wready)",
+        if(0) inform("  DDR_WRITE W-channel debug (%lu cycles):", wrDbg.totalCycles);
+        if(0) inform("    W handshakes:  %lu (RTL wvalid && wready)",
                wrDbg.wHandshakes);
-        inform("    W stalls:      %lu (RTL wvalid && !wready)",
+        if(0) inform("    W stalls:      %lu (RTL wvalid && !wready)",
                wrDbg.wStalls);
-        inform("    W idle:        %lu (RTL !wvalid, sub-burst gaps)",
+        if(0) inform("    W idle:        %lu (RTL !wvalid, sub-burst gaps)",
                wrDbg.wIdle);
-        inform("    gem5 accepted: %lu (sendTimingReq true)",
+        if(0) inform("    gem5 accepted: %lu (sendTimingReq true)",
                wrDbg.sendAccepted);
-        inform("    gem5 rejected: %lu (sendTimingReq false, queued)",
+        if(0) inform("    gem5 rejected: %lu (sendTimingReq false, queued)",
                wrDbg.sendRejected);
-        inform("    gem5 retries:  %lu (sent via retry queue)",
+        if(0) inform("    gem5 retries:  %lu (sent via retry queue)",
                wrDbg.retrySent);
-        inform("    AW handshakes: %lu", wrDbg.awHandshakes);
-        inform("    BRESPs avail:  %lu (bvalid asserted)", wrDbg.brespAvail);
-        inform("    BRESPs recv:   %lu (bvalid && bready consumed)",
+        if(0) inform("    AW handshakes: %lu", wrDbg.awHandshakes);
+        if(0) inform("    BRESPs avail:  %lu (bvalid asserted)", wrDbg.brespAvail);
+        if(0) inform("    BRESPs recv:   %lu (bvalid && bready consumed)",
                wrDbg.brespRecv);
-        inform("    BRESPs noMatch:%lu (bQueue non-empty but wrong type)",
+        if(0) inform("    BRESPs noMatch:%lu (bQueue non-empty but wrong type)",
                wrDbg.brespNoMatch);
-        inform("    maxBqDepth:    %lu", wrDbg.maxBqDepth);
-        inform("    W timing:      first=%lu last=%lu span=%lu cyc",
+        if(0) inform("    maxBqDepth:    %lu", wrDbg.maxBqDepth);
+        if(0) inform("    W timing:      first=%lu last=%lu span=%lu cyc",
                wrDbg.firstWcycle, wrDbg.lastWcycle,
                wrDbg.lastWcycle - wrDbg.firstWcycle);
-        inform("    B timing:      first=%lu last=%lu span=%lu cyc",
+        if(0) inform("    B timing:      first=%lu last=%lu span=%lu cyc",
                wrDbg.firstBcycle, wrDbg.lastBcycle,
                wrDbg.firstBcycle > 0 ? wrDbg.lastBcycle - wrDbg.firstBcycle : 0UL);
-        inform("    W→B latency:   %lu cyc (first BRESP - first W)",
+        if(0) inform("    W→B latency:   %lu cyc (first BRESP - first W)",
                wrDbg.firstBcycle > wrDbg.firstWcycle ?
                wrDbg.firstBcycle - wrDbg.firstWcycle : 0UL);
-        inform("    Effective:     %.3f cyc/beat (%lu beats in %lu cyc)",
+        if(0) inform("    Effective:     %.3f cyc/beat (%lu beats in %lu cyc)",
                wrDbg.wHandshakes > 0 ?
                (double)wrDbg.totalCycles / wrDbg.wHandshakes : 0.0,
                wrDbg.wHandshakes, wrDbg.totalCycles);
@@ -3647,28 +3718,28 @@ void OramDevice::completeOp()
 
     // DDR_READ debug breakdown
     if (rdDbg.totalCycles > 0) {
-        inform("  DDR_READ R-channel debug (%lu cycles):", rdDbg.totalCycles);
-        inform("    R handshakes:  %lu (RTL rvalid && rready)",
+        if(0) inform("  DDR_READ R-channel debug (%lu cycles):", rdDbg.totalCycles);
+        if(0) inform("    R handshakes:  %lu (RTL rvalid && rready)",
                rdDbg.rHandshakes);
-        inform("    R stalls:      %lu (RTL rvalid && !rready)",
+        if(0) inform("    R stalls:      %lu (RTL rvalid && !rready)",
                rdDbg.rStalls);
-        inform("    R idle:        %lu (RTL !rvalid, waiting for data)",
+        if(0) inform("    R idle:        %lu (RTL !rvalid, waiting for data)",
                rdDbg.rIdle);
-        inform("    AR handshakes: %lu", rdDbg.arHandshakes);
-        inform("    gem5 accepted: %lu (read sendPkt true)",
+        if(0) inform("    AR handshakes: %lu", rdDbg.arHandshakes);
+        if(0) inform("    gem5 accepted: %lu (read sendPkt true)",
                rdDbg.sendAccepted);
-        inform("    gem5 rejected: %lu (read sendPkt false, queued)",
+        if(0) inform("    gem5 rejected: %lu (read sendPkt false, queued)",
                rdDbg.sendRejected);
-        inform("    gem5 retries:  %lu (sent via retry queue)",
+        if(0) inform("    gem5 retries:  %lu (sent via retry queue)",
                rdDbg.retrySent);
-        inform("    mem responses: %lu (handleMemResp reads)",
+        if(0) inform("    mem responses: %lu (handleMemResp reads)",
                rdDbg.memResps);
-        inform("    maxRqDepth:    %lu", rdDbg.maxRqDepth);
-        inform("    maxPendReads:  %lu", rdDbg.maxPendReads);
-        inform("    R timing:      first=%lu last=%lu span=%lu cyc",
+        if(0) inform("    maxRqDepth:    %lu", rdDbg.maxRqDepth);
+        if(0) inform("    maxPendReads:  %lu", rdDbg.maxPendReads);
+        if(0) inform("    R timing:      first=%lu last=%lu span=%lu cyc",
                rdDbg.firstRcycle, rdDbg.lastRcycle,
                rdDbg.firstRcycle > 0 ? rdDbg.lastRcycle - rdDbg.firstRcycle : 0UL);
-        inform("    Effective:     %.3f cyc/beat (%lu beats in %lu cyc)",
+        if(0) inform("    Effective:     %.3f cyc/beat (%lu beats in %lu cyc)",
                rdDbg.rHandshakes > 0 ?
                (double)rdDbg.totalCycles / rdDbg.rHandshakes : 0.0,
                rdDbg.rHandshakes, rdDbg.totalCycles);
