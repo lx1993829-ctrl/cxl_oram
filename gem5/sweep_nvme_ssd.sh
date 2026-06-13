@@ -16,7 +16,7 @@ BINARY="configs/oram_nvme_test"
 CONFIG="configs/oram_ssd.py"
 SSD_CFG="src/mem/ssd/simplessd/config/sample.cfg"
 SSD_CFG_BAK="${SSD_CFG}.sweep_bak"
-NUM_OPS=100000            # total ORAM ops per instance (50000 writes + 50000 reads)
+NUM_OPS=100            # total ORAM ops per instance (50000 writes + 50000 reads)
 NUM_SLOTS=32768
 OUTDIR="m5out"
 NVME_BAR0="0xf0000000"
@@ -103,7 +103,7 @@ last_all = 0
 
 for Q in range(1, $N+1):
     # Extract doorbells for queue Q
-    with open('$LOGFILE') as f:
+    with open('$LOGFILE', errors='ignore') as f:
         ticks = []
         for line in f:
             if ('SQ %d ' % Q) in line and 'Doorbell' in line and 'tail' in line:
@@ -154,7 +154,7 @@ import re
 first_all = float('inf')
 last_all = 0
 for Q in range(1, $N+1):
-    with open('$LOGFILE') as f:
+    with open('$LOGFILE', errors='ignore') as f:
         ticks = []
         for line in f:
             if ('SQ %d ' % Q) in line and 'Doorbell' in line and 'tail' in line:
