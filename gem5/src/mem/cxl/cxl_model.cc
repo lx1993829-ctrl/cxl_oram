@@ -1322,6 +1322,20 @@ bool CxlModel::handleHostResponse(PacketPtr pkt)
     orec.pendingCplBytes += responseSize;
     orec.pendingCplBeats.push_back({pkt->getAddr(), pkt});
 
+    // DIAG: trace DDR5 response data for ring entry addresses
+    if (pkt->getAddr() >= 0x600000000 && pkt->getAddr() < 0x600001000 &&
+        pkt->hasData()) {
+        const uint8_t *rd = pkt->getConstPtr<uint8_t>();
+        uint32_t rdSlot = 0;
+        memcpy(&rdSlot, rd, 4);
+        inform("CXL-DDR5-RESP tag=%u addr=0x%lx size=%u "
+               "ddr5_bytes[0..7]=%02x %02x %02x %02x %02x %02x %02x %02x "
+               "slot_addr=0x%x",
+               tag, pkt->getAddr(), responseSize,
+               rd[0],rd[1],rd[2],rd[3],rd[4],rd[5],rd[6],rd[7],
+               rdSlot);
+    }
+
     // Decide whether to flush now:
     //   (a) pendingCplBytes has reached the combining boundary, or
     //   (b) this is the final beat of the group (all bytes accumulated).
@@ -1512,6 +1526,24 @@ void CxlModel::processDownstreamQueue()
                     if (bi.hostPkt && bi.hostPkt->hasData()) {
                         devPktForBeat->setData(
                             bi.hostPkt->getConstPtr<uint8_t>());
+
+                        // DIAG: trace data for ring entry addresses
+                        if (bi.beatAddr >= 0x600000000 &&
+                            bi.beatAddr <  0x600001000) {
+                            const uint8_t *hd = bi.hostPkt->getConstPtr<uint8_t>();
+                            const uint8_t *dd = devPktForBeat->getConstPtr<uint8_t>();
+                            uint32_t hSlot = 0, dSlot = 0;
+                            memcpy(&hSlot, hd, 4);
+                            memcpy(&dSlot, dd, 4);
+                            inform("CXL-DATA-COPY tag=%u addr=0x%lx "
+                                   "hostPkt[0..7]=%02x %02x %02x %02x %02x %02x %02x %02x (slot=0x%x) "
+                                   "devPkt[0..7]=%02x %02x %02x %02x %02x %02x %02x %02x (slot=0x%x) "
+                                   "match=%d",
+                                   flit.tag, bi.beatAddr,
+                                   hd[0],hd[1],hd[2],hd[3],hd[4],hd[5],hd[6],hd[7], hSlot,
+                                   dd[0],dd[1],dd[2],dd[3],dd[4],dd[5],dd[6],dd[7], dSlot,
+                                   (memcmp(hd, dd, devPktForBeat->getSize()) == 0));
+                        }
                     } else {
                         warn_once("CXL: read response hostPkt=%p hasData=%d "
                                   "for tag=%u beat_addr=0x%lx — device gets "
@@ -1826,6 +1858,17 @@ void CxlModel::trySendResponses()
     if (earliestPending != MaxTick && !responseEvent.scheduled())
         schedule(responseEvent, earliestPending);
 
+    // BUG FIX: if responses are stuck (sendTimingResp returned false),
+    // earliestPending stays MaxTick because the stuck entries ARE ready
+    // (readyTick <= now) but can't be delivered.  Without this retry,
+    // the response event is never rescheduled, the queue grows until
+    // a downstream pointer becomes stale, and drainDeviceRequests
+    // segfaults.  Retry in 1000 ticks (1 ns) — cheap and guarantees
+    // forward progress once the device port unblocks.
+    if (afterTotal > 0 && !responseEvent.scheduled()) {
+        schedule(responseEvent, curTick() + 1000);
+    }
+
     if (pendingDeviceRetry) {
         pendingDeviceRetry = false;
         retryStarvedPorts();
@@ -1937,9 +1980,11 @@ void CxlModel::trySendToHost()
             Tick next = (earliestDeferred != MaxTick)
                 ? std::max(base, earliestDeferred) : base;
             schedule(hostSendEvent, next);
+        } else {
+            // BUG FIX: defensive retry when all packets are xbar-blocked.
+            // recvReqRetry should wake us, but retry at 1 ns as fallback.
+            schedule(hostSendEvent, curTick() + 1000);
         }
-        // else: all remaining packets blocked on xbar retries. Wait
-        // for recvReqRetry to wake us.
     }
 }
 
