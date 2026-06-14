@@ -2306,6 +2306,21 @@ void PCIeModel::trySendResponses()
     if (earliestPending != MaxTick && !responseEvent.scheduled())
         schedule(responseEvent, earliestPending);
 
+    // BUG FIX: if responses are stuck (sendTimingResp returned false),
+    // earliestPending stays MaxTick because the stuck entries ARE ready
+    // (readyTick <= now) but can't be delivered.  Without this retry,
+    // the response event is never rescheduled, the queue grows until
+    // a downstream pointer becomes stale, and drainDeviceRequests
+    // segfaults.  Retry in 1000 ticks (1 ns).
+    {
+        size_t totalResp = 0;
+        for (unsigned sp = 0; sp < responseQueue.size(); sp++)
+            totalResp += responseQueue[sp].size();
+        if (totalResp > 0 && !responseEvent.scheduled()) {
+            schedule(responseEvent, curTick() + 1000);
+        }
+    }
+
     if (pendingDeviceRetry) {
         pendingDeviceRetry = false;
         retryStarvedPorts();
