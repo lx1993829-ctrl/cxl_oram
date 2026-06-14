@@ -14,9 +14,9 @@
 #   CPU -> membus -> iobridge -> iobus -> NvmeSsdDevice.pio  (BAR0)
 #   NvmeSsdDevice.dma -> system.pcie -> cxl_host_xbar -> DDR5
 #
-# Dedicated PCIeModel instance for NVMe (separate from system.cxl which
-# carries ORAM CXL traffic). On a real machine the CPU has independent
-# CXL and PCIe root ports; they only meet at the host fabric (the mesh
+# Dedicated PCIeModel instance for NVMe (separate from the ORAM fabric).
+# In --use-nvme mode, both ORAM and NVMe use PCIeModel (no CXL).
+# On a real machine, two PCIe root ports meet at the host fabric (the mesh
 # / memory-controller side). Modeling them as separate fabric instances
 # joined at cxl_host_xbar is the faithful structure: independent tag
 # pools, link-layer credits, and timing parameters; shared contention
@@ -326,25 +326,50 @@ if need_oram:
     system.hbm_xbar = hbm_xbar_list
     system.hbm_ctrl = hbm_ctrl_list
 
-# --- Single shared CXL fabric ---
-# Also gated on need_oram: when ORAM isn't instantiated, nothing
-# uses the CXL fabric, so skip its construction too.
+# --- Shared fabric: PCIe for --use-nvme, CXL for everything else ---
 if need_oram:
-    system.cxl = CxlModel(
-        gen=5,
-        lanes=16,
-        cxl_core_clock='1ns',
-        max_tags=256,
-        max_outstanding=64,
-        max_outstanding_writes=128,
-        flit_credits=128,
-        completion_buffer_depth=2048,
-        host_inject_interval='1ns',
-    )
-    system.cxl.clk_domain = SrcClockDomain(clock='1GHz', voltage_domain=VoltageDomain())
+    if args.use_nvme:
+        # NVMe mode: ORAM uses PCIeModel (Gen5 x16) to reach DDR5.
+        # Both ORAM and NVMe SSD are on PCIe — no CXL in the system.
+        system.oram_fabric = PCIeModel(
+            gen=5,
+            lanes=16,
+            mps=512,
+            mrrs=512,
+            max_tags=256,
+            max_outstanding=64,
+            max_outstanding_writes=128,
+            rrb_depth=256,
+            completion_reorder_depth=64,
+            pcie_core_clock='1ns',
+            pcie_core_width=64,
+            pcie_tlp_gap='2ns',
+            host_inject_interval='1ns',
+            requester_id=0x0100,  # bus=1, dev=0, func=0
+        )
+        system.oram_fabric.clk_domain = SrcClockDomain(
+            clock='1GHz', voltage_domain=VoltageDomain())
 
-    for i in range(N):
-        system.oram[i].pcie_port = system.cxl.device_side_port
+        for i in range(N):
+            system.oram[i].pcie_port = system.oram_fabric.device_side_port
+    else:
+        # DDR5 or CXL SSD mode: ORAM uses CxlModel (Gen5 x16).
+        system.oram_fabric = CxlModel(
+            gen=5,
+            lanes=16,
+            cxl_core_clock='1ns',
+            max_tags=256,
+            max_outstanding=64,
+            max_outstanding_writes=128,
+            flit_credits=128,
+            completion_buffer_depth=2048,
+            host_inject_interval='1ns',
+        )
+        system.oram_fabric.clk_domain = SrcClockDomain(
+            clock='1GHz', voltage_domain=VoltageDomain())
+
+        for i in range(N):
+            system.oram[i].pcie_port = system.oram_fabric.device_side_port
 
 # --- Host xbar + memory backings ---
 system.cxl_host_xbar = NoncoherentXBar(
@@ -356,7 +381,7 @@ system.cxl_host_xbar.clk_domain = SrcClockDomain(
 NUM_HOST_PORTS = 4
 if need_oram:
     for _ in range(NUM_HOST_PORTS):
-        system.cxl.host_side_port = system.cxl_host_xbar.cpu_side_ports
+        system.oram_fabric.host_side_port = system.cxl_host_xbar.cpu_side_ports
 
 NUM_DDR5_CHANNELS = 16
 ddr5_intlv_bits = int(_math.log(NUM_DDR5_CHANNELS, 2))
@@ -431,10 +456,11 @@ if need_oram:
 # pio: CPU -> membus -> iobridge -> iobus -> nvme_ssd.pio   (BAR0)
 # dma: nvme_ssd.dma -> system.pcie -> cxl_host_xbar -> DDR5
 #
-# Dedicated PCIeModel for NVMe — separate from system.cxl which carries
-# ORAM CXL traffic. Two distinct fabric models joined at the host xbar
-# mirrors a real CPU's separate CXL/PCIe root ports that meet only
-# downstream at the memory-controller fabric.
+# Dedicated PCIeModel for NVMe (Gen5 x4), separate from system.oram_fabric
+# (Gen5 x16) which carries ORAM traffic. Both are PCIe in --use-nvme mode.
+# Two distinct fabric models joined at the host xbar mirrors a real CPU's
+# separate PCIe root ports that meet only downstream at the
+# memory-controller fabric.
 #
 # Gen5 x4 is typical for a high-end NVMe SSD (Samsung 990 Pro et al.);
 # tag and credit pools are sized smaller than ORAM's Gen5 x16 since a
@@ -449,7 +475,7 @@ if args.use_nvme:
     )
     system.nvme_ssd.pio = system.iobus.mem_side_ports
 
-    # Dedicated PCIe fabric for NVMe (independent from system.cxl).
+    # Dedicated PCIe fabric for NVMe (independent from system.oram_fabric).
     system.pcie = PCIeModel(
         gen=5,
         lanes=4,
