@@ -28,12 +28,11 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from phase_d_layout import (
+from oram_addr_layout import (
     MAIN_DRAM_BASE, MAIN_DRAM_SIZE,
     HBM_PER_INSTANCE, DDR_PER_INSTANCE,
     HBM_BASE, DDR_AGG_BASE, DDR_SLAB_BASE,
     CMD_RING_BASE, RESULT_BUF_BASE, ORAM_CMD_BASE,
-    STASH_OFFSET,
     STASH_OFFSET,
     per_instance_addrs, ddr_aggregate_size,
 )
@@ -83,7 +82,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--binary',         type=str, required=True)
 parser.add_argument('--num-instances',  type=int, default=1)
 parser.add_argument('--num-slots',      type=int, default=16)
-parser.add_argument('--num-ops',        type=int, default=1)
+parser.add_argument('--num-ops',        type=int, default=20,
+    help='Total ops per instance (writes + reads). Must be even. '
+         'Binary gets n_iters = num_ops/2.')
 parser.add_argument('--local-pct',      type=int, default=0)
 args = parser.parse_args()
 
@@ -207,7 +208,7 @@ for i in range(N):
         oram_freq='300MHz',
         local_pct=args.local_pct,
         num_slots=args.num_slots,
-        num_ops=args.num_ops * 2,  # each iteration = write + read pair
+        num_ops=args.num_ops,          # total ops (writes + reads)
         hbm_base       = a['hbm'],
         host_base      = a['ddr'],
         stash_offset   = STASH_OFFSET,
@@ -311,7 +312,7 @@ for i in range(N):
 # =============================================================================
 processes = [Process(pid=100 + i) for i in range(N)]
 for i, p in enumerate(processes):
-    p.cmd = [args.binary, str(N), str(i), str(args.num_ops), str(args.num_slots)]
+    p.cmd = [args.binary, str(N), str(i), str(args.num_ops // 2), str(args.num_slots)]
 
 system.workload = m5.objects.SEWorkload.init_compatible(args.binary)
 for i in range(N):
