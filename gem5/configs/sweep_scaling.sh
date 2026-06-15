@@ -57,17 +57,30 @@ run_one() {
     echo "=== DONE  $TAG → $VALS ==="
 }
 
-echo "=== Launching sweep (MAX_JOBS=$MAX_JOBS) ==="
+echo "=== HBM2 sweep ==="
 for N in 1 2 3 4 5 6 7 8; do
-    run_one "hbm2"        $N oram_sim_pcie.py "--local-pct=100 --local-mem=hbm2" &
-    run_one "lpddr5_1x16" $N oram_sim_pcie.py "--local-pct=100 --local-mem=lpddr5_1x16" &
-    run_one "lpddr5_2x16" $N oram_sim_pcie.py "--local-pct=100 --local-mem=lpddr5_2x16" &
-    run_one "pcie"        $N oram_sim_pcie.py "--local-pct=0" &
-    run_one "cxl"         $N oram_sim_cxl.py  "--local-pct=0" &
-
-    while [ $(jobs -r | wc -l) -ge $MAX_JOBS ]; do sleep 10; done
+    run_one "hbm2" $N oram_sim_pcie.py "--local-pct=100 --local-mem=hbm2"
 done
-wait
+
+echo "=== LPDDR5 1x16 sweep ==="
+for N in 1 2 3 4 5 6 7 8; do
+    run_one "lpddr5_1x16" $N oram_sim_pcie.py "--local-pct=100 --local-mem=lpddr5_1x16"
+done
+
+echo "=== LPDDR5 2x16 sweep ==="
+for N in 1 2 3 4 5 6 7 8; do
+    run_one "lpddr5_2x16" $N oram_sim_pcie.py "--local-pct=100 --local-mem=lpddr5_2x16"
+done
+
+echo "=== PCIe sweep ==="
+for N in 1 2 3 4 5 6 7 8; do
+    run_one "pcie" $N oram_sim_pcie.py "--local-pct=0"
+done
+
+echo "=== CXL sweep ==="
+for N in 1 2 3 4 5 6 7 8; do
+    run_one "cxl" $N oram_sim_cxl.py "--local-pct=0"
+done
 echo ""
 
 # Merge per-run CSVs into results.csv
