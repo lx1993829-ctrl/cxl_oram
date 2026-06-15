@@ -584,6 +584,43 @@ int main(int argc, char **argv) {
     /* ================================================================
      * PASS 1: All Writes
      * ================================================================ */
+    /* ----------------------------------------------------------------
+     * SSD INIT: bulk-copy DDR_INIT bucket data from DDR5 to SSD.
+     *
+     * DDR_INIT writes encrypted buckets to DDR5.  The SSD has never
+     * been written, so NVMe Read would overwrite valid DDR5 data with
+     * zeros — corrupting eviction buckets and causing stash overflow.
+     *
+     * Sequential: one NVMe Write per bucket, drain CQE, next.
+     * num_slots=32768 → 8192 buckets × 32 KB = 256 MB total.
+     * At ~12 µs/write, ~100 ms simulated. Wall-clock: 15-30 min
+     * (gem5+Verilator overhead).
+     * ---------------------------------------------------------------- */
+    se_puts("|||ssd_init_start\n");
+    {
+        uint32_t num_buckets = (uint32_t)num_slots / 4;
+        for (uint32_t b = 0; b < num_buckets; b++) {
+            uint64_t slab = oram_host_base + (uint64_t)b * BUCKET_SIZE_BYTES;
+            uint64_t lba  = inst_lba_base  + (uint64_t)b * LBAS_PER_SLOT;
+
+            BUILD_PRP(prplist_wr, slab);
+            uint16_t cid = (uint16_t)(0xA000u | (b & 0x0FFFu));
+            submit_nvme_io(iosq, &io_sq_tail, sq_dbell,
+                           IO_OPC_WRITE, cid, slab,
+                           (uint64_t)(uintptr_t)prplist_wr,
+                           lba, LBAS_PER_SLOT - 1);
+            if (drain_cqes(iocq, &io_cq_head, &io_cq_phase, cq_dbell,
+                           cid, 0) < 0) {
+                se_eputs("|||FAIL ssd_init\n"); return 1;
+            }
+
+            if ((b % 100) == 0)
+                se_printf_uint("|||ssd_init_bucket", (uint64_t)b);
+        }
+        se_printf_uint("|||ssd_init_total_buckets", (uint64_t)num_buckets);
+    }
+    se_puts("|||ssd_init_done\n");
+
     se_puts("|||pass1_writes_start\n");
 
     COMPUTE_SLOT(rng, cur_slot, cur_client_id, cur_lease_id, cur_token,
