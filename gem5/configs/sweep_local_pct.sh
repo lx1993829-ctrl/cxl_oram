@@ -25,7 +25,7 @@ OPS=100000            # total ops: 50k writes + 50k reads
 N=1
 OUTDIR=m5out/local_pct_sweep
 RESULTS=$OUTDIR/results.csv
-MAX_JOBS=4
+MAX_JOBS=1
 
 mkdir -p $OUTDIR
 
@@ -59,14 +59,15 @@ run_pct() {
     echo "=== DONE  $TAG → $VALS ==="
 }
 
-echo "=== Launching sweep (MAX_JOBS=$MAX_JOBS) ==="
+echo "=== PCIe sweep ==="
 for PCT in 0 10 20 30 40 50 60 70 80 90 100; do
-    run_pct "pcie" $PCT oram_sim_pcie.py "--local-mem=hbm2" &
-    run_pct "cxl"  $PCT oram_sim_cxl.py  "" &
-
-    while [ $(jobs -r | wc -l) -ge $MAX_JOBS ]; do sleep 10; done
+    run_pct "pcie" $PCT oram_sim_pcie.py "--local-mem=hbm2"
 done
-wait
+
+echo "=== CXL sweep ==="
+for PCT in 0 10 20 30 40 50 60 70 80 90 100; do
+    run_pct "cxl"  $PCT oram_sim_cxl.py  ""
+done
 echo ""
 
 # Merge per-run CSVs into results.csv
