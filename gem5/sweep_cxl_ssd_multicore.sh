@@ -47,7 +47,7 @@ for N in 1 2 3 4; do
     N_SSD_CFG="${SSD_CFG}.n${N}"
     cp "$SSD_CFG_BAK" "$N_SSD_CFG"
 
-    CACHE=$((8388608 * N))
+    CACHE=$((262144 * N))
     FILL=$(python3 -c "highest=($N-1)*32768+16384; print(f'{highest/$TOTAL_NAND_PAGES:.5f}')")
     LOGFILE="${OUTDIR}/n${N}_ssd_${NUM_OPS}op.log"
 
