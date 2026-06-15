@@ -16,7 +16,7 @@ BINARY="configs/oram_nvme_test"
 CONFIG="configs/oram_ssd.py"
 SSD_CFG="src/mem/ssd/simplessd/config/sample.cfg"
 SSD_CFG_BAK="${SSD_CFG}.sweep_bak"
-NUM_OPS=100            # total ORAM ops per instance (50000 writes + 50000 reads)
+NUM_OPS=100000            # total ORAM ops per instance (50000 writes + 50000 reads)
 NUM_SLOTS=32768
 OUTDIR="m5out"
 NVME_BAR0="0xf0000000"
@@ -41,7 +41,7 @@ echo ""
 
 for N in 1 2 3 4; do
     # ---- Compute per-N SimpleSSD parameters ----
-    CACHE=$((8388608 * N))
+    CACHE=$((262144 * N))
     FILL=$(python3 -c "highest=($N-1)*32768+16384; print(f'{highest/$TOTAL_NAND_PAGES:.5f}')")
     LOGFILE="${OUTDIR}/n${N}_nvme_${NUM_OPS}op.log"
 
@@ -51,20 +51,10 @@ for N in 1 2 3 4; do
     # ---- Patch sample.cfg ----
     cp "$SSD_CFG_BAK" "$SSD_CFG"
 
-    # FIX 1: EnableMultiPlaneOperation = 0
-    # Same root cause as CXL SSD: ioUnitInPage mismatch causes
-    # 75% of reads to skip PAL with zero NAND latency.
     sed -i "s/^EnableMultiPlaneOperation = .*/EnableMultiPlaneOperation = 0/" "$SSD_CFG"
-
-    # FIX 2: Scale CacheSize with N (8 MB per instance)
     sed -i "s/^CacheSize = .*/CacheSize = $CACHE/" "$SSD_CFG"
-
-    # FIX 3: Scale FillRatio with N
-    # Instance i's bucket data starts at page i × 32768.
-    # Highest accessed page = (N-1) × 32768 + 16384.
     sed -i "s/^FillRatio = .*/FillRatio = $FILL/" "$SSD_CFG"
 
-    # Verify config
     echo "  Config:"
     grep -E 'CacheSize|FillRatio|EnableMultiPlane' "$SSD_CFG" | sed 's/^/    /'
 
@@ -94,7 +84,6 @@ for N in 1 2 3 4; do
     grep 'STEADY-STATE' "$LOGFILE" | sed 's/^.*info: /    /'
 
     # ---- NVMe E2E throughput ----
-    # Total wall-clock time / total ops across all instances
     python3 -c "
 import re
 
@@ -102,7 +91,6 @@ first_all = float('inf')
 last_all = 0
 
 for Q in range(1, $N+1):
-    # Extract doorbells for queue Q
     with open('$LOGFILE', errors='ignore') as f:
         ticks = []
         for line in f:
@@ -113,7 +101,6 @@ for Q in range(1, $N+1):
                 m = re.match(r'(\d+):', line)
                 if m: ticks.append(int(m.group(1)))
 
-    # Skip smoke test (first 4 doorbells)
     t = ticks[4:]
     if len(t) >= 2:
         if t[0] < first_all: first_all = t[0]
@@ -122,7 +109,7 @@ for Q in range(1, $N+1):
 total_us = (last_all - first_all) / 1e6
 total_ops = $N * $NUM_OPS
 avg_us = total_us / total_ops
-avg_cyc = avg_us * 300  # 300 MHz → cycles
+avg_cyc = avg_us * 300
 
 print(f'  NVMe E2E:')
 print(f'    Total wall-clock: {total_us:.0f} us')
