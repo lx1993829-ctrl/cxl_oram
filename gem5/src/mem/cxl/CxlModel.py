@@ -112,21 +112,11 @@ class CxlModel(ClockedObject):
         "Separate from read maxOutstanding because posted writes "
         "don't consume tags. 128 = typical CXL controller FIFO.")
     flit_credits = Param.UInt32(128,
-        "FLIT credits granted by host RC per device-side port. Each "
-        "upstream FLIT consumes one credit, returned after "
-        "flit_credit_return_delay. NOTE: the implementation in "
-        "cxl_model.cc allocates ONE pool of this size per device-side "
-        "port (see flitCredits.assign(devicePorts.size(), p.flit_credits) "
-        "near construction). At N device-side ports the total credit "
-        "budget is therefore N * flit_credits. This deviates from real "
-        "CXL hardware (one pool per virtual channel) but matches the "
-        "PCIe model's per-port credit accounting and prevents one "
-        "instance's credit exhaustion from blocking another. At N=16 "
-        "and default 128, the aggregate 2048 credits are over-"
-        "provisioned and credits are NOT the multi-instance "
-        "saturation bottleneck — the wire (upstreamBusyUntil), "
-        "core-clock gate, and shared RC pipeline are. 0 = disable "
-        "credit flow control entirely.")
+        "FLIT credits granted by host RC (shared pool). All device-side "
+        "ports compete for one pool of this size, stored at flitCredits[0] "
+        "in cxl_model.cc. This matches PCIe model's shared credit pool "
+        "design — one physical CXL link has one credit budget. Natural "
+        "contention at high N. 0 = disable credit flow control entirely.")
     flit_credit_return_delay = Param.Latency('20ns',
         "Time for FLIT credit to return from host RC. Credits piggyback "
         "on downstream FLITs, not a separate round-trip. Similar to "

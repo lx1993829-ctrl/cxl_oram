@@ -1,9 +1,12 @@
 /*
  * cxl_model.cc — FLIT-level pipelined CXL.mem model for gem5 v25.1
  *
- * Simplified from PCIeModel: no TLP headers, no credit flow control,
- * no DLLP ACK, no bridge pipeline. Uses CXL FLIT framing with
- * minimal header overhead.
+ * FLIT-based framing with credit flow control:
+ *   - CXL.mem fixed 256B FLITs (no TLP headers, no DLLP ACK)
+ *   - Endpoint + root port pipeline (replaces PCIe bridge pipeline)
+ *   - Same Gen5 x16 physical layer as PCIe (shared PHY)
+ *   - FLIT-level credit flow control (shared pool)
+ *   - Burst-window RC optimization (same as PCIe model)
  */
 
 #include "mem/cxl/cxl_model.hh"
@@ -59,6 +62,12 @@ CxlModel::CxlModel(const Params &p)
       flitCreditEvent([this]{ processFlitCreditReturn(); }, name()),
       // .hh:394 — Host send event
       hostSendEvent([this]{ trySendToHost(); }, name()),
+      // .hh — Periodic diagnostic event
+      diagEvent([this]{
+          dumpCxlState("periodic");
+          checkPortStalls();
+          schedule(diagEvent, curTick() + 10000000);
+      }, name()),
       // .hh:414 — Stats
       stats(*this)
 {
@@ -95,13 +104,16 @@ CxlModel::CxlModel(const Params &p)
     // Pools are full per port (NOT split) — realistic for separate
     // AXI masters with their own controller channels.
     outstandingWrites.resize(devicePorts.size(), 0);
-    // FLIT credits: shared pool. All ports compete for one link budget
-    // (stored at index 0). Natural contention at high N.
+    // FLIT credits: SHARED pool. All ports compete for one link-level
+    // credit budget stored at flitCredits[0] / flitCreditsMax[0].
+    // flitCredits[1..N-1] are unused (zero). This models real CXL where
+    // the RC advertises one credit set per VC, shared by all functions.
+    // Matches PCIe model's credits[0] shared-pool convention.
     unsigned N = devicePorts.size();
     flitCreditsMax.assign(devicePorts.size(), 0);
     flitCredits.assign(devicePorts.size(), 0);
-    flitCreditsMax[0] = p.flit_credits;
-    flitCredits[0] = p.flit_credits;
+    flitCreditsMax[0] = p.flit_credits;  // shared pool at index 0
+    flitCredits[0] = p.flit_credits;     // shared pool at index 0
     deferredFlitCredits.resize(devicePorts.size());
     upstreamQueue.resize(devicePorts.size());
     downstreamQueue.resize(devicePorts.size());
@@ -226,6 +238,9 @@ void CxlModel::init()
     for (auto *hp : hostPorts)
         if (!hp->isConnected())
             fatal("CxlModel %s: host_side_port not connected\n", name());
+
+    // Schedule periodic diagnostic (matches PCIe's diagEvent pattern)
+    schedule(diagEvent, 10000000);  // first dump at 10M ticks
 }
 
 Port &CxlModel::getPort(const std::string &if_name, PortID idx)
@@ -344,7 +359,7 @@ void CxlModel::enqueueUpstream(FlitEntry &flit)
     // pipeline (they can overlap for different FLITs), but the
     // overall rate is capped by whichever is slower.
     Tick corePeriodPs = (cxlCoreClock > 0) ? cxlCoreClock : 2000;
-    Tick asmDelay = (flit.wireBytes * corePeriodPs) / 64;
+    Tick asmDelay = (flit.wireBytes * corePeriodPs + 63) / 64;  // ceiling
     Tick serDelay = serializationDelay(flit.wireBytes);
     Tick linkDelay = std::max(asmDelay, serDelay);
 
@@ -433,19 +448,10 @@ void CxlModel::enqueueDownstream(FlitEntry &flit, Tick earliestStart)
 }
 
 // ====================================================================
-//  Burst-Window RC Helper
+//  Burst-Window RC Helper — REMOVED (dead code)
+//  Both upstream and downstream paths compute RC delay inline using
+//  rcUpstreamBusyUntil / rcDownstreamBusyUntil serialization.
 // ====================================================================
-
-Tick CxlModel::computeRcDelay(Tick &lastRcTick)
-{
-    Tick now = curTick();
-    Tick gap = now - lastRcTick;
-    Tick delay = (gap <= burstWindowTicks) ? 0 : rcLatency;
-    lastRcTick = now;
-    DPRINTF(CXL, "  RC-window: gap=%llu delay=%llu @%llu\n",
-            gap, delay, now);
-    return delay;
-}
 
 // ====================================================================
 //  Port Implementations
@@ -892,12 +898,13 @@ CxlModel::drainDeviceRequests()
                            now >= lastReadBufferTicks[p] + COALESCE_TIMEOUT;
             if (rdReady) {
                 while (!rdBuf.empty()) {
-                    auto &req = rdBuf.front();
-                    if (!processBufferedRead(req.pkt, req.srcPort)) break;
+                    PacketPtr frontPkt = rdBuf.front().pkt;
+                    int frontSrcPort = rdBuf.front().srcPort;
+                    if (!processBufferedRead(frontPkt, frontSrcPort)) break;
                     rdBuf.pop_front();
                     // Phase B diagnostic: track per-port progress.
-                    if (req.srcPort < (int)perPortLastDrainTick.size())
-                        perPortLastDrainTick[req.srcPort] = now;
+                    if (frontSrcPort < (int)perPortLastDrainTick.size())
+                        perPortLastDrainTick[frontSrcPort] = now;
                 }
             } else {
                 // Phase B diagnostic: rdBuf has work but is not ready
@@ -936,12 +943,13 @@ CxlModel::drainDeviceRequests()
                            now >= lastWriteBufferTicks[p] + COALESCE_TIMEOUT;
             if (wrReady) {
                 while (!wrBuf.empty()) {
-                    auto &req = wrBuf.front();
-                    if (!processBufferedWrite(req.pkt, req.srcPort)) break;
+                    PacketPtr frontPkt = wrBuf.front().pkt;
+                    int frontSrcPort = wrBuf.front().srcPort;
+                    if (!processBufferedWrite(frontPkt, frontSrcPort)) break;
                     wrBuf.pop_front();
                     // Phase B diagnostic: track per-port progress.
-                    if (req.srcPort < (int)perPortLastDrainTick.size())
-                        perPortLastDrainTick[req.srcPort] = now;
+                    if (frontSrcPort < (int)perPortLastDrainTick.size())
+                        perPortLastDrainTick[frontSrcPort] = now;
                 }
             } else {
                 DPRINTF(CXL, "  [DRAIN-WAIT-WR] port=%u wrBuf=%lu beat=%u "
@@ -1405,7 +1413,7 @@ bool CxlModel::handleHostResponse(PacketPtr pkt)
         rcEnd = rcStart + rcThroughputDelay;
     }
     rcDownstreamBusyUntil = rcEnd;
-    lastDownstreamRcTick = now;
+    // lastDownstreamRcTick removed — was written but never read
 
     // Stage 2: Shared Gen5 wire serialization.
     Tick wireSerDelay = serializationDelay(cplFlit.wireBytes);

@@ -108,9 +108,9 @@ class CxlModel : public ClockedObject
     Tick rcDownstreamBusyUntil;  // Shared RC pipeline throughput (downstream)
     Tick rcUpstreamBusyUntil;    // Shared RC pipeline throughput (upstream)
 
-    // Burst-window RC helper — returns 0 if RC was recently traversed,
-    // rcLatency otherwise. Updates the lastTick tracker.
-    Tick computeRcDelay(Tick &lastRcTick);
+    // computeRcDelay removed — was dead code (never called). Both
+    // upstream and downstream paths compute RC delay inline using
+    // rcUpstreamBusyUntil / rcDownstreamBusyUntil.
 
     // ================================================================
     //  FLIT Type
@@ -296,8 +296,8 @@ class CxlModel : public ClockedObject
     // ================================================================
     //  Burst-Window RC Optimization (same as PCIe)
     // ================================================================
-    Tick lastUpstreamRcTick;
-    Tick lastDownstreamRcTick;
+    Tick lastUpstreamRcTick;    // DEAD — kept for ABI compat, never read
+    Tick lastDownstreamRcTick;  // DEAD — kept for ABI compat, never read
     Tick burstWindowTicks;
 
     // ================================================================
@@ -488,6 +488,12 @@ class CxlModel : public ClockedObject
     // processDownstreamQueue and on demand (stuck, anomaly). The
     // trigger string is logged so you can filter the cause.
     void dumpCxlState(const char *trigger);
+
+    // Periodic diagnostic event — fires every 10M ticks regardless of
+    // traffic, matching PCIe's diagEvent. Catches deadlocks that occur
+    // before any downstream FLITs arrive (where the existing
+    // processDownstreamQueue-based dump would never fire).
+    EventFunctionWrapper diagEvent;
 
     // Invariant checks (DPRINTF-gated so production overhead is zero
     // when CXL debug flag is disabled).
