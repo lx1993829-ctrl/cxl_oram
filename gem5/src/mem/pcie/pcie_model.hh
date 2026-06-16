@@ -288,7 +288,6 @@ class PCIeModel : public ClockedObject
     Tick downstreamBusyUntil;
 
     Tick serializationDelay(unsigned wireBytes) const;
-    Tick tlpLinkDelay(const TlpPacket &tlp) const; // max(assembly, serialization) + ack
     void enqueueUpstream(TlpPacket &tlp);
     void enqueueDownstream(TlpPacket &tlp, Tick earliestStart = 0);
 
@@ -392,8 +391,8 @@ class PCIeModel : public ClockedObject
     //  last traversed. Packets arriving in the same burst window
     //  (same tick or within one ORAM cycle) share one RC traversal.
     // ================================================================
-    Tick lastUpstreamRcTick;    // last time RC outbound was charged
-    Tick lastDownstreamRcTick;  // last time RC return was charged
+    Tick lastUpstreamRcTick;    // DEAD — kept for ABI compat, never read
+    Tick lastDownstreamRcTick;  // DEAD — kept for ABI compat, never read
     Tick burstWindowTicks;      // packets within this window share RC
 
     // ================================================================
@@ -508,6 +507,7 @@ class PCIeModel : public ClockedObject
         statistics::Scalar totalPaddingBytes;
         statistics::Scalar readRequests, writeRequests;
         statistics::Scalar tagExhausted, creditStalls;
+        statistics::Scalar creditOvercommits;
         statistics::Scalar assemblyBottleneckTLPs;
         statistics::Scalar completionsBuffered;
         statistics::Histogram readLatencyHist, writeLatencyHist;

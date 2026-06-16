@@ -166,10 +166,13 @@ PCIeModel::PCIeModel(const Params &p)
         freeTags.push_back(t);
 
     // Phase A.1: SHARED credit pool. All device ports compete for one
-    // link-level credit budget (stored in credits[0]). This models real
-    // PCIe where the RC advertises one credit set per VC, shared by all
-    // functions on the link. Credits consumed by port A reduce the pool
-    // for all other ports — natural contention at high N.
+    // link-level credit budget stored in credits[0]. credits[1..N-1]
+    // are allocated but unused (zero). This models real PCIe where the
+    // RC advertises one credit set per VC, shared by all functions on
+    // the link. Credits consumed by port A reduce the pool for all
+    // other ports — natural contention at high N.
+    // NOTE: the `sp` parameter on credit helper functions is used only
+    // for bounds-checking, NOT for indexing. All accesses go to credits[0].
     credits[0].phMax   = p.credits_ph;
     credits[0].pdMax   = p.credits_pd;
     credits[0].nphMax  = p.credits_nph;
@@ -411,7 +414,10 @@ Tick PCIeModel::assemblyDelay(unsigned totalBytes) const
     // With TLP packing, the next TLP starts immediately after
     // the previous one — no wasted cycles on partial beats.
     // Throughput = pcieCoreWidthBytes × (1/pcieCorePeriod).
-    return (Tick)totalBytes * pcieCorePeriod / pcieCoreWidthBytes;
+    // Ceiling division: real hardware takes at minimum one full
+    // core cycle even for sub-width TLPs.
+    return ((Tick)totalBytes * pcieCorePeriod + pcieCoreWidthBytes - 1)
+           / pcieCoreWidthBytes;
 }
 
 void PCIeModel::buildTlpHeader(TlpPacket &tlp)
@@ -527,6 +533,8 @@ PCIeModel::buildMemWriteTlp(Addr addr, unsigned payloadBytes,
     tlp.requesterId = requesterId;
     tlp.completerId = 0;
     tlp.tag = 0;
+    assert((payloadBytes % 4) == 0 &&
+           "PCIe memory write payload must be DW-aligned (multiple of 4)");
     tlp.length = payloadBytes / 4;
     tlp.addr = addr;
     tlp.byteCount = 0;
@@ -823,20 +831,8 @@ void PCIeModel::releaseTag(uint16_t tag)
 Tick PCIeModel::serializationDelay(unsigned wireBytes) const
 { return (Tick)wireBytes * linkParams.byteSerializationDelay; }
 
-Tick PCIeModel::tlpLinkDelay(const TlpPacket &tlp) const
-{
-    Tick asmDelay = assemblyDelay(tlp.totalBytes);
-    Tick serDelay = serializationDelay(tlp.wireBytes);
-    // The bottleneck is whichever is slower.
-    Tick perTlpDelay = std::max(asmDelay, serDelay);
-    // PCIe Data Link Layer: each TLP requires an ACK DLLP from the
-    // receiver. ACK DLLPs (8 bytes) share the link and consume
-    // bandwidth. The sender pipelines TLPs without waiting for ACKs,
-    // but the ACK traffic reduces effective link throughput. Model
-    // this as amortized per-TLP overhead. CXL has no DLLP layer.
-    perTlpDelay += dllpAckDelay;
-    return perTlpDelay;
-}
+// tlpLinkDelay removed — was dead code (never called). Upstream
+// and downstream paths compute max(assembly, serialization) inline.
 
 void PCIeModel::enqueueUpstream(TlpPacket &tlp)
 {
@@ -1292,6 +1288,9 @@ PCIeModel::processBufferedRead(PacketPtr pkt, int srcPort)
         auto &entry = portBuf[idx];
         if (entry.pkt->getAddr() == nextAddr &&
             entry.pkt->getSize() == beatSize) {
+            // PCIe spec §2.2.7: a single TLP must not cross a 4K boundary.
+            if (((pkt->getAddr()) >> 12) != ((nextAddr + beatSize - 1) >> 12))
+                break;
             group.push_back(entry.pkt);
             nextAddr += beatSize;
             scanCount = idx;  // inclusive end
@@ -1388,6 +1387,9 @@ PCIeModel::processBufferedWrite(PacketPtr pkt, int srcPort)
         auto &entry = portBuf[idx];
         if (entry.pkt->getAddr() == nextAddr &&
             entry.pkt->getSize() == beatSize) {
+            // PCIe spec §2.2.7: a single TLP must not cross a 4K boundary.
+            if (((pkt->getAddr()) >> 12) != ((nextAddr + beatSize - 1) >> 12))
+                break;
             group.push_back(entry.pkt);
             nextAddr += beatSize;
             scanCount = idx;
@@ -1488,11 +1490,12 @@ PCIeModel::drainDeviceRequests()
                            now >= lastReadBufferTicks[p] + COALESCE_TIMEOUT;
             if (rdReady) {
                 while (!rdBuf.empty()) {
-                    auto &req = rdBuf.front();
-                    if (!processBufferedRead(req.pkt, req.srcPort)) break;
+                    PacketPtr frontPkt = rdBuf.front().pkt;
+                    int frontSrcPort = rdBuf.front().srcPort;
+                    if (!processBufferedRead(frontPkt, frontSrcPort)) break;
                     rdBuf.pop_front();
-                    if (req.srcPort < (int)perPortLastDrainTick.size())
-                        perPortLastDrainTick[req.srcPort] = now;
+                    if (frontSrcPort < (int)perPortLastDrainTick.size())
+                        perPortLastDrainTick[frontSrcPort] = now;
                 }
             } else {
                 DPRINTF(PCIe, "  [DRAIN-WAIT-RD] port=%u rdBuf=%lu beat=%u "
@@ -1527,11 +1530,12 @@ PCIeModel::drainDeviceRequests()
                            now >= lastWriteBufferTicks[p] + COALESCE_TIMEOUT;
             if (wrReady) {
                 while (!wrBuf.empty()) {
-                    auto &req = wrBuf.front();
-                    if (!processBufferedWrite(req.pkt, req.srcPort)) break;
+                    PacketPtr frontPkt = wrBuf.front().pkt;
+                    int frontSrcPort = wrBuf.front().srcPort;
+                    if (!processBufferedWrite(frontPkt, frontSrcPort)) break;
                     wrBuf.pop_front();
-                    if (req.srcPort < (int)perPortLastDrainTick.size())
-                        perPortLastDrainTick[req.srcPort] = now;
+                    if (frontSrcPort < (int)perPortLastDrainTick.size())
+                        perPortLastDrainTick[frontSrcPort] = now;
                 }
             } else {
                 DPRINTF(PCIe, "  [DRAIN-WAIT-WR] port=%u wrBuf=%lu beat=%u "
@@ -2053,6 +2057,7 @@ bool PCIeModel::handleHostResponse(PacketPtr pkt)
                 credits[0].cpldCredits, totalCpld,
                 curTick());
         stats.creditStalls++;
+        stats.creditOvercommits++;
         // Don't drain credits below floor — let the return path
         // catch up naturally.
     }
@@ -2113,7 +2118,7 @@ bool PCIeModel::handleHostResponse(PacketPtr pkt)
         rcEnd = rcStart + rcThroughputDelay;
     }
     rcDownstreamBusyUntil = rcEnd;
-    lastDownstreamRcTick = now;
+    // lastDownstreamRcTick removed — was written but never read
 
     {
         // Bug 5 fix: now a member variable
@@ -2493,6 +2498,8 @@ PCIeModel::PCIeStats::PCIeStats(PCIeModel &owner)
                "Tag exhaustion stalls"),
       ADD_STAT(creditStalls, statistics::units::Count::get(),
                "Credit exhaustion stalls"),
+      ADD_STAT(creditOvercommits, statistics::units::Count::get(),
+               "Completion credit overcommits (CplH/CplD went negative)"),
       ADD_STAT(assemblyBottleneckTLPs, statistics::units::Count::get(),
                "TLPs where assembly was slower than serialization"),
       ADD_STAT(completionsBuffered, statistics::units::Count::get(),
