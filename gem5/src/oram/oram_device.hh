@@ -7,6 +7,7 @@
 #include <random>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "mem/port.hh"
@@ -391,6 +392,16 @@ class OramDevice : public ClockedObject
     struct BResp { uint8_t id; bool isHbm; bool isStash; };
     std::deque<BResp> bQueue;
 
+    // Per-instance BRESP posmap tracking (parallel to bQueue).
+    // bQueueIsPosmap[i] tracks whether bQueue[i] is a posmap BRESP.
+    // posmapWriteSeqs tracks which PendingWriteBurst seqs are posmap RMW writes.
+    std::deque<bool> bQueueIsPosmap;
+    std::unordered_set<size_t> posmapWriteSeqs;
+
+    // driveAxiB: index of the bQueue entry currently presented on B channel.
+    // -1 = none presented. Set by scan, consumed on next bready handshake.
+    int bQueuePresentIdx = -1;
+
     // HT SLOT write-forwarding shadow. The single-beat HT write commits to the
     // HBM backing store with BRESP-to-data latency; a lookup issued in a later
     // op can read the SLOT address before the prior write has functionally
@@ -590,6 +601,12 @@ class OramDevice : public ClockedObject
     // Per-phase cycle counters (accumulated across all ops)
     // FSM states from flat_oram_gcm.v
     static constexpr int NUM_FSM_STATES = 31;
+    // Named FSM state constants — must match flat_oram_gcm.v encoding
+    static constexpr uint8_t FSM_S_IDLE       = 0;
+    static constexpr uint8_t FSM_DDR_READ     = 2;
+    static constexpr uint8_t FSM_DDR_WRITE    = 19;
+    static constexpr uint8_t FSM_ST_LOAD      = 28;
+    static constexpr uint8_t FSM_ST_FLUSH     = 29;
     uint64_t phaseCycles[NUM_FSM_STATES];
     uint64_t opPhaseCycles[NUM_FSM_STATES]; // per-op accumulator
     uint8_t  prevFsmState;

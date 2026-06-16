@@ -79,7 +79,7 @@ class OramDevice(ClockedObject):
         "Base physical address of the result buffer in host DDR5. "
         "One 64B cache line per op: {token, lease_id, op_idx, rdata[0..7]}.")
 
-    result_buf_size = Param.UInt64(0x100000,
+    result_buf_size = Param.UInt64(0x1000000,
         "Size of the result buffer in bytes. Must be >= max_ops * 64. "
         "Default 1 MiB (0x100000) = 16384 entries — comfortable headroom "
         "for 10K ops.")
