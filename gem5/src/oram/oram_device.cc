@@ -211,6 +211,7 @@ OramDevice::OramDevice(const OramDeviceParams &p)
              "OramDevice: instanceId=%u >= 64. Increase static debug "
              "array sizes in oram_device.cc", instanceId);
     oramClkPeriod = p.oram_freq;
+    hbmCdcLatency = p.hbm_cdc_latency;
     wStallCount = 0;
     noProgressCount = 0;
 
@@ -588,7 +589,10 @@ void OramDevice::tick()
     if (!pendingReadBursts.empty()) {
         auto &rb = pendingReadBursts.front();
         // Count how many contiguous beats are ready in reorder buf
-        for (int i = rb.flushedBeats; i < rb.totalBeats && rb.beatRecvd[i]; i++)
+        // (including CDC delay for HBM beats)
+        Tick now = curTick();
+        for (int i = rb.flushedBeats; i < rb.totalBeats &&
+             rb.beatRecvd[i] && now >= rb.beatReadyTick[i]; i++)
             reorderReady++;
     }
 
@@ -869,7 +873,7 @@ void OramDevice::tick()
         }
 
         size_t seq = nextBurstSeq++;
-        pendingReadBursts.emplace_back(s_arid, numBeats, seq);
+        pendingReadBursts.emplace_back(s_arid, numBeats, seq, pcie);
         
         // Data round-trip tracker: log read burst address
         Addr gem5ArAddr = pcie ? (hostBase + s_araddr) : (hbmBase + s_araddr);
@@ -2383,7 +2387,8 @@ void OramDevice::drainPendingSends()
             PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
             pkt->allocate();
             auto *ss = new AxiSenderState(it->axiId, it->beatIdx,
-                                           it->totalBeats, false, it->seq);
+                                           it->totalBeats, false, it->seq,
+                                           false);  // coalesced HBM read
             ss->secondBeatIdx = next->beatIdx;
             ss->secondBurstSeq = next->seq;
             pkt->pushSenderState(ss);
@@ -2406,7 +2411,7 @@ void OramDevice::drainPendingSends()
             pkt->allocate();
             pkt->pushSenderState(new AxiSenderState(it->axiId, it->beatIdx,
                                                      it->totalBeats, false,
-                                                     it->seq));
+                                                     it->seq, isPcie));
             it = pendingReadSends.erase(it);
 
             if (sendPkt(pkt, isPcie)) {
@@ -2512,7 +2517,8 @@ void OramDevice::handleMemResp(PacketPtr pkt)
 
         // Helper lambda to deliver one beat to pendingReadBursts
         auto deliverBeat = [&](size_t seq, int beatIdx,
-                               const uint8_t *data, unsigned dataOff) {
+                               const uint8_t *data, unsigned dataOff,
+                               bool isPcieResp) {
             for (auto &rb : pendingReadBursts) {
                 if (rb.seq == seq) {
                     assert(beatIdx < rb.totalBeats);
@@ -2534,6 +2540,10 @@ void OramDevice::handleMemResp(PacketPtr pkt)
                     beat.id = ss->axiId;
                     beat.last = (beatIdx == rb.totalBeats - 1);
                     rb.beatRecvd[beatIdx] = true;
+                    // HBM CDC: PCIe/CXL responses already include CDC
+                    // in the fabric model; HBM responses need it here.
+                    rb.beatReadyTick[beatIdx] = curTick() +
+                        (isPcieResp ? 0 : hbmCdcLatency);
                     rb.beatsRecv++;
                     return true;
                 }
@@ -2652,7 +2662,8 @@ void OramDevice::handleMemResp(PacketPtr pkt)
 
         // First beat (always present)
         bool found = deliverBeat(ss->burstSeq, ss->beatIdx,
-                                  pkt->getConstPtr<uint8_t>(), 0);
+                                  pkt->getConstPtr<uint8_t>(), 0,
+                                  ss->isPcie);
 
         // Debug: cross-check HT region reads with functional path
         {
@@ -2695,7 +2706,8 @@ void OramDevice::handleMemResp(PacketPtr pkt)
         if (ss->secondBeatIdx >= 0) {
             rdDbg.memResps++;  // count as two responses
             bool found2 = deliverBeat(ss->secondBurstSeq, ss->secondBeatIdx,
-                                       pkt->getConstPtr<uint8_t>(), 32);
+                                       pkt->getConstPtr<uint8_t>(), 32,
+                                       ss->isPcie);
             found = found || found2;
         }
 
@@ -2809,7 +2821,8 @@ void OramDevice::flushCompletedReads()
     if (!pendingReadBursts.empty()) {
         auto &rb = pendingReadBursts.front();
         if (rb.flushedBeats < rb.totalBeats &&
-            rb.beatRecvd[rb.flushedBeats]) {
+            rb.beatRecvd[rb.flushedBeats] &&
+            curTick() >= rb.beatReadyTick[rb.flushedBeats]) {
             RBeat beat = rb.beats[rb.flushedBeats];
             beat.isSingle = (rb.totalBeats == 1);
             // Diagnostic: detect two single-beat HT read beats coexisting in

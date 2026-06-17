@@ -33,6 +33,17 @@ class OramDevice(ClockedObject):
     num_slots = Param.UInt32(32, "ORAM slots (max 32768)")
     num_ops = Param.UInt32(100, "Test operations to run")
 
+    hbm_cdc_latency = Param.Latency('0ns',
+        "HBM AXI clock domain crossing latency applied per read response. "
+        "On real Alveo U55C, the CDC between PL logic (300 MHz) and HBM "
+        "controllers (450 MHz) is internal to the Xilinx HBM IP — the "
+        "user-facing AXI port is synchronous to the PL clock. The CDC "
+        "latency (~7ns = 2 PL cycles) should therefore be modeled in "
+        "the gem5 interconnect (NoncoherentXBar response_latency), not "
+        "here. Default 0 = disabled. Set to 7ns ONLY if your xbar "
+        "response_latency does not already account for HBM interface "
+        "pipeline stages.")
+
     aes_key_0 = Param.UInt32(0x01234567, "AES key word 0")
     aes_key_1 = Param.UInt32(0x89ABCDEF, "AES key word 1")
     aes_key_2 = Param.UInt32(0xFEDCBA98, "AES key word 2")
@@ -79,7 +90,7 @@ class OramDevice(ClockedObject):
         "Base physical address of the result buffer in host DDR5. "
         "One 64B cache line per op: {token, lease_id, op_idx, rdata[0..7]}.")
 
-    result_buf_size = Param.UInt64(0x1000000,
+    result_buf_size = Param.UInt64(0x100000,
         "Size of the result buffer in bytes. Must be >= max_ops * 64. "
         "Default 1 MiB (0x100000) = 16384 entries — comfortable headroom "
         "for 10K ops.")

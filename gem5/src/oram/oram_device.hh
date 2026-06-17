@@ -273,6 +273,7 @@ class OramDevice : public ClockedObject
     bool     lastCompletedRdataValid;
 
     Tick oramClkPeriod;
+    Tick hbmCdcLatency;   // HBM AXI CDC delay (0 = disabled)
     uint64_t oramCycle;
     EventFunctionWrapper tickEvent;
     void tick();
@@ -338,12 +339,14 @@ class OramDevice : public ClockedObject
         uint8_t axiId;
         int beatIdx, totalBeats;
         bool isWrite;
+        bool isPcie;
         size_t burstSeq;
         int secondBeatIdx = -1;  // >=0 when two 32B reads coalesced into 64B
         size_t secondBurstSeq = 0;
-        AxiSenderState(uint8_t id, int idx, int total, bool wr, size_t seq)
+        AxiSenderState(uint8_t id, int idx, int total, bool wr, size_t seq,
+                        bool pcie = false)
             : axiId(id), beatIdx(idx), totalBeats(total),
-              isWrite(wr), burstSeq(seq) {}
+              isWrite(wr), isPcie(pcie), burstSeq(seq) {}
     };
 
     // pos_map read-modify-write: tagged on the RMW read so handleMemResp
@@ -373,10 +376,13 @@ class OramDevice : public ClockedObject
 
     struct ReadBurstReasm {
         uint8_t axiId; int totalBeats, beatsRecv, flushedBeats; size_t seq;
+        bool isPcie;
         std::vector<RBeat> beats; std::vector<bool> beatRecvd;
-        ReadBurstReasm(uint8_t id, int total, size_t s)
+        std::vector<Tick> beatReadyTick;
+        ReadBurstReasm(uint8_t id, int total, size_t s, bool pcie = false)
             : axiId(id), totalBeats(total), beatsRecv(0), flushedBeats(0), seq(s),
-              beats(total), beatRecvd(total, false) {}
+              isPcie(pcie),
+              beats(total), beatRecvd(total, false), beatReadyTick(total, 0) {}
     };
     std::deque<ReadBurstReasm> pendingReadBursts;
     size_t nextBurstSeq;
