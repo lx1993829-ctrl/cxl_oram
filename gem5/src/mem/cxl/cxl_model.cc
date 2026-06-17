@@ -1422,8 +1422,12 @@ bool CxlModel::handleHostResponse(PacketPtr pkt)
     downstreamBusyUntil = wireEnd;
 
     // Stage 3: Per-port CDC endpoint — can't start until wire delivers.
-    const Tick cdcCycles = 2;
-    const Tick cdcThroughput = cdcCycles * fpgaClockPeriod;
+    // The CDC FIFO drains at the FPGA-side AXI rate: 32B per FPGA cycle.
+    // A 256B CplD FLIT occupies the CDC output for ceil(256/32)=8 cycles,
+    // not the previous flat 2 cycles. This is the binding throughput
+    // constraint between the CXL hard block and the FPGA fabric.
+    unsigned cdcDrainBeats = (combinedBytes + 31) / 32;
+    Tick cdcThroughput = cdcDrainBeats * fpgaClockPeriod;
     Tick startCdc = std::max(wireEnd, endpointBusyUntil[dstPort]);
     Tick doneCdc = startCdc + cdcThroughput;
     endpointBusyUntil[dstPort] = doneCdc;
