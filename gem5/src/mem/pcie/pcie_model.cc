@@ -2143,8 +2143,12 @@ bool PCIeModel::handleHostResponse(PacketPtr pkt)
     lastDownstreamEmit = wireStart;
 
     // Stage 3: Per-port CDC bridge — can't start until wire delivers.
-    const Tick cdcCycles = 2;
-    const Tick cdcThroughput = cdcCycles * fpgaClockPeriod;
+    // The CDC FIFO drains at the FPGA-side AXI rate: 32B per FPGA cycle.
+    // A 128B CplD occupies the CDC output port for ceil(128/32)=4 cycles,
+    // not the previous flat 2 cycles. This is the binding throughput
+    // constraint between the PCIe hard block and the FPGA fabric.
+    unsigned cdcDrainBeats = (combinedSize + 31) / 32;
+    Tick cdcThroughput = cdcDrainBeats * fpgaClockPeriod;
     Tick startCdc = std::max(wireEnd, bridgeBusyUntil[port]);
     Tick doneCdc = startCdc + cdcThroughput;
     bridgeBusyUntil[port] = doneCdc;
