@@ -210,6 +210,7 @@ class PCIeModel : public ClockedObject
         unsigned totalBytes, completedBytes;
         unsigned pendingCplBytes = 0;
         unsigned emittedBytes = 0;
+        unsigned deliveredBeats = 0;  // Bug #1 fix: per-CplD streaming delivery index
         Tick issueTick;
         int srcPortIdx = 0;
     };
@@ -429,6 +430,8 @@ class PCIeModel : public ClockedObject
     // existing perPortReadsOut pattern so one port cannot consume
     // every write slot and starve others.
     std::vector<unsigned> outstandingWrites;
+    std::vector<unsigned> outstandingReadBeats;  // per-beat read tracking (mirrors outstandingWrites)
+    unsigned maxOutstandingReads;  // shared acceptance-time limit for reads
     std::vector<unsigned> perPortReadsOut;  // per-device-port outstanding reads
     bool pendingDeviceRetry;   // deferred retry after BRESP delivery
     unsigned nextRetryPort;    // round-robin index for fair retry
@@ -512,9 +515,10 @@ class PCIeModel : public ClockedObject
         statistics::Scalar completionsBuffered;
         statistics::Histogram readLatencyHist, writeLatencyHist;
         statistics::Histogram readCoalesceHist, writeCoalesceHist;
-        // Review fix #2: removed avgWriteLatency (was inflated by
-        // coalesce factor). avgReadLatency stays — correctly per-group.
-        statistics::Formula avgReadLatency;
+        // Review fix #2: removed avgReadLatency/avgWriteLatency Formulas.
+        // They divided per-beat latency sum by per-group counter,
+        // inflating averages by coalesce factor. Use histograms for
+        // accurate distribution info. Matches CXL model.
         statistics::Scalar totalReadLatency, totalWriteLatency;
     };
     PCIeStats stats;

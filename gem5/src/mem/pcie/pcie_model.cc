@@ -130,6 +130,8 @@ PCIeModel::PCIeModel(const Params &p)
     // AXI master has its own controller channel with the full credit
     // budget.
     outstandingWrites.resize(devicePorts.size(), 0);
+    outstandingReadBeats.resize(devicePorts.size(), 0);
+    maxOutstandingReads = p.max_outstanding_reads;
     upstreamQueue.resize(devicePorts.size());
     downstreamQueue.resize(devicePorts.size());
     pendingHostReqs.resize(devicePorts.size());
@@ -179,7 +181,6 @@ PCIeModel::PCIeModel(const Params &p)
     credits[0].npdMax  = p.credits_npd;
     credits[0].cplhMax = p.credits_cplh;
     credits[0].cpldMax = p.credits_cpld;
-    unsigned N = devicePorts.size();
     initCredits();
     // outstandingWrites resized to per-port vector above.
     pendingDeviceRetry = false;
@@ -199,11 +200,11 @@ PCIeModel::PCIeModel(const Params &p)
     inform("PCIe Phase A.1: %lu device port(s), %lu host port(s); "
            "per-port credits ph=%d pd=%d nph=%d cplh=%d cpld=%d; "
            "per-port rrb_depth=%u max_outstanding_writes=%u "
-           "max_outstanding_reads=%u; shared tag pool=%u",
+           "max_outstanding=%u max_outstanding_reads=%u; shared tag pool=%u",
            devicePorts.size(), hostPorts.size(),
            p.credits_ph, p.credits_pd, p.credits_nph,
            p.credits_cplh, p.credits_cpld,
-           rrbDepth, maxOutstandingWrites, maxOutstanding, maxTags);
+           rrbDepth, maxOutstandingWrites, maxOutstanding, maxOutstandingReads, maxTags);
 }
 
 void PCIeModel::init()
@@ -384,10 +385,31 @@ void PCIeModel::retryStarvedPorts()
 {
     unsigned n = devicePorts.size();
     if (n == 0) return;
+
+    // Admission pre-check (matches CXL pattern): compute global
+    // outstanding sums and only retry a port if at least one gate
+    // is open. Avoids wasted sendRetryReq → handleDeviceRequest →
+    // return false round-trips under read-beat saturation.
+    unsigned totalReadsOut = 0, totalWritesOut = 0, totalReadBeatsOut = 0;
+    for (unsigned j = 0; j < n; j++) {
+        totalReadsOut += perPortReadsOut[j];
+        totalWritesOut += outstandingWrites[j];
+        totalReadBeatsOut += outstandingReadBeats[j];
+    }
+
     for (unsigned i = 0; i < n; i++) {
         unsigned idx = (nextRetryPort + i) % n;
         auto *dp = devicePorts[idx];
         if (dp->needRetry) {
+            bool canRead = hasFreeTags() &&
+                           (maxOutstanding == 0 ||
+                            totalReadsOut < maxOutstanding) &&
+                           (maxOutstandingReads == 0 ||
+                            totalReadBeatsOut < maxOutstandingReads);
+            bool canWrite = (maxOutstandingWrites == 0 ||
+                             totalWritesOut < maxOutstandingWrites);
+            if (!canRead && !canWrite) continue;
+
             dp->needRetry = false;
             dp->sendRetryReq();
             nextRetryPort = (idx + 1) % n;
@@ -1023,34 +1045,75 @@ void PCIeModel::deliverCompletions(Tick now)
                 DeferredCredit::Completion,
                 dataCreditsNeeded(tlp.payloadBytes));
 
+            // Bug #1 fix: deliver THIS CplD's beats immediately (per-CplD
+            // streaming). Real AXI-PCIe bridges (Xilinx PG194) release each
+            // CplD's data to AXI R on arrival — the RRB reorders across
+            // tags, not within. Previously held all beats until the last
+            // CplD, delaying first data by (N-1) × inter-CplD spacing.
+            {
+                int srcPort = orec.srcPortIdx;
+                unsigned newBeats = tlp.payloadBytes / 32;
+                unsigned startBeat = orec.deliveredBeats;
+                for (unsigned i = startBeat;
+                     i < startBeat + newBeats && i < orec.allPkts.size();
+                     i++) {
+                    orec.allPkts[i]->makeResponse();
+                    responseQueue[srcPort].push_back(
+                        {orec.allPkts[i], srcPort, curTick()});
+                    orec.allPkts[i] = nullptr;  // prevent dangling access in handleHostResponse
+                }
+                orec.deliveredBeats += newBeats;
+
+                // Decrement read outstanding at completion delivery.
+                // Bridge buffer tracks requests until completion reaches
+                // AXI R — CXL's downstream advantage (half the CplDs)
+                // frees slots faster, showing as lower DDR_READ.
+                if ((unsigned)srcPort < outstandingReadBeats.size() &&
+                    outstandingReadBeats[srcPort] >= newBeats)
+                    outstandingReadBeats[srcPort] -= newBeats;
+                else if ((unsigned)srcPort < outstandingReadBeats.size())
+                    outstandingReadBeats[srcPort] = 0;
+                {
+                    unsigned totalRdBeats = 0;
+                    for (unsigned sp = 0; sp < outstandingReadBeats.size(); sp++)
+                        totalRdBeats += outstandingReadBeats[sp];
+                    if (maxOutstandingReads == 0 || totalRdBeats < maxOutstandingReads)
+                        pendingDeviceRetry = true;
+                }
+
+                // RRB: free entries per-CplD, not per-tag.
+                if (rrbDepth > 0 && rrbOccupied[srcPort] >= newBeats)
+                    rrbOccupied[srcPort] -= newBeats;
+                else if (rrbDepth > 0)
+                    rrbOccupied[srcPort] = 0;
+                DPRINTF(PCIe, "  [RRB-RETIRE] port=%d freed=%u beats, "
+                        "occ=%u/%u\n",
+                        srcPort, newBeats,
+                        rrbOccupied[srcPort], rrbDepth);
+
+                if (!responseEvent.scheduled())
+                    schedule(responseEvent, now);
+            }
+
+            // Tag completion: bookkeeping only — beats already delivered.
             if (orec.completedBytes >= orec.totalBytes) {
-                // PCIe Bug #8 fix: sample in ticks (matches declared unit Tick).
-                // Reads on PCIe retire per-group at the last-CplD arrival,
-                // so one sample per coalesced group is already correct
-                // (no per-beat inflation like CXL had).
                 Tick lat = now - orec.issueTick;
                 stats.totalReadLatency += lat;
                 stats.readLatencyHist.sample(lat);
 
-                // Save fields BEFORE erase — orec reference
-                // becomes dangling after outstandingReads.erase()
                 int srcPort = orec.srcPortIdx;
                 unsigned numCoalesced = orec.allPkts.size();
-                // Move allPkts out before erase
-                std::vector<PacketPtr> devPkts = std::move(orec.allPkts);
 
                 DPRINTF(PCIe, "  RD DONE tag=%u lat=%llu (%.1fns) beats=%u\n",
                         tag, lat, (double)lat / 1000.0, numCoalesced);
 
-                // One NPH credit per coalesced MRd TLP (always 1).
                 scheduleDeferredCreditReturn(
                     (unsigned)srcPort,
                     DeferredCredit::NonPosted, 0);
                 releaseTag(tag);
                 outstandingReads.erase(readIt);
-                perPortReadsOut[srcPort]--;  // one coalesced group done
+                perPortReadsOut[srcPort]--;
 
-                // Shared-pool: check global read budget.
                 unsigned totalReadsOut = 0;
                 for (auto v : perPortReadsOut) totalReadsOut += v;
                 if (hasFreeTags() &&
@@ -1065,28 +1128,6 @@ void PCIeModel::deliverCompletions(Tick now)
                     drainDeviceRequests();
 
                 if (tlp.origPkt) delete tlp.origPkt;
-
-                // Send individual responses for each coalesced read.
-                // Phase A.1: per-port responseQueue.
-                for (auto *devPkt : devPkts) {
-                    devPkt->makeResponse();
-                    responseQueue[srcPort].push_back(
-                        {devPkt, srcPort, curTick()});
-                }
-                // Review item #1: retirement frees RRB entries. Each beat
-                // now retired to AXI R channel releases one RRB slot.
-                // Phase A.1: per-port RRB occupancy.
-                unsigned freed = devPkts.size();
-                if (rrbDepth > 0 && rrbOccupied[srcPort] >= freed)
-                    rrbOccupied[srcPort] -= freed;
-                else
-                    rrbOccupied[srcPort] = 0;  // safety clamp
-                DPRINTF(PCIe, "  [RRB-RETIRE] port=%d freed=%u beats, "
-                        "occ=%u/%u\n",
-                        srcPort, freed, rrbOccupied[srcPort], rrbDepth);
-
-                if (!responseEvent.scheduled())
-                    schedule(responseEvent, now);
 
                 // Phase tracking
                 if (rdTracker.firstDnDone == 0) rdTracker.firstDnDone = now;
@@ -1165,9 +1206,20 @@ PCIeModel::handleDeviceRequest(PacketPtr pkt, int srcPort)
 
     // ---- Buffer depth check (models per-port bridge FIFO) ----
     if (pkt->isRead()) {
-        // Accept reads freely into buffer. The real limits are
-        // tags and credits, checked in processBufferedRead.
-        // Buffer rarely exceeds ~1024 entries (one ORAM op).
+        // Shared-pool: sum read beats across all ports for global limit.
+        // Mirrors write mechanism. Beats held from acceptance until
+        // DDR5 response — propagates DDR5 backend contention to RTL.
+        unsigned totalReadBeatsOut = 0;
+        for (unsigned j = 0; j < devicePorts.size(); j++)
+            totalReadBeatsOut += outstandingReadBeats[j];
+        if (maxOutstandingReads > 0 &&
+            totalReadBeatsOut >= maxOutstandingReads) {
+            DPRINTF(PCIe, "  RD BEAT LIMIT: port=%d outstanding[%d]=%u total=%u max=%u\n",
+                    srcPort, srcPort, outstandingReadBeats[srcPort],
+                    totalReadBeatsOut, maxOutstandingReads);
+            devicePorts[srcPort]->needRetry = true;
+            return false;
+        }
     } else if (pkt->isWrite()) {
         // Review fix #1: was summing deviceWriteBuffer.size() + outstandingWrites,
         // but outstandingWrites is incremented below (line ~861) on buffer
@@ -1191,6 +1243,7 @@ PCIeModel::handleDeviceRequest(PacketPtr pkt, int srcPort)
     // ---- Accept into internal buffer ----
     if (pkt->isRead()) {
         deviceReadBuffers[srcPort].push_back({pkt, srcPort});
+        outstandingReadBeats[srcPort]++;
         lastReadBufferTicks[srcPort] = curTick();
         // perPortReadsOut incremented in processBufferedRead
         // (per coalesced group, not per beat)
@@ -2142,13 +2195,11 @@ bool PCIeModel::handleHostResponse(PacketPtr pkt)
     downstreamBusyUntil = wireEnd;
     lastDownstreamEmit = wireStart;
 
-    // Stage 3: Per-port CDC bridge — can't start until wire delivers.
-    // The CDC FIFO drains at the FPGA-side AXI rate: 32B per FPGA cycle.
-    // A 128B CplD occupies the CDC output port for ceil(128/32)=4 cycles,
-    // not the previous flat 2 cycles. This is the binding throughput
-    // constraint between the PCIe hard block and the FPGA fabric.
-    unsigned cdcDrainBeats = (combinedSize + 31) / 32;
-    Tick cdcThroughput = cdcDrainBeats * fpgaClockPeriod;
+    // Stage 3: Per-port CDC bridge — shared FIFO → crossbar → per-port AXI.
+    // 2 FPGA cycles sync latency per CplD. Not a throughput bottleneck.
+    // Read contention modeled by outstandingReadBeats (matching writes).
+    const Tick cdcCycles = 2;
+    const Tick cdcThroughput = cdcCycles * fpgaClockPeriod;
     Tick startCdc = std::max(wireEnd, bridgeBusyUntil[port]);
     Tick doneCdc = startCdc + cdcThroughput;
     bridgeBusyUntil[port] = doneCdc;
@@ -2416,7 +2467,9 @@ void PCIeModel::trySendToHost()
         }
     }
     if (anyPending && !hostSendEvent.scheduled()) {
-        Tick next = std::max(curTick() + 1, nextEligible);
+        Tick base = (hostInjectInterval > 0)
+            ? curTick() + hostInjectInterval : curTick() + 1;
+        Tick next = std::max(base, nextEligible);
         schedule(hostSendEvent, next);
     }
 }
@@ -2516,15 +2569,8 @@ PCIeModel::PCIeStats::PCIeStats(PCIeModel &owner)
                "Read coalesce group size (beats per MRd TLP)"),
       ADD_STAT(writeCoalesceHist, statistics::units::Count::get(),
                "Write coalesce group size (beats per MWr TLP)"),
-      ADD_STAT(avgReadLatency, statistics::units::Tick::get(),
-               "Average read latency (per-group, correct)"),
-      // Review fix #2: REMOVED avgWriteLatency. totalWriteLatency
-      // accumulates per-beat at DDR5 commit (line ~1355), but
-      // writeRequests counts per-group (line 1069), so the ratio was
-      // inflated by coalesce factor. Use writeLatencyHist for accurate
-      // per-beat distribution or totalWriteLatency / beatsCommitted
-      // (not tracked) for per-beat average. avgReadLatency stays: PCIe
-      // read sum is correctly per-group already.
+      // Review fix #2: REMOVED avgReadLatency and avgWriteLatency.
+      // Use histograms for accurate distribution info. Matches CXL model.
       ADD_STAT(totalReadLatency, statistics::units::Tick::get(),
                "Cumulative read latency (per-group)"),
       ADD_STAT(totalWriteLatency, statistics::units::Tick::get(),
@@ -2534,7 +2580,6 @@ PCIeModel::PCIeStats::PCIeStats(PCIeModel &owner)
     writeLatencyHist.init(100);
     readCoalesceHist.init(20);   // 1-20 beats per group
     writeCoalesceHist.init(20);
-    avgReadLatency = totalReadLatency / readRequests;
 }
 
 // ====================================================================

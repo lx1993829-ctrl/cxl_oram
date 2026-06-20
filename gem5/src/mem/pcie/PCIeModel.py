@@ -100,6 +100,11 @@ class PCIeModel(ClockedObject):
         "Models AXI-PCIe bridge posted write buffer depth. "
         "Separate from read maxOutstanding because posted writes "
         "don't consume tags. 128 = typical Xilinx bridge FIFO.")
+    max_outstanding_reads = Param.UInt32(256,
+        "Max outstanding read beats (shared across all ports) before "
+        "backpressure. Incremented per beat at acceptance, decremented "
+        "at DDR5 response. Propagates DDR5 backend contention to RTL "
+        "via ARREADY. 128 = typical bridge read buffer depth.")
 
     # ---- Endpoint Identity ----
     requester_id = Param.UInt16(0x0100,
