@@ -17,7 +17,7 @@ BINARY="configs/oram_workload"
 CONFIG="configs/oram_ssd.py"
 SSD_CFG="src/mem/ssd/simplessd/config/sample.cfg"
 SSD_CFG_BAK="${SSD_CFG}.sweep_bak"
-NUM_OPS=100000
+NUM_OPS=10000
 NUM_SLOTS=32768
 OUTDIR="m5out"
 
