@@ -43,6 +43,7 @@ CxlModel::CxlModel(const Params &p)
       // .hh:100-101 — Core-clock gap
       cxlCoreClock(p.cxl_core_clock),
       lastFlitEmitTick(0),
+      lastDownstreamFlitEmit(0),
       // .hh:120 — Tag tracking
       maxTags(p.max_tags),
       // .hh:188-191 — Link serialization shared state
@@ -104,12 +105,13 @@ CxlModel::CxlModel(const Params &p)
     // Pools are full per port (NOT split) — realistic for separate
     // AXI masters with their own controller channels.
     outstandingWrites.resize(devicePorts.size(), 0);
+    outstandingReadBeats.resize(devicePorts.size(), 0);
+    maxOutstandingReads = p.max_outstanding_reads;
     // FLIT credits: SHARED pool. All ports compete for one link-level
     // credit budget stored at flitCredits[0] / flitCreditsMax[0].
     // flitCredits[1..N-1] are unused (zero). This models real CXL where
     // the RC advertises one credit set per VC, shared by all functions.
     // Matches PCIe model's credits[0] shared-pool convention.
-    unsigned N = devicePorts.size();
     flitCreditsMax.assign(devicePorts.size(), 0);
     flitCredits.assign(devicePorts.size(), 0);
     flitCreditsMax[0] = p.flit_credits;  // shared pool at index 0
@@ -193,10 +195,10 @@ CxlModel::CxlModel(const Params &p)
     // write budget, and queue set.
     inform("CXL Phase A.1: %lu device port(s), %lu host port(s); "
            "per-port flit_credits=%u, max_outstanding_writes=%u, "
-           "max_outstanding_reads=%u; shared tag pool=%u",
+           "max_outstanding=%u, max_outstanding_reads=%u; shared tag pool=%u",
            devicePorts.size(), hostPorts.size(),
            flitCreditsMax.empty() ? 0 : flitCreditsMax[0],
-           maxOutstandingWrites, maxOutstanding, maxTags);
+           maxOutstandingWrites, maxOutstanding, maxOutstandingReads, maxTags);
 }
 
 void CxlModel::computeLinkParams()
@@ -290,16 +292,19 @@ void CxlModel::retryStarvedPorts()
     // ports so no single port permanently wins retry races.
     // Shared-pool: outstanding reads/writes are global limits (one physical
     // CXL link), not per-port. Compute global sums for admission check.
-    unsigned totalReadsOut = 0, totalWritesOut = 0;
+    unsigned totalReadsOut = 0, totalWritesOut = 0, totalReadBeatsOut = 0;
     for (unsigned j = 0; j < n; j++) {
         totalReadsOut += perPortReadsOut[j];
         totalWritesOut += outstandingWrites[j];
+        totalReadBeatsOut += outstandingReadBeats[j];
     }
     for (unsigned i = 0; i < n; i++) {
         unsigned idx = (nextRetryPort + i) % n;
         bool canRead = hasFreeTags() &&
                        (maxOutstanding == 0 ||
-                        totalReadsOut < maxOutstanding);
+                        totalReadsOut < maxOutstanding) &&
+                       (maxOutstandingReads == 0 ||
+                        totalReadBeatsOut < maxOutstandingReads);
         bool canWrite = (maxOutstandingWrites == 0 ||
                          totalWritesOut < maxOutstandingWrites);
         if (!canRead && !canWrite) continue;
@@ -515,15 +520,22 @@ CxlModel::handleDeviceRequest(PacketPtr pkt, int srcPort)
             pkt->getAddr(), pkt->getSize());
     checkInvariants("handleDeviceRequest");
 
-    // ---- Backpressure at accept time ----
-    // Reads: accept freely into buffer. Real CXL endpoints accept
-    // requests into internal FIFOs. The actual limits are tags and
-    // FLIT credits, checked in processBufferedRead at TLP/FLIT build
-    // time — not at AXI acceptance. This matches PCIe's behavior
-    // (Xilinx PG194: bridge accepts AR beats into FIFO, stalls only
-    // when FIFO is physically full at 1024+ entries).
     if (pkt->isRead()) {
-        // Accept into buffer — tags gate at processBufferedRead
+        // Shared-pool: sum read beats across all ports for global limit.
+        // Mirrors the write mechanism (outstandingWrites). Beats held
+        // from acceptance until DDR5 response — propagates DDR5 backend
+        // contention to RTL via ARREADY.
+        unsigned totalReadBeatsOut = 0;
+        for (unsigned j = 0; j < devicePorts.size(); j++)
+            totalReadBeatsOut += outstandingReadBeats[j];
+        if (maxOutstandingReads > 0 &&
+            totalReadBeatsOut >= maxOutstandingReads) {
+            DPRINTF(CXL, "  RD BEAT LIMIT: port=%d outstanding[%d]=%u total=%u max=%u\n",
+                    srcPort, srcPort, outstandingReadBeats[srcPort],
+                    totalReadBeatsOut, maxOutstandingReads);
+            devicePorts[srcPort]->needRetry = true;
+            return false;
+        }
     } else if (pkt->isWrite()) {
         // Shared-pool: sum writes across all ports for global limit check.
         unsigned totalWritesOut = 0;
@@ -541,6 +553,7 @@ CxlModel::handleDeviceRequest(PacketPtr pkt, int srcPort)
 
     if (pkt->isRead()) {
         deviceReadBuffers[srcPort].push_back({pkt, srcPort});
+        outstandingReadBeats[srcPort]++;
         lastReadBufferTicks[srcPort] = curTick();
         perPortBeatsAccepted[srcPort]++;
         perPortReadsAccepted[srcPort]++;
@@ -713,16 +726,14 @@ CxlModel::processBufferedRead(PacketPtr pkt, int srcPort)
     stats.readCoalesceHist.sample(totalSize / beatSize);
 
     // Build the upstream FLIT. One coalesced read = one M2S Req slot.
-    // CXL 3.0 packs up to 4 request slots per 256B FLIT. Under ORAM's
-    // sustained burst traffic (64 read groups per DDR_READ), real CXL
-    // achieves full slot packing. Amortized per-slot wire cost =
-    // 256B / 4 slots = 64B. This is higher than PCIe's 22B MRd TLP
-    // (real CXL penalty for fixed-size FLITs) but lower than charging
-    // a full 256B FLIT per request (which ignores slot packing).
-    static const unsigned SLOTS_PER_FLIT = 4;
-    static const unsigned AMORTIZED_REQ_WIRE = FLIT_SIZE / SLOTS_PER_FLIT; // 64B
+    // CXL 3.0 packs up to 4 request slots per 256B FLIT, but ORAM's
+    // bucket reads are spaced ~53ns apart (16-beat coalescing each),
+    // far exceeding any realistic coalesce window. Each read ships in
+    // its own FLIT with 1/4 slots filled. CXL can't send partial FLITs
+    // on the wire, so the cost is the full 256B frame — same as the
+    // write path (wrWireBytes rounds up to FLIT_SIZE).
     FlitEntry flit;
-    flit.wireBytes = AMORTIZED_REQ_WIRE;
+    flit.wireBytes = FLIT_SIZE;  // full 256B FLIT on wire (single-slot read)
     flit.type = FlitType::ReadReq;
     flit.tag = tag;
     flit.addr = outstandingReads[tag].addr;
@@ -1416,18 +1427,25 @@ bool CxlModel::handleHostResponse(PacketPtr pkt)
     // lastDownstreamRcTick removed — was written but never read
 
     // Stage 2: Shared Gen5 wire serialization.
+    // Bug #5 fix: add core-clock emission gate, symmetric with PCIe
+    // downstream and CXL upstream (lastFlitEmitTick).
     Tick wireSerDelay = serializationDelay(cplFlit.wireBytes);
-    Tick wireStart = std::max(rcEnd, downstreamBusyUntil);
+    Tick coreGateTick = (cxlCoreClock > 0 && lastDownstreamFlitEmit > 0)
+                        ? lastDownstreamFlitEmit + cxlCoreClock : 0;
+    Tick wireStart = std::max({rcEnd, downstreamBusyUntil, coreGateTick});
     Tick wireEnd = wireStart + wireSerDelay;
     downstreamBusyUntil = wireEnd;
+    lastDownstreamFlitEmit = wireStart;
 
-    // Stage 3: Per-port CDC endpoint — can't start until wire delivers.
-    // The CDC FIFO drains at the FPGA-side AXI rate: 32B per FPGA cycle.
-    // A 256B CplD FLIT occupies the CDC output for ceil(256/32)=8 cycles,
-    // not the previous flat 2 cycles. This is the binding throughput
-    // constraint between the CXL hard block and the FPGA fabric.
-    unsigned cdcDrainBeats = (combinedBytes + 31) / 32;
-    Tick cdcThroughput = cdcDrainBeats * fpgaClockPeriod;
+    // Stage 3: Per-port CDC — shared FIFO → crossbar → per-port AXI.
+    // The CDC FIFO and crossbar operate at host clock speed (never the
+    // bottleneck). Each AXI port's clock crossing is 2 FPGA cycles
+    // (async pointer sync). Throughput constraint is per-port
+    // flushCompletedReads (1 beat/cycle), not the CDC.
+    // Read contention is modeled by outstandingReadBeats (shared
+    // acceptance-time limit matching the write mechanism).
+    const Tick cdcCycles = 2;
+    const Tick cdcThroughput = cdcCycles * fpgaClockPeriod;
     Tick startCdc = std::max(wireEnd, endpointBusyUntil[dstPort]);
     Tick doneCdc = startCdc + cdcThroughput;
     endpointBusyUntil[dstPort] = doneCdc;
@@ -1574,6 +1592,14 @@ void CxlModel::processDownstreamQueue()
                     perPortReadsDelivered[srcPort]++;
                     lastProgressTick = curTick();
 
+                    // Decrement read outstanding at completion delivery.
+                    // The bridge buffer tracks requests until completion
+                    // reaches AXI R — not until DDR5 responds.
+                    if ((unsigned)srcPort < outstandingReadBeats.size() &&
+                        outstandingReadBeats[srcPort] > 0) {
+                        outstandingReadBeats[srcPort]--;
+                    }
+
                     // Review item #1: retirement frees one buffer entry.
                     // Phase A.1: per-port completion buffer occupancy.
                     if (completionBufferOccupied[srcPort] > 0)
@@ -1599,6 +1625,15 @@ void CxlModel::processDownstreamQueue()
                     if (bi.hostPkt) delete bi.hostPkt;
                 }
                 flit.combinedBeats.clear();
+
+                // Wake stalled ports after read beats freed
+                {
+                    unsigned totalRdBeats = 0;
+                    for (unsigned sp = 0; sp < outstandingReadBeats.size(); sp++)
+                        totalRdBeats += outstandingReadBeats[sp];
+                    if (maxOutstandingReads == 0 || totalRdBeats < maxOutstandingReads)
+                        pendingDeviceRetry = true;
+                }
 
                 // Retirement: only when ALL bytes of the group have been
                 // delivered.

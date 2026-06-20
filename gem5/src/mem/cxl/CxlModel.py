@@ -111,6 +111,11 @@ class CxlModel(ClockedObject):
         "Models CXL endpoint write buffer depth. "
         "Separate from read maxOutstanding because posted writes "
         "don't consume tags. 128 = typical CXL controller FIFO.")
+    max_outstanding_reads = Param.UInt32(256,
+        "Max outstanding read beats (shared across all ports) before "
+        "backpressure. Incremented per beat at acceptance, decremented "
+        "at DDR5 response. Propagates DDR5 backend contention to RTL "
+        "via ARREADY. 128 = typical bridge read buffer depth.")
     flit_credits = Param.UInt32(128,
         "FLIT credits granted by host RC (shared pool). All device-side "
         "ports compete for one pool of this size, stored at flitCredits[0] "

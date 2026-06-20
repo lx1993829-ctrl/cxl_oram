@@ -192,6 +192,7 @@ class CxlModel : public ClockedObject
 
     std::vector<std::deque<FlitEntry>> downstreamQueue;
     Tick downstreamBusyUntil;
+    Tick lastDownstreamFlitEmit;  // Bug #5: core-clock gate for downstream
 
     Tick serializationDelay(unsigned wireBytes) const;
     void enqueueUpstream(FlitEntry &flit);
@@ -342,6 +343,8 @@ class CxlModel : public ClockedObject
     // maxOutstandingWrites in flight (pool per port — realistic for
     // separate AXI masters with their own bridge FIFOs).
     std::vector<unsigned> outstandingWrites;
+    std::vector<unsigned> outstandingReadBeats;  // per-beat read tracking (mirrors outstandingWrites)
+    unsigned maxOutstandingReads;  // shared acceptance-time limit for reads
     // Bug 2 (per-port outstanding): per-device-port outstanding read
     // counters. Each instance gets its own full quota of maxOutstanding
     // rather than sharing a single global pool that starves at N > 1.
@@ -362,15 +365,15 @@ class CxlModel : public ClockedObject
     //  credits to the endpoint. Each upstream FLIT consumes one credit.
     //  Credit returned when host RC accepts the FLIT (round-trip delay).
     //
-    //  Phase A.1: per-port credit pools. Each device-side port gets
-    //  flit_credits credits in full (NOT split). Models real CXL
-    //  topology where each AXI master's controller channel has its own
-    //  credit budget — one master never depletes another's pool.
-    //  Default 128 credits per port matches Synopsys/Cadence CXL 3.0
-    //  endpoint IP.
+    //  Shared credit pool: all device-side ports share one credit budget
+    //  at flitCredits[0] / flitCreditsMax[0]. The RC advertises one
+    //  credit set per VC, shared by all functions behind the endpoint.
+    //  Vectors are sized to devicePorts.size() for indexing convenience
+    //  but only index 0 is used at runtime.
+    //  Default 128 credits matches Synopsys/Cadence CXL 3.0 endpoint IP.
     // ================================================================
-    std::vector<unsigned> flitCredits;      // current available credits per port
-    std::vector<unsigned> flitCreditsMax;   // max credits per port (from params)
+    std::vector<unsigned> flitCredits;      // shared pool at index [0]
+    std::vector<unsigned> flitCreditsMax;   // shared max at index [0]
     Tick flitCreditReturnDelay; // time for credit to return from host RC
 
     struct DeferredFlitCredit {
