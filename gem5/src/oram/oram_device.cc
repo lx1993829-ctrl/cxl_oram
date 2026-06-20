@@ -477,7 +477,7 @@ void OramDevice::tick()
                 if (q.isSingle) { stashReadPending = true; break; }
             }
         }
-        oram->m_axi_arready = (hbmBlocked || stashReadPending) ? 0 : 1;
+        oram->m_axi_arready = (hbmBlocked || pcieBlocked || stashReadPending) ? 0 : 1;
 
         // === DEBUG N=4 CRASH: arready gate diagnostics ===
         {
@@ -797,11 +797,24 @@ void OramDevice::tick()
         if (pendingReadBursts.size() > rdDbg.maxPendReads)
             rdDbg.maxPendReads = pendingReadBursts.size();
     }
-    prevFsmState = curFsmState;
-
-    // --- Debug: track FSM transitions and SCAN results ---
-    // Log every FSM state transition with full context
+    // --- Debug: track FSM transitions ---
+    // Log DDR_READ/DDR_WRITE entry/exit with instance name.
+    // Must compare BEFORE updating prevFsmState (was dead code before:
+    // prevFsmState was set to curFsmState at line above, making the
+    // check always false).
     if (curFsmState != prevFsmState && ctrlState == OramState::PROCESSING) {
+        if (curFsmState == FSM_DDR_READ)
+            inform("[%s] DDR_READ  ENTER  cyc=%lu op=%u",
+                   name(), oramCycle, opsCompleted);
+        else if (prevFsmState == FSM_DDR_READ)
+            inform("[%s] DDR_READ  EXIT   cyc=%lu op=%u (%lu cyc in phase)",
+                   name(), oramCycle, opsCompleted, opPhaseCycles[FSM_DDR_READ]);
+        if (curFsmState == FSM_DDR_WRITE)
+            inform("[%s] DDR_WRITE ENTER  cyc=%lu op=%u",
+                   name(), oramCycle, opsCompleted);
+        else if (prevFsmState == FSM_DDR_WRITE)
+            inform("[%s] DDR_WRITE EXIT   cyc=%lu op=%u (%lu cyc in phase)",
+                   name(), oramCycle, opsCompleted, opPhaseCycles[FSM_DDR_WRITE]);
         DPRINTF(Oram, "[%lu] FSM: %d -> %d (found_bkt=%d found_stash=%d "
                "gcm_tag_match=%d gcm_tag_valid=%d "
                "access_viol=%d oram_busy=%d)",
@@ -813,6 +826,7 @@ void OramDevice::tick()
                (int)oram->access_violation,
                (int)oram->oram_busy);
     }
+    prevFsmState = curFsmState;
 
     // Log token and request details at op dispatch
     if (oram->client_req && ctrlState == OramState::PROCESSING) {
@@ -3919,7 +3933,7 @@ void OramDevice::completeOp()
         "SB_WR_ENC_RECV", "SB_WR_ENC_TAG", "ST_LOAD", "ST_FLUSH",
         "PM_WAIT"
     };
-    inform("  Op %u phase breakdown (%lu total cyc):", opsCompleted, cyc);
+    inform("[%s] Op %u phase breakdown (%lu total cyc):", name(), opsCompleted, cyc);
     for (int i = 0; i < NUM_FSM_STATES; i++) {
         if (opPhaseCycles[i] > 0) {
             inform("    %-20s %6lu cyc (%4.1f%%)",
@@ -4077,7 +4091,7 @@ void OramDevice::printStats()
     double avg = (double)totalOpCycles / opsCompleted;
     double ns = oramClkPeriod / 1000.0;
 
-    inform("=== ORAM Results ===");
+    inform("[%s] === ORAM Results ===", name());
     inform("  %u slots: HBM=%u host=%u", numSlots, hbmSlotCount,
            numSlots - hbmSlotCount);
     inform("  Ops: %u/%u  HBM=%lu  PCIe=%lu",
