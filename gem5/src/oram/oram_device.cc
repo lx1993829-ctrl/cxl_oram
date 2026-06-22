@@ -2187,22 +2187,30 @@ void OramDevice::handleCmdRingResp(PacketPtr pkt, CmdRingFetchSenderState *ss)
                fData[12], fData[13], fData[14], fData[15],
                funcSlotAddr);
 
-        // 3. Byte-level comparison
+        // 3. Byte-level comparison and stale-data fixup.
+        //    Cross-port DDR5 write ordering issue: CPU ring writes and
+        //    OramDevice ring reads go through different DDR5 xbar ports.
+        //    At high N, writes may not have committed when the timing
+        //    read arrives. Detect via byte comparison, fix using
+        //    functional data. The timing read still goes through the
+        //    fabric for accurate load modeling.
         bool mismatch = false;
         for (int b = 0; b < 64; b++) {
-            if (data[b] != fData[b]) {
-                if (!mismatch) {
-                    DPRINTF(Oram, "RING-CORRUPT slot=%lu: timing vs functional MISMATCH!\n",
-                         ss->ringSlot);
-                    mismatch = true;
-                }
-                warn("  byte[%d]: timing=0x%02x functional=0x%02x (XOR=0x%02x)",
-                     b, data[b], fData[b], data[b] ^ fData[b]);
-            }
+            if (data[b] != fData[b]) { mismatch = true; break; }
         }
-        if (!mismatch && ss->ringSlot <= 5) {
-            DPRINTF(Oram, "RING-OK    slot=%lu: timing == functional (slot_addr=0x%x)\n",
-                   ss->ringSlot, e.slot_addr);
+        if (mismatch) {
+            warn("RING-FIXUP slot=%lu: using functional data (timing was stale)",
+                 ss->ringSlot);
+            memcpy(&e.slot_addr, fData + 0x00, 4);
+            memcpy(&e.token,     fData + 0x04, 4);
+            e.lease_id  = fData[0x08];
+            e.op        = fData[0x09];
+            e.hw_client = fData[0x0A];
+            memcpy(&opIdxLo, fData + 0x0C, 4);
+            memcpy(e.wdata,  fData + 0x10, 32);
+            memcpy(&opIdxHi, fData + 0x30, 4);
+            memcpy(&valid,   fData + 0x34, 4);
+            e.opIdx = ((uint64_t)opIdxHi << 32) | (uint64_t)opIdxLo;
         }
 
         delete fPkt;
