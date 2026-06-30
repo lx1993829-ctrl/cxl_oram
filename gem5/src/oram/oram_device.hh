@@ -206,6 +206,10 @@ class OramDevice : public ClockedObject
         uint32_t rdata[8];
         bool     rdata_valid;
 
+        // Eviction bucket info (latched from RTL at client_done)
+        uint16_t req_b = 0;       // bucket actually accessed
+        uint16_t req_b_new = 0;   // eviction target bucket
+
         // --- E2E timing (gem5 Ticks) ---
         Tick fetchTick;      // when ring entry arrived / MMIO doorbell
         Tick dispatchTick;   // when dispatched to RTL (IN_PROGRESS)
@@ -273,7 +277,7 @@ class OramDevice : public ClockedObject
     bool     lastCompletedRdataValid;
 
     Tick oramClkPeriod;
-    Tick hbmCdcLatency;   // HBM AXI CDC delay (0 = disabled)
+    Tick hbmCdcLatency;  // CDC delay for HBM read responses
     uint64_t oramCycle;
     EventFunctionWrapper tickEvent;
     void tick();
@@ -339,14 +343,16 @@ class OramDevice : public ClockedObject
         uint8_t axiId;
         int beatIdx, totalBeats;
         bool isWrite;
-        bool isPcie;
         size_t burstSeq;
+        bool isPcie = false;
         int secondBeatIdx = -1;  // >=0 when two 32B reads coalesced into 64B
         size_t secondBurstSeq = 0;
-        AxiSenderState(uint8_t id, int idx, int total, bool wr, size_t seq,
-                        bool pcie = false)
+        AxiSenderState(uint8_t id, int idx, int total, bool wr, size_t seq)
             : axiId(id), beatIdx(idx), totalBeats(total),
-              isWrite(wr), isPcie(pcie), burstSeq(seq) {}
+              isWrite(wr), burstSeq(seq), isPcie(false) {}
+        AxiSenderState(uint8_t id, int idx, int total, bool wr, size_t seq, bool pcie)
+            : axiId(id), beatIdx(idx), totalBeats(total),
+              isWrite(wr), burstSeq(seq), isPcie(pcie) {}
     };
 
     // pos_map read-modify-write: tagged on the RMW read so handleMemResp
@@ -379,10 +385,14 @@ class OramDevice : public ClockedObject
         bool isPcie;
         std::vector<RBeat> beats; std::vector<bool> beatRecvd;
         std::vector<Tick> beatReadyTick;
-        ReadBurstReasm(uint8_t id, int total, size_t s, bool pcie = false)
+        ReadBurstReasm(uint8_t id, int total, size_t s)
             : axiId(id), totalBeats(total), beatsRecv(0), flushedBeats(0), seq(s),
-              isPcie(pcie),
-              beats(total), beatRecvd(total, false), beatReadyTick(total, 0) {}
+              isPcie(false), beats(total), beatRecvd(total, false),
+              beatReadyTick(total, 0) {}
+        ReadBurstReasm(uint8_t id, int total, size_t s, bool pcie)
+            : axiId(id), totalBeats(total), beatsRecv(0), flushedBeats(0), seq(s),
+              isPcie(pcie), beats(total), beatRecvd(total, false),
+              beatReadyTick(total, 0) {}
     };
     std::deque<ReadBurstReasm> pendingReadBursts;
     size_t nextBurstSeq;
@@ -397,16 +407,9 @@ class OramDevice : public ClockedObject
 
     struct BResp { uint8_t id; bool isHbm; bool isStash; };
     std::deque<BResp> bQueue;
-
-    // Per-instance BRESP posmap tracking (parallel to bQueue).
-    // bQueueIsPosmap[i] tracks whether bQueue[i] is a posmap BRESP.
-    // posmapWriteSeqs tracks which PendingWriteBurst seqs are posmap RMW writes.
-    std::deque<bool> bQueueIsPosmap;
-    std::unordered_set<size_t> posmapWriteSeqs;
-
-    // driveAxiB: index of the bQueue entry currently presented on B channel.
-    // -1 = none presented. Set by scan, consumed on next bready handshake.
-    int bQueuePresentIdx = -1;
+    std::deque<bool> bQueueIsPosmap;        // parallel to bQueue: true if posmap BRESP
+    std::unordered_set<size_t> posmapWriteSeqs;  // burstSeqs of posmap writes
+    int bQueuePresentIdx = -1;              // index into bQueue currently on AXI B
 
     // HT SLOT write-forwarding shadow. The single-beat HT write commits to the
     // HBM backing store with BRESP-to-data latency; a lookup issued in a later
@@ -607,12 +610,11 @@ class OramDevice : public ClockedObject
     // Per-phase cycle counters (accumulated across all ops)
     // FSM states from flat_oram_gcm.v
     static constexpr int NUM_FSM_STATES = 31;
-    // Named FSM state constants — must match flat_oram_gcm.v encoding
-    static constexpr uint8_t FSM_S_IDLE       = 0;
-    static constexpr uint8_t FSM_DDR_READ     = 2;
-    static constexpr uint8_t FSM_DDR_WRITE    = 19;
-    static constexpr uint8_t FSM_ST_LOAD      = 28;
-    static constexpr uint8_t FSM_ST_FLUSH     = 29;
+    // FSM state indices (must match flat_oram_gcm.v dbg_oram_state)
+    static constexpr int FSM_DDR_READ  = 2;
+    static constexpr int FSM_DDR_WRITE = 19;
+    static constexpr int FSM_ST_LOAD   = 28;
+    static constexpr int FSM_ST_FLUSH  = 29;
     uint64_t phaseCycles[NUM_FSM_STATES];
     uint64_t opPhaseCycles[NUM_FSM_STATES]; // per-op accumulator
     uint8_t  prevFsmState;

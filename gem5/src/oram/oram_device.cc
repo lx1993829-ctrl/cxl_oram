@@ -1544,7 +1544,13 @@ void OramDevice::tick()
     if ((ctrlState == OramState::PROCESSING ||
          ctrlState == OramState::WRITE_INIT) &&
         (oram->client_done & doneMask))
+    {
         clientDoneSeen = true;
+        if (!cmdQueue.empty()) {
+            cmdQueue.front().req_b     = (uint16_t)oram->dbg_req_b;
+            cmdQueue.front().req_b_new = (uint16_t)oram->dbg_req_b_new;
+        }
+    }
 
     // For READ ops, defer completeOp until rdataShadow is captured.
     // The RTL may assert client_done before client_rdata_valid in some
@@ -1940,7 +1946,7 @@ void OramDevice::trySendRetries(bool isPcie)
 //   0x10: lease_id_used (u32)
 //   0x14: hw_client_used (u32)
 //   0x18: slot_addr_used (u32)
-//   0x1C: reserved (u32 = 0)
+//   0x1C: evict_info (u32)      — [15:0] = req_b, [31:16] = req_b_new
 //   0x20..0x3F: rdata[0..7] (32 B, only meaningful for reads)
 // =============================================================================
 
@@ -1994,7 +2000,8 @@ void OramDevice::sendResultPacket(uint64_t opIdx)
     v32 = op.lease_id;    memcpy(buf + 0x10, &v32, 4);
     v32 = op.hw_client;   memcpy(buf + 0x14, &v32, 4);
     v32 = op.slot_addr;   memcpy(buf + 0x18, &v32, 4);
-    v32 = 0;              memcpy(buf + 0x1C, &v32, 4);
+    v32 = (uint32_t)op.req_b | ((uint32_t)op.req_b_new << 16);
+    memcpy(buf + 0x1C, &v32, 4);
 
     // rdata[0..7] @ 0x20..0x3F (32 B). Filled from op.rdata (which was
     // copied from rdataShadow in completeOp). For writes, this stays zero.
