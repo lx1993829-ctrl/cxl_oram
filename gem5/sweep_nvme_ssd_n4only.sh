@@ -39,7 +39,7 @@ trap 'echo "Restoring sample.cfg..."; cp "$SSD_CFG_BAK" "$SSD_CFG"; rm -f "$SSD_
 echo "=== Starting NVMe SSD N-scaling sweep (ops=$NUM_OPS, slots=$NUM_SLOTS) ==="
 echo ""
 
-for N in 1 2 3 4; do
+for N in 4; do
     # ---- Compute per-N SimpleSSD parameters ----
     CACHE=$((262144 * N))
     FILL=$(python3 -c "highest=($N-1)*32768+16384; print(f'{highest/$TOTAL_NAND_PAGES:.5f}')")
