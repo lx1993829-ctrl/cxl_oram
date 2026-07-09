@@ -890,6 +890,9 @@ void PCIeModel::enqueueUpstream(TlpPacket &tlp)
                 upstreamBusyUntil, earliest, startSer);
     }
     upstreamBusyUntil = endSer;
+    if (startSer > earliest)
+        inform("PCIE-UP-WAIT port=%d wait=%llu",
+               tlp.srcPortIdx, startSer - earliest);
     lastUpstreamEmit = startSer;  // Review item #3: track last emit tick
 
     // Bias #1 note: DLLP ACKs (real PCIe) are BATCHED — one ACK
@@ -1684,6 +1687,9 @@ void PCIeModel::processUpstreamQueue()
                     rcEndUp = rcStartUp + rcThroughputDelay;
                 }
                 rcUpstreamBusyUntil = rcEndUp;
+                if (!rcColdUp && rcStartUp > now)
+                    inform("PCIE-RC-UP-WAIT port=%d wait=%llu type=read",
+                           (int)sp, rcStartUp - now);
 
                 DPRINTF(PCIe, "  [UP] RC: cold=%d pipeIdle=%lld "
                         "rcEnd=%llu @%llu\n",
@@ -1768,6 +1774,9 @@ void PCIeModel::processUpstreamQueue()
                     rcEndUpW = rcStartUpW + rcThroughputDelay;
                 }
                 rcUpstreamBusyUntil = rcEndUpW;
+                if (!rcColdUpW && rcStartUpW > now)
+                    inform("PCIE-RC-UP-WAIT port=%d wait=%llu type=write",
+                           (int)sp, rcStartUpW - now);
 
                 Tick sendTick2 = std::max(rcEndUpW, curTick() + 1);
 
@@ -2171,6 +2180,9 @@ bool PCIeModel::handleHostResponse(PacketPtr pkt)
         rcEnd = rcStart + rcThroughputDelay;
     }
     rcDownstreamBusyUntil = rcEnd;
+    if (!rcCold && rcStart > now)
+        inform("PCIE-RC-DN-WAIT port=%d wait=%llu tag=%u",
+               port, rcStart - now, tag);
     // lastDownstreamRcTick removed — was written but never read
 
     {
@@ -2193,6 +2205,9 @@ bool PCIeModel::handleHostResponse(PacketPtr pkt)
     Tick wireStart = std::max({rcEnd, downstreamBusyUntil, coreGateTick});
     Tick wireEnd = wireStart + wireSerDelay;
     downstreamBusyUntil = wireEnd;
+    if (wireStart > rcEnd)
+        inform("PCIE-DN-WIRE-WAIT port=%d wait=%llu wireSerDelay=%llu",
+               port, wireStart - rcEnd, wireSerDelay);
     lastDownstreamEmit = wireStart;
 
     // Stage 3: Per-port CDC bridge — shared FIFO → crossbar → per-port AXI.
