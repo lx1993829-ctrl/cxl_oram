@@ -699,44 +699,18 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* ---- Submit write-back for BOTH modified buckets ---- */
-        /* Read eviction info from result buffer (already committed since
-         * cpu_op_count has advanced). Layout: 0x1C = req_b | (req_b_new << 16) */
+        /* ---- Submit write-back ---- */
+        BUILD_PRP(prplist_wr, cur_slab);
         {
-            uint64_t res_addr = result_buf_base + op * 64;
-            uint32_t evict_info = *(volatile uint32_t *)(uintptr_t)(res_addr + 0x1C);
-            uint16_t req_b     = (uint16_t)(evict_info & 0xFFFF);
-            uint16_t req_b_new = (uint16_t)(evict_info >> 16);
-
-            /* Write-back bucket req_b (accessed bucket) */
-            uint64_t rb_slab = oram_host_base + (uint64_t)req_b * BUCKET_SIZE_BYTES;
-            uint64_t rb_lba  = inst_lba_base  + (uint64_t)req_b * LBAS_PER_SLOT;
-            BUILD_PRP(prplist_wr, rb_slab);
-            uint16_t wr_cid_b = (uint16_t)(0xD000u | (iter & 0x0FFFu));
+            uint16_t cur_wr_cid = (uint16_t)(0xD000u | (iter & 0x0FFFu));
             submit_nvme_io(iosq, &io_sq_tail, sq_dbell,
-                           IO_OPC_WRITE, wr_cid_b, rb_slab,
+                           IO_OPC_WRITE, cur_wr_cid, cur_slab,
                            (uint64_t)(uintptr_t)prplist_wr,
-                           rb_lba, LBAS_PER_SLOT - 1);
+                           cur_lba, LBAS_PER_SLOT - 1);
 
             if (drain_cqes(iocq, &io_cq_head, &io_cq_phase, cq_dbell,
-                           next_rd_cid, wr_cid_b) < 0) {
+                           next_rd_cid, cur_wr_cid) < 0) {
                 se_eputs("|||FAIL pass1 drain\n"); return 1;
-            }
-
-            /* Write-back bucket req_b_new (eviction target) if different */
-            if (req_b_new != req_b) {
-                uint64_t rn_slab = oram_host_base + (uint64_t)req_b_new * BUCKET_SIZE_BYTES;
-                uint64_t rn_lba  = inst_lba_base  + (uint64_t)req_b_new * LBAS_PER_SLOT;
-                BUILD_PRP(prplist_wr, rn_slab);
-                uint16_t wr_cid_n = (uint16_t)(0xD800u | (iter & 0x0FFFu));
-                submit_nvme_io(iosq, &io_sq_tail, sq_dbell,
-                               IO_OPC_WRITE, wr_cid_n, rn_slab,
-                               (uint64_t)(uintptr_t)prplist_wr,
-                               rn_lba, LBAS_PER_SLOT - 1);
-                if (drain_cqes(iocq, &io_cq_head, &io_cq_phase, cq_dbell,
-                               wr_cid_n, 0) < 0) {
-                    se_eputs("|||FAIL pass1 evict drain\n"); return 1;
-                }
             }
         }
 
@@ -870,39 +844,18 @@ int main(int argc, char **argv) {
             se_printf_hex("|||  exp_r0", wdata_i[0]);
         }
 
-        /* ---- Submit write-back for BOTH modified buckets ---- */
+        /* ---- Submit write-back (ORAM modifies bucket on every access) ---- */
+        BUILD_PRP(prplist_wr, cur_slab);
         {
-            uint32_t evict_info = *(volatile uint32_t *)(uintptr_t)(res_addr + 0x1C);
-            uint16_t req_b     = (uint16_t)(evict_info & 0xFFFF);
-            uint16_t req_b_new = (uint16_t)(evict_info >> 16);
-
-            uint64_t rb_slab = oram_host_base + (uint64_t)req_b * BUCKET_SIZE_BYTES;
-            uint64_t rb_lba  = inst_lba_base  + (uint64_t)req_b * LBAS_PER_SLOT;
-            BUILD_PRP(prplist_wr, rb_slab);
-            uint16_t wr_cid_b = (uint16_t)(0xF000u | (iter & 0x0FFFu));
+            uint16_t cur_wr_cid = (uint16_t)(0xF000u | (iter & 0x0FFFu));
             submit_nvme_io(iosq, &io_sq_tail, sq_dbell,
-                           IO_OPC_WRITE, wr_cid_b, rb_slab,
+                           IO_OPC_WRITE, cur_wr_cid, cur_slab,
                            (uint64_t)(uintptr_t)prplist_wr,
-                           rb_lba, LBAS_PER_SLOT - 1);
+                           cur_lba, LBAS_PER_SLOT - 1);
 
             if (drain_cqes(iocq, &io_cq_head, &io_cq_phase, cq_dbell,
-                           next_rd_cid, wr_cid_b) < 0) {
+                           next_rd_cid, cur_wr_cid) < 0) {
                 se_eputs("|||FAIL pass2 drain\n"); return 1;
-            }
-
-            if (req_b_new != req_b) {
-                uint64_t rn_slab = oram_host_base + (uint64_t)req_b_new * BUCKET_SIZE_BYTES;
-                uint64_t rn_lba  = inst_lba_base  + (uint64_t)req_b_new * LBAS_PER_SLOT;
-                BUILD_PRP(prplist_wr, rn_slab);
-                uint16_t wr_cid_n = (uint16_t)(0xF800u | (iter & 0x0FFFu));
-                submit_nvme_io(iosq, &io_sq_tail, sq_dbell,
-                               IO_OPC_WRITE, wr_cid_n, rn_slab,
-                               (uint64_t)(uintptr_t)prplist_wr,
-                               rn_lba, LBAS_PER_SLOT - 1);
-                if (drain_cqes(iocq, &io_cq_head, &io_cq_phase, cq_dbell,
-                               wr_cid_n, 0) < 0) {
-                    se_eputs("|||FAIL pass2 evict drain\n"); return 1;
-                }
             }
         }
 

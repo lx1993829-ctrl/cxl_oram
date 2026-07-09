@@ -238,7 +238,6 @@ system.cxl = CxlModel(
     max_outstanding=64,
     max_outstanding_writes=128,
     flit_credits=128,
-    completion_buffer_depth=2048,
     host_inject_interval='1ns',
 )
 system.cxl.clk_domain = SrcClockDomain(clock='1GHz', voltage_domain=VoltageDomain())
