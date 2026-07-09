@@ -69,8 +69,9 @@
 //   (next free)       0x14A00000
 // =============================================================================
 `define HT_SLOT_BASE      34'h0_1410_0000
-`define HT_SLOT_ENTRIES    2048
-`define HT_SLOT_MASK       11'h7FF          // hash = slot_addr[22:12]
+// Direct-indexed SLOT table: 32768 entries × 4B / 32B per line = 4096 lines.
+`define HT_SLOT_LINES     4096
+`define HT_SLOT_ENTRIES    32768
 `define HT_BKT_HEAD_BASE  34'h0_1420_0000
 `define HT_BKT_NEXT_BASE  34'h0_1430_0000
 `define HT_EMPTY           14'h3FFF         // empty pointer (max PTR_W=14)

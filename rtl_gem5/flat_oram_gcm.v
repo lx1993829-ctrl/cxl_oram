@@ -50,6 +50,7 @@ module flat_oram_gcm #(
     output reg                  err_bucket_overflow,
     output reg                  err_stash_overflow,
     output reg                  err_tag_mismatch,
+    output reg                  err_ht_insert_full,   // SLOT table 4-way hash collision: INSERT silently dropped
 
     // BRAM Init Interface
     input  wire                     init_mode,
@@ -361,7 +362,8 @@ module flat_oram_gcm #(
         S_ST_FLUSH      = 6'd29,
         S_PM_WAIT       = 6'd30,
         S_HT_LOOKUP_WAIT = 6'd31,  // Step 4: wait for HT slot lookup result
-        S_EVICT_SLOTR_WAIT = 6'd32;  // wait slot_r HBM read at eviction
+        S_EVICT_SLOTR_WAIT = 6'd32,  // wait slot_r HBM read at eviction
+        S_BKT_FIND_WAIT    = 6'd33;  // 1-cycle delay: lets HT FSM clear stale ht_bkt_find_done
 
     // Hash table FSM states
     localparam [2:0]
@@ -410,12 +412,9 @@ module flat_oram_gcm #(
     wire [PTR_W-1:0] ev_valid_check_idx = ht_evict_list[evict_list_idx];
     wire             ev_valid_check_out;
 
-    // Per-stash-entry assigned bucket: recorded at INSERT, checked at S_EVICT
-    // to prevent evicting a block to the wrong bucket via a stale BKT_FIND
-    // chain link. If stash_bkt[candidate] != req_b, the candidate belongs to
-    // a different bucket and must be skipped.
-    reg [BUCKET_W-1:0] stash_bkt [0:STASH_DEPTH-1];
-    wire               ev_bkt_match = (stash_bkt[ev_valid_check_idx] == req_b);
+    // stash_bkt[] moved to HBM: bucket is co-stored with slot_addr in
+    // slot_r_table. The ev_bkt_match check now runs in S_EVICT_SLOTR_WAIT
+    // after the slot_r HBM read returns (zero additional HBM transactions).
 
     // AES-GCM feed control
     reg                  aes_half;
@@ -586,13 +585,16 @@ module flat_oram_gcm #(
     // --- slot_r table (per-stash-entry slot address, moved off-chip) ---
     reg  [PTR_W-1:0]     sr_rd_idx;  reg sr_rd_en;
     wire [SLOT_AW-1:0]   sr_rd_slot_addr; wire sr_rd_valid;
-    reg  [PTR_W-1:0]     sr_wr_idx;  reg [SLOT_AW-1:0] sr_wr_slot_addr; reg sr_wr_en;
+    wire [BUCKET_W-1:0]  sr_rd_bucket;
+    reg  [PTR_W-1:0]     sr_wr_idx;  reg [SLOT_AW-1:0] sr_wr_slot_addr;
+    reg  [BUCKET_W-1:0]  sr_wr_bucket;  reg sr_wr_en;
 
     slot_r_table u_slot_r (
         .clk(clk), .rst_n(rst_n),
         .rd_idx(sr_rd_idx), .rd_en(sr_rd_en),
-        .rd_slot_addr(sr_rd_slot_addr), .rd_valid(sr_rd_valid),
-        .wr_idx(sr_wr_idx), .wr_slot_addr(sr_wr_slot_addr), .wr_en(sr_wr_en),
+        .rd_slot_addr(sr_rd_slot_addr), .rd_bucket(sr_rd_bucket), .rd_valid(sr_rd_valid),
+        .wr_idx(sr_wr_idx), .wr_slot_addr(sr_wr_slot_addr),
+        .wr_bucket(sr_wr_bucket), .wr_en(sr_wr_en),
         .busy(slotr_busy), .dbg_state(slotr_dbg_state),
         .m_axi_arid(sr_axi_arid), .m_axi_araddr(sr_axi_araddr),
         .m_axi_arlen(sr_axi_arlen), .m_axi_arsize(sr_axi_arsize),
@@ -1219,8 +1221,8 @@ module flat_oram_gcm #(
                             // for this stash entry (mirrors the HT insert below).
                             sr_wr_idx <= stash_alloc_idx;
                             sr_wr_slot_addr <= req_slot_addr;
+                            sr_wr_bucket <= req_b_new;
                             sr_wr_en <= 1;
-                            stash_bkt[stash_alloc_idx] <= req_b_new;
                             `ifndef SYNTHESIS
                             $display("[SLOTR_FSM] t=%0t INSERT(SB_RD path) idx=%0d slot=0x%08h (async HBM write)",
                                      $time, stash_alloc_idx, req_slot_addr);
@@ -1438,8 +1440,8 @@ module flat_oram_gcm #(
                                 // slot_r moved to HBM: write per-entry slot addr.
                                 sr_wr_idx <= stash_alloc_idx;
                                 sr_wr_slot_addr <= req_slot_addr;
+                                sr_wr_bucket <= req_b_new;
                                 sr_wr_en <= 1;
-                                stash_bkt[stash_alloc_idx] <= req_b_new;
                                 `ifndef SYNTHESIS
                                 $display("[SLOTR_FSM] t=%0t INSERT(EXTRACT_WR path) idx=%0d slot=0x%08h (async HBM write)",
                                          $time, stash_alloc_idx, req_slot_addr);
@@ -1506,7 +1508,11 @@ module flat_oram_gcm #(
                             ht_cmd_bkt <= req_b_new;          // NEW bucket
                             ht_cmd_idx <= found_stash_idx;
                             ht_cmd_slot_insert <= 1;
-                            stash_bkt[found_stash_idx] <= req_b_new;
+                            // stash_bkt moved to HBM: write bucket via slot_r_table
+                            sr_wr_idx <= found_stash_idx;
+                            sr_wr_slot_addr <= req_slot_addr;
+                            sr_wr_bucket <= req_b_new;
+                            sr_wr_en <= 1;
                             if (req_op) begin
                                 beat_cnt <= 0;
                                 stash_alloc_idx <= found_stash_idx;
@@ -1563,6 +1569,19 @@ module flat_oram_gcm #(
                     ht_cmd_bkt <= req_b;
                     ht_cmd_bkt_find <= 1;
                     evict_list_idx <= 0;
+                    // BKT_FIND_WAIT: 1-cycle delay so the HT FSM sees ht_cmd_bkt_find
+                    // and clears the stale ht_bkt_find_done flag before S_EVICT reads it.
+                    // Without this, S_EVICT passes the !ht_bkt_find_done guard using the
+                    // PREVIOUS operation's stale completion flag and consumes the wrong
+                    // eviction list.
+                    state <= S_BKT_FIND_WAIT;
+                end
+
+                S_BKT_FIND_WAIT: begin
+                    // One-cycle pipeline bubble.  On this cycle the HT FSM latches
+                    // ht_cmd_bkt_find and clears ht_bkt_find_done <= 0.  By the time
+                    // S_EVICT evaluates !ht_bkt_find_done on the NEXT posedge, the
+                    // cleared value is visible (NBL took effect).
                     state <= S_EVICT;
                 end
 
@@ -1588,16 +1607,11 @@ module flat_oram_gcm #(
                                      $time, ht_evict_list[evict_list_idx]);
                             `endif
                             evict_list_idx <= evict_list_idx + 1;
-                        end else if (!ev_bkt_match) begin
-                            `ifndef SYNTHESIS
-                            $display("[EV_SKIP_BKT] t=%0t skipping stash_idx=%0d: assigned bkt=%0d != evict bkt=%0d (stale chain link)",
-                                     $time, ht_evict_list[evict_list_idx],
-                                     stash_bkt[ht_evict_list[evict_list_idx]], req_b);
-                            `endif
-                            evict_list_idx <= evict_list_idx + 1;
                         end else begin
                         // Issue the slot_r read for this eviction candidate;
                         // capture the index, then wait for the HBM read result.
+                        // Bucket match check moved to S_EVICT_SLOTR_WAIT (bucket
+                        // is co-stored with slot_addr in HBM, zero extra reads).
                         evict_stash_idx <= ht_evict_list[evict_list_idx];
                         ev_pos <= lowest_free_pos(bkt_slot_list);  // coherent placement
                         sr_rd_idx <= ht_evict_list[evict_list_idx];
@@ -1672,6 +1686,18 @@ module flat_oram_gcm #(
                 // =============================================================
                 S_EVICT_SLOTR_WAIT: begin
                     if (sr_rd_valid) begin
+                        // Bucket match check (moved from S_EVICT): the bucket is
+                        // co-stored with the slot address in slot_r_table. If the
+                        // candidate's bucket doesn't match the eviction target,
+                        // skip it and return to S_EVICT for the next candidate.
+                        if (sr_rd_bucket != req_b) begin
+                            `ifndef SYNTHESIS
+                            $display("[EV_SKIP_BKT] t=%0t skipping stash_idx=%0d: assigned bkt=%0d != evict bkt=%0d (stale chain link, detected after slot_r read)",
+                                     $time, evict_stash_idx, sr_rd_bucket, req_b);
+                            `endif
+                            evict_list_idx <= evict_list_idx + 1;
+                            state <= S_EVICT;
+                        end else begin
                         ev_slot_addr <= sr_rd_slot_addr;
                         `ifndef SYNTHESIS
                         $display("[EV_SLOTR] t=%0t slot_r read done: slot=0x%08h stash_idx=%0d",
@@ -1695,6 +1721,7 @@ module flat_oram_gcm #(
                         beat_cnt <= 0;
                         evict_list_idx <= evict_list_idx + 1;
                         state <= S_ST_LOAD;
+                        end // close bucket-match else
                     end
                 end
 
@@ -1991,7 +2018,7 @@ module flat_oram_gcm #(
                 S_EV_ENC_RECV,     S_EV_ENC_TAG: begin
                     `PERF_INC(encrypt)
                 end
-                S_COMPACT: begin
+                S_COMPACT, S_BKT_FIND_WAIT: begin
                     `PERF_INC(compact)
                 end
                 S_EVICT, S_EVICT_SLOTR_WAIT: begin
@@ -2052,7 +2079,7 @@ module flat_oram_gcm #(
     reg [AXI_AW-1:0] ht_addr;       // current HBM address
     reg [AXI_DW-1:0] ht_beat;       // read-back data beat
     reg              ht_rd_acc;     // set when THIS FSM's single read was accepted
-    reg [14:0] ht_hash;              // hash value (15-bit for 32768-slot coverage)
+    // (ht_hash removed — direct-indexed table needs no hash)
     reg [3:0]  ht_sub_op;            // sub-step within an operation (widened to 4-bit for unlink steps 8,9)
 
     // SLOT write-back cache: 4-entry cache (one per SLOT beat).
@@ -2083,32 +2110,42 @@ module flat_oram_gcm #(
     localparam HT_OP_BKT_INSERT = 3'd5;
     localparam HT_OP_BKT_DELETE = 3'd6;
 
-    // HT SLOT entry layout (64-bit, 4 entries per 256-bit beat):
-    //   [3:0]                            = status (4 bits, fixed)
-    //   [HT_BKT_OFS-1 : 4]              = slot_addr (SLOT_ADDR_W bits)
-    //   [HT_IDX_OFS-1 : HT_BKT_OFS]     = bucket_id (BUCKET_ID_W bits)
-    //   [HT_VAL_BIT-1 : HT_IDX_OFS]      = stash_idx (STASH_PTR_W bits)
-    //   [HT_VAL_BIT]                      = valid (1 bit)
-    localparam HT_STAT_OFS = 0;
-    localparam HT_ADDR_OFS = 4;
-    localparam HT_BKT_OFS  = HT_ADDR_OFS + SLOT_AW;    // 4+32 = 36
-    localparam HT_IDX_OFS  = HT_BKT_OFS + BUCKET_W;    // 36+13 = 49
-    localparam HT_VAL_BIT  = HT_IDX_OFS + PTR_W;        // 49+14 = 63
+    // =========================================================================
+    // Direct-indexed SLOT entry (32 bits, 8 entries per 256-bit beat):
+    //   [BUCKET_W-1:0]                  = bucket_id (13 bits)
+    //   [DI_IDX_OFS+PTR_W-1:DI_IDX_OFS]= stash_idx (14 bits)
+    //   [DI_VAL_BIT]                    = valid     (1 bit)
+    //   [31:28]                         = reserved  (4 bits)
+    //
+    // Indexed by slot_index = addr[26:12].  Each slot_index maps to exactly
+    // one 32-bit position — no hashing, no associativity, no collisions.
+    //   line_index = slot_index[14:3]   (which 32-byte HBM line)
+    //   position   = slot_index[2:0]    (which of 8 entries in the line)
+    //
+    // Table size: 32768 entries / 8 per line = 4096 lines × 32 B = 128 KB.
+    // =========================================================================
+    localparam DI_BKT_OFS  = 0;
+    localparam DI_IDX_OFS  = BUCKET_W;              // 13
+    localparam DI_VAL_BIT  = DI_IDX_OFS + PTR_W;    // 27
+    localparam DI_ENTRY_W  = 32;
+    localparam DI_PER_BEAT = AXI_DW / DI_ENTRY_W;   // 8
 
-    // Helper: compute SLOT hash table HBM address from slot_addr
-    // 8192 beats × 4 entries/beat = 32768 capacity (2× STASH_DEPTH).
-    // Hash uses addr[26:12] (15 bits, covers 32768 slots at 0x1000 spacing),
-    // truncated to 13-bit beat index. XOR with addr[11:10] spreads sub-page
-    // addresses (0x400-spaced). Collisions from the truncation are handled
-    // by the 4-way associative scan (checks full 32-bit slot_addr).
+    // Backward-compat aliases used in debug prints (old 64-bit names)
+    localparam HT_VAL_BIT  = DI_VAL_BIT;
+    localparam HT_IDX_OFS  = DI_IDX_OFS;
+    localparam HT_BKT_OFS  = DI_BKT_OFS;
+
+    // Helper: compute SLOT table HBM address from slot_addr (direct index)
+    // slot_index = addr[26:12]; 8 entries per 32-byte line.
+    // No hashing — each slot has a unique, dedicated position.
     function [AXI_AW-1:0] ht_slot_hbm_addr;
         input [SLOT_AW-1:0] addr;
-        reg [14:0] h;
-        reg [12:0] beat;
+        reg [14:0] slot_index;
+        reg [11:0] line_index;
         begin
-            h = addr[26:12];
-            beat = h[12:0] ^ {11'b0, addr[11:10]};
-            ht_slot_hbm_addr = `HT_SLOT_BASE + ({19'b0, beat} << 5);
+            slot_index = addr[26:12];
+            line_index = slot_index[14:3];   // 4096 lines
+            ht_slot_hbm_addr = `HT_SLOT_BASE + ({22'b0, line_index} << 5);
         end
     endfunction
 
@@ -2244,6 +2281,7 @@ module flat_oram_gcm #(
             ht_found_bkt <= 0;
             ht_evict_count <= 0;
             ht_bkt_find_done <= 0;   // Step 4
+            err_ht_insert_full <= 0;
             ht_sub_op <= 0;
             ht_del_bkt <= 0; ht_del_target <= 0; ht_del_cur <= 0;
             ht_del_save_next <= 0; ht_del_hops <= 0;
@@ -2305,6 +2343,12 @@ module flat_oram_gcm #(
             if (ht_cmd_bkt_find) begin
                 ht_latch_bkt_find <= 1;
                 ht_latch_find_bkt <= ht_cmd_bkt;
+                // Clear stale completion flag immediately so S_EVICT (which
+                // runs 1 cycle later via S_BKT_FIND_WAIT) sees done=0 and
+                // waits for the NEW BKT_FIND to complete.  Without this,
+                // S_EVICT would pass the !ht_bkt_find_done guard using the
+                // previous operation's stale flag.
+                ht_bkt_find_done <= 0;
             end
 
             case (ht_state)
@@ -2331,7 +2375,7 @@ module flat_oram_gcm #(
                         ht_stash_idx <= ht_latch_del_idx;
                         ht_del_bkt    <= ht_latch_del_bkt;    // unlink bucket
                         ht_del_target <= ht_latch_del_idx;    // idx to remove
-                        ht_hash <= ht_latch_del_addr[26:12];
+                        // (ht_hash removed — direct indexed)
                         ht_addr <= ht_slot_hbm_addr(ht_latch_del_addr);
                         st_sng_addr <= ht_slot_hbm_addr(ht_latch_del_addr);
                         st_sng_rd_req <= 1;
@@ -2347,7 +2391,7 @@ module flat_oram_gcm #(
                         ht_slot_addr <= ht_latch_ins_addr;
                         ht_target_bkt <= ht_latch_ins_bkt;
                         ht_stash_idx <= ht_latch_ins_idx;
-                        ht_hash <= ht_latch_ins_addr[26:12];
+                        // (ht_hash removed — direct indexed)
                         ht_addr <= ht_slot_hbm_addr(ht_latch_ins_addr);
                         st_sng_addr <= ht_slot_hbm_addr(ht_latch_ins_addr);
                         st_sng_rd_req <= 1;
@@ -2362,7 +2406,7 @@ module flat_oram_gcm #(
                     end else if (ht_latch_slot_lookup) begin
                         ht_latch_slot_lookup <= 0;
                         ht_slot_addr <= ht_latch_lu_addr;
-                        ht_hash <= ht_latch_lu_addr[26:12];
+                        // (ht_hash removed — direct indexed)
                         ht_addr <= ht_slot_hbm_addr(ht_latch_lu_addr);
                         st_sng_addr <= ht_slot_hbm_addr(ht_latch_lu_addr);
                         st_sng_rd_req <= 1;
@@ -2429,44 +2473,27 @@ module flat_oram_gcm #(
                     HT_OP_SLOT_LOOKUP: begin
                         ht_slot_found <= 0;
                         ht_found = 0;
+                        // Direct-indexed: position = slot_index[2:0]
+                        begin
+                            reg [2:0] di_pos;
+                            reg [DI_ENTRY_W-1:0] di_entry;
+                            di_pos = ht_slot_addr[14:12];
+                            di_entry = ht_beat[di_pos*DI_ENTRY_W +: DI_ENTRY_W];
+                            if (di_entry[DI_VAL_BIT]) begin
+                                ht_slot_found <= 1;
+                                ht_found = 1;
+                                ht_found_idx <= di_entry[DI_IDX_OFS +: PTR_W];
+                                ht_found_bkt <= di_entry[DI_BKT_OFS +: BUCKET_W];
+                            end
+                        end
                         // Latch LOOKUP diagnostic
                         dbg_ht_lu_hbm_addr <= ht_addr;
-                        dbg_ht_lu_valid_bits <= {ht_beat[3*64+HT_VAL_BIT],
-                                                  ht_beat[2*64+HT_VAL_BIT],
-                                                  ht_beat[1*64+HT_VAL_BIT],
-                                                  ht_beat[0*64+HT_VAL_BIT]};
+                        dbg_ht_lu_valid_bits <= 4'b0;  // legacy field, unused
                         dbg_ht_lu_wb_hit <= ht_wb_hit_latched;
                         dbg_ht_lu_slot_looked_up <= ht_slot_addr;
                         `ifndef SYNTHESIS
-                        $display("[HT_LOOKUP_RD] t=%0t slot=0x%08h addr=0x%0h hash=%0d rdata[63:0]=0x%016h entry[0..3]valid=%b%b%b%b wb_hit=%b",
-                                 $time, ht_slot_addr, ht_addr, ht_hash,
-                                 ht_beat[63:0],
-                                 ht_beat[63], ht_beat[127], ht_beat[191], ht_beat[255],
-                                 ht_wb_hit);
-                        `endif
-                        for (ht_j = 0; ht_j < 4; ht_j = ht_j + 1) begin
-                            if (ht_beat[ht_j*64 + HT_VAL_BIT] &&
-                                ht_beat[ht_j*64+HT_ADDR_OFS +: SLOT_AW] == ht_slot_addr) begin
-                                ht_slot_found <= 1;
-                                ht_found = 1;
-                                ht_found_idx <= ht_beat[ht_j*64+HT_IDX_OFS +: PTR_W];
-                                ht_found_bkt <= ht_beat[ht_j*64+HT_BKT_OFS +: BUCKET_W];
-                            end
-                        end
-                        `ifndef SYNTHESIS
-                        // Per-entry decode of the home beat: valid|slot|bkt|idx for
-                        // each of the 4 entries. Audits HT SLOT-table contents.
-                        $display("[HT_LU_ENTRIES] t=%0t lu_slot=0x%08h addr=0x%0h | e0:v%b s=0x%08h b=%0d i=%0d | e1:v%b s=0x%08h b=%0d i=%0d | e2:v%b s=0x%08h b=%0d i=%0d | e3:v%b s=0x%08h b=%0d i=%0d",
-                                 $time, ht_slot_addr, ht_addr,
-                                 ht_beat[0*64+HT_VAL_BIT], ht_beat[0*64+HT_ADDR_OFS +:SLOT_AW], ht_beat[0*64+HT_BKT_OFS +:BUCKET_W], ht_beat[0*64+HT_IDX_OFS +:PTR_W],
-                                 ht_beat[1*64+HT_VAL_BIT], ht_beat[1*64+HT_ADDR_OFS +:SLOT_AW], ht_beat[1*64+HT_BKT_OFS +:BUCKET_W], ht_beat[1*64+HT_IDX_OFS +:PTR_W],
-                                 ht_beat[2*64+HT_VAL_BIT], ht_beat[2*64+HT_ADDR_OFS +:SLOT_AW], ht_beat[2*64+HT_BKT_OFS +:BUCKET_W], ht_beat[2*64+HT_IDX_OFS +:PTR_W],
-                                 ht_beat[3*64+HT_VAL_BIT], ht_beat[3*64+HT_ADDR_OFS +:SLOT_AW], ht_beat[3*64+HT_BKT_OFS +:BUCKET_W], ht_beat[3*64+HT_IDX_OFS +:PTR_W]);
-                        `endif
-                        // Step 5: HT authoritative, no shadow
-                        `ifndef SYNTHESIS
-                        $display("[HT_LOOKUP] t=%0t slot=0x%08h: HT=%s idx=%0d bkt=%0d",
-                                 $time, ht_slot_addr,
+                        $display("[HT_LOOKUP] t=%0t slot=0x%08h addr=0x%0h pos=%0d: HT=%s idx=%0d bkt=%0d",
+                                 $time, ht_slot_addr, ht_addr, ht_slot_addr[14:12],
                                  ht_found ? "HIT" : "MISS",
                                  ht_found_idx, ht_found_bkt);
                         `endif
@@ -2476,54 +2503,29 @@ module flat_oram_gcm #(
 
                     HT_OP_SLOT_INSERT: begin
                         if (ht_sub_op == 0) begin
-                            ht_inserted = 0;
-                            ht_new_beat = ht_beat;
-                            // First: check if slot_addr already exists (update in place)
-                            for (ht_j = 0; ht_j < 4; ht_j = ht_j + 1) begin
-                                if (!ht_inserted &&
-                                    ht_beat[ht_j*64+HT_ADDR_OFS +: SLOT_AW] == ht_slot_addr) begin
-                                    ht_new_beat[ht_j*64 + HT_VAL_BIT] = 1'b1;
-                                    ht_new_beat[ht_j*64+HT_IDX_OFS +: PTR_W] = ht_stash_idx;
-                                    ht_new_beat[ht_j*64+HT_BKT_OFS +: BUCKET_W] = ht_target_bkt;
-                                    ht_new_beat[ht_j*64+HT_ADDR_OFS +: SLOT_AW] = ht_slot_addr;
-                                    ht_new_beat[ht_j*64 +: 4] = 4'b0;
-                                    ht_inserted = 1;
-                                end
+                            // Direct-indexed: write to position = slot_index[2:0].
+                            // No scan needed. Overflow impossible by construction.
+                            begin
+                                reg [2:0] di_pos;
+                                di_pos = ht_slot_addr[14:12];
+                                ht_new_beat = ht_beat;
+                                ht_new_beat[di_pos*DI_ENTRY_W + DI_VAL_BIT]           = 1'b1;
+                                ht_new_beat[di_pos*DI_ENTRY_W+DI_IDX_OFS +: PTR_W]    = ht_stash_idx;
+                                ht_new_beat[di_pos*DI_ENTRY_W+DI_BKT_OFS +: BUCKET_W] = ht_target_bkt;
                             end
-                            // Second: find empty slot if no existing entry
-                            if (!ht_inserted) begin
-                                for (ht_j = 0; ht_j < 4; ht_j = ht_j + 1) begin
-                                    if (!ht_inserted && !ht_beat[ht_j*64 + HT_VAL_BIT]) begin
-                                        ht_new_beat[ht_j*64 + HT_VAL_BIT] = 1'b1;
-                                        ht_new_beat[ht_j*64+HT_IDX_OFS +: PTR_W] = ht_stash_idx;
-                                        ht_new_beat[ht_j*64+HT_BKT_OFS +: BUCKET_W] = ht_target_bkt;
-                                        ht_new_beat[ht_j*64+HT_ADDR_OFS +: SLOT_AW] = ht_slot_addr;
-                                        ht_new_beat[ht_j*64 +: 4] = 4'b0;
-                                        ht_inserted = 1;
-                                    end
-                                end
-                            end
-                            if (ht_inserted) begin
-                                st_sng_addr <= ht_addr;
-                                st_sng_wdata <= ht_new_beat;
-                                st_sng_wr_req <= 1;
-                                ht_wb_valid[ht_addr[6:5]] <= 1;
-                                ht_wb_addr[ht_addr[6:5]] <= ht_addr;
-                                ht_wb_data[ht_addr[6:5]] <= ht_new_beat;
-                                ht_sub_op <= 1;
-                                ht_state <= HT_WAIT_WR;
-                                `ifndef SYNTHESIS
-                                $display("[HT_INSERT_WR] t=%0t slot=0x%08h addr=0x%0h hash=%0d entry[0..3]valid=%b%b%b%b",
-                                         $time, ht_slot_addr, ht_addr, ht_hash,
-                                         ht_new_beat[63], ht_new_beat[127], ht_new_beat[191], ht_new_beat[255]);
-                                `endif
-                            end else begin
-                                `ifndef SYNTHESIS
-                                $display("[HT_WARN] t=%0t SLOT INSERT: no empty slot at hash=%0d", $time, ht_hash);
-                                `endif
-                                ht_done <= 1;
-                                ht_state <= HT_IDLE;
-                            end
+                            st_sng_addr <= ht_addr;
+                            st_sng_wdata <= ht_new_beat;
+                            st_sng_wr_req <= 1;
+                            ht_wb_valid[ht_addr[6:5]] <= 1;
+                            ht_wb_addr[ht_addr[6:5]] <= ht_addr;
+                            ht_wb_data[ht_addr[6:5]] <= ht_new_beat;
+                            ht_sub_op <= 1;
+                            ht_state <= HT_WAIT_WR;
+                            `ifndef SYNTHESIS
+                            $display("[HT_INSERT_WR] t=%0t slot=0x%08h addr=0x%0h pos=%0d idx=%0d bkt=%0d",
+                                     $time, ht_slot_addr, ht_addr,
+                                     ht_slot_addr[14:12], ht_stash_idx, ht_target_bkt);
+                            `endif
                         end else if (ht_sub_op == 2) begin
                             // Read BKT head result. Head-insert: new entry becomes
                             // head, its next = old_head.
@@ -2586,22 +2588,21 @@ module flat_oram_gcm #(
 
                     HT_OP_SLOT_DELETE: begin
                         if (ht_sub_op == 0) begin
-                            ht_found = 0;
-                            ht_new_beat = ht_beat;
-                            for (ht_j = 0; ht_j < 4; ht_j = ht_j + 1) begin
-                                if (!ht_found && ht_beat[ht_j*64 + HT_VAL_BIT] &&
-                                    ht_beat[ht_j*64+HT_ADDR_OFS +: SLOT_AW] == ht_slot_addr) begin
-                                    ht_new_beat[ht_j*64 +: 64] = 64'b0;
-                                    ht_found = 1;
-                                    `ifndef SYNTHESIS
-                                    $display("[HT_DEL_SLOT] t=%0t slot=0x%08h addr=0x%0h MATCH entry%0d (was valid=1 bkt=%0d idx=%0d) -> cleared",
-                                             $time, ht_slot_addr, ht_addr, ht_j,
-                                             ht_beat[ht_j*64+HT_BKT_OFS +: BUCKET_W],
-                                             ht_beat[ht_j*64+HT_IDX_OFS +: PTR_W]);
-                                    `endif
-                                end
+                            // Direct-indexed: clear position = slot_index[2:0].
+                            begin
+                                reg [2:0] di_pos;
+                                reg [DI_ENTRY_W-1:0] di_entry;
+                                di_pos = ht_slot_addr[14:12];
+                                di_entry = ht_beat[di_pos*DI_ENTRY_W +: DI_ENTRY_W];
+                                ht_found = di_entry[DI_VAL_BIT];
+                                ht_new_beat = ht_beat;
+                                ht_new_beat[di_pos*DI_ENTRY_W +: DI_ENTRY_W] = {DI_ENTRY_W{1'b0}};
                             end
                             if (ht_found) begin
+                                `ifndef SYNTHESIS
+                                $display("[HT_DEL_SLOT] t=%0t slot=0x%08h addr=0x%0h pos=%0d -> cleared",
+                                         $time, ht_slot_addr, ht_addr, ht_slot_addr[14:12]);
+                                `endif
                                 st_sng_addr <= ht_addr;
                                 st_sng_wdata <= ht_new_beat;
                                 st_sng_wr_req <= 1;
@@ -2612,7 +2613,8 @@ module flat_oram_gcm #(
                                 ht_state <= HT_WAIT_WR;
                             end else begin
                                 `ifndef SYNTHESIS
-                                $display("[HT_WARN] t=%0t SLOT DELETE: not found addr=0x%08h", $time, ht_slot_addr);
+                                $display("[HT_WARN] t=%0t SLOT DELETE: not found addr=0x%08h pos=%0d",
+                                         $time, ht_slot_addr, ht_slot_addr[14:12]);
                                 `endif
                                 ht_done <= 1;
                                 ht_state <= HT_IDLE;

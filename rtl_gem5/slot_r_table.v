@@ -38,6 +38,7 @@ module slot_r_table #(
     parameter DEPTH       = `ORAM_STASH_DEPTH,
     parameter PTR_W       = `STASH_PTR_W,
     parameter SLOT_AW     = `SLOT_ADDR_W,
+    parameter BUCKET_W    = `BUCKET_ID_W,
     parameter AXI_DW      = `AXI_DATA_W,
     parameter AXI_AW      = `AXI_ADDR_W,
     parameter AXI_SW      = `AXI_STRB_W,
@@ -54,11 +55,13 @@ module slot_r_table #(
     input  wire [PTR_W-1:0]     rd_idx,
     input  wire                 rd_en,
     output reg  [SLOT_AW-1:0]   rd_slot_addr,
+    output reg  [BUCKET_W-1:0]  rd_bucket,       // bucket co-stored with slot addr
     output reg                  rd_valid,
 
     // Write port: direct stash-entry index -- fire-and-forget; latched.
     input  wire [PTR_W-1:0]     wr_idx,
     input  wire [SLOT_AW-1:0]   wr_slot_addr,
+    input  wire [BUCKET_W-1:0]  wr_bucket,       // bucket co-stored with slot addr
     input  wire                 wr_en,
 
     // Busy: high whenever a read is in flight OR any write is queued/draining.
@@ -122,6 +125,7 @@ module slot_r_table #(
     // =========================================================================
     reg [PTR_W-1:0]   wq_idx  [0:QDEPTH-1];
     reg [SLOT_AW-1:0] wq_slot [0:QDEPTH-1];
+    reg [BUCKET_W-1:0] wq_bkt [0:QDEPTH-1];
     reg [$clog2(QDEPTH+1)-1:0] wq_count;     // 0..QDEPTH
     reg [$clog2(QDEPTH)-1:0]   wq_head;      // next entry to drain
     reg [$clog2(QDEPTH)-1:0]   wq_tail;      // next free slot
@@ -151,6 +155,7 @@ module slot_r_table #(
         if (!rst_n) begin
             sr_state      <= S_IDLE;
             rd_slot_addr  <= {SLOT_AW{1'b0}};
+            rd_bucket     <= {BUCKET_W{1'b0}};
             rd_valid      <= 1'b0;
             wq_count      <= 0;
             wq_head       <= 0;
@@ -167,6 +172,7 @@ module slot_r_table #(
             for (k = 0; k < QDEPTH; k = k + 1) begin
                 wq_idx[k]  <= {PTR_W{1'b0}};
                 wq_slot[k] <= {SLOT_AW{1'b0}};
+                wq_bkt[k]  <= {BUCKET_W{1'b0}};
             end
         end else begin
             rd_valid <= 1'b0;
@@ -175,10 +181,11 @@ module slot_r_table #(
             if (do_enq) begin
                 wq_idx[wq_tail]  <= wr_idx;
                 wq_slot[wq_tail] <= wr_slot_addr;
+                wq_bkt[wq_tail]  <= wr_bucket;
                 wq_tail          <= (wq_tail == QDEPTH-1) ? 0 : wq_tail + 1;
                 `ifndef SYNTHESIS
-                $display("[SLOTR] ENQ idx=%0d slot=0x%08h tail=%0d count=%0d->%0d @%0t",
-                         wr_idx, wr_slot_addr, wq_tail, wq_count,
+                $display("[SLOTR] ENQ idx=%0d slot=0x%08h bkt=%0d tail=%0d count=%0d->%0d @%0t",
+                         wr_idx, wr_slot_addr, wr_bucket, wq_tail, wq_count,
                          (do_deq ? wq_count : wq_count+1), $time);
                 `endif
             end
@@ -212,8 +219,8 @@ module slot_r_table #(
                     m_axi_awsize  <= AXI_SIZE;
                     m_axi_awburst <= AXI_BURST;
                     m_axi_awvalid <= 1'b1;
-                    // Full-beat write: { pad[223:0], slot_addr[31:0] }.
-                    m_axi_wdata   <= {{(AXI_DW-SLOT_AW){1'b0}}, wq_slot[wq_head]};
+                    // Full-beat write: { pad, bucket[BUCKET_W-1:0], slot_addr[31:0] }.
+                    m_axi_wdata   <= {{(AXI_DW-SLOT_AW-BUCKET_W){1'b0}}, wq_bkt[wq_head], wq_slot[wq_head]};
                     m_axi_wstrb   <= {AXI_SW{1'b1}};
                     m_axi_wlast   <= 1'b1;
                     m_axi_wvalid  <= 1'b1;
@@ -243,11 +250,12 @@ module slot_r_table #(
                 if (m_axi_rvalid) begin
                     m_axi_rready <= 1'b0;
                     rd_slot_addr <= m_axi_rdata[SLOT_AW-1:0];
+                    rd_bucket    <= m_axi_rdata[SLOT_AW +: BUCKET_W];
                     rd_valid     <= 1'b1;
                     sr_state     <= S_IDLE;
                     `ifndef SYNTHESIS
-                    $display("[SLOTR] RD done: slot=0x%08h @%0t",
-                             m_axi_rdata[SLOT_AW-1:0], $time);
+                    $display("[SLOTR] RD done: slot=0x%08h bkt=%0d @%0t",
+                             m_axi_rdata[SLOT_AW-1:0], m_axi_rdata[SLOT_AW +: BUCKET_W], $time);
                     `endif
                 end
             end
