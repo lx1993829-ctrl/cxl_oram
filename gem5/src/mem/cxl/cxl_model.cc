@@ -397,6 +397,9 @@ void CxlModel::enqueueUpstream(FlitEntry &flit)
     }
     flit.readyTick = startTick + linkDelay;
     upstreamBusyUntil = flit.readyTick;
+    if (startTick > earliest)
+        inform("CXL-UP-WAIT port=%d wait=%llu",
+               flit.srcPortIdx, startTick - earliest);
     lastFlitEmitTick = startTick;  // Review item #3: track last emit
 
     // Phase A.1: push to per-port queue. The wire (upstreamBusyUntil)
@@ -431,6 +434,9 @@ void CxlModel::enqueueDownstream(FlitEntry &flit, Tick earliestStart)
     Tick serDelay = serializationDelay(flit.wireBytes);
     flit.readyTick = startTick + serDelay;
     downstreamBusyUntil = flit.readyTick;
+    if (startTick > earliestStart)
+        inform("CXL-DN-WAIT port=%d wait=%llu serDelay=%llu",
+               flit.srcPortIdx, startTick - earliestStart, serDelay);
 
     // Phase A.1: push to per-port downstream queue keyed by source port.
     // The wire (downstreamBusyUntil) stays shared; queue split prevents
@@ -1074,6 +1080,9 @@ void CxlModel::processUpstreamQueue()
                 rcEndUp = rcStartUp + rcThroughputDelay;
             }
             rcUpstreamBusyUntil = rcEndUp;
+            if (!rcColdUp && rcStartUp > now)
+                inform("CXL-RC-UP-WAIT port=%d wait=%llu",
+                       flit.srcPortIdx, rcStartUp - now);
             Tick earliestSend = std::max(rcEndUp, curTick() + 1);
             unsigned moved = 0;
 
@@ -1424,6 +1433,9 @@ bool CxlModel::handleHostResponse(PacketPtr pkt)
         rcEnd = rcStart + rcThroughputDelay;
     }
     rcDownstreamBusyUntil = rcEnd;
+    if (!rcCold && rcStart > now)
+        inform("CXL-RC-DN-WAIT port=%d wait=%llu",
+               cplFlit.srcPortIdx, rcStart - now);
     // lastDownstreamRcTick removed — was written but never read
 
     // Stage 2: Shared Gen5 wire serialization.
@@ -1435,6 +1447,9 @@ bool CxlModel::handleHostResponse(PacketPtr pkt)
     Tick wireStart = std::max({rcEnd, downstreamBusyUntil, coreGateTick});
     Tick wireEnd = wireStart + wireSerDelay;
     downstreamBusyUntil = wireEnd;
+    if (wireStart > rcEnd)
+        inform("CXL-DN-WIRE-WAIT port=%d wait=%llu wireSerDelay=%llu",
+               cplFlit.srcPortIdx, wireStart - rcEnd, wireSerDelay);
     lastDownstreamFlitEmit = wireStart;
 
     // Stage 3: Per-port CDC — shared FIFO → crossbar → per-port AXI.
