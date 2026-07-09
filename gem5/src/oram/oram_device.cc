@@ -261,8 +261,15 @@ OramDevice::OramDevice(const OramDeviceParams &p)
     }
     hbmSlotCount = (numSlots * localPct) / 100;
     if (hbmSlotCount == 0 && localPct > 0) hbmSlotCount = 1;
-    inform("ORAM: %u slots, HBM=%u, host=%u",
-           numSlots, hbmSlotCount, numSlots - hbmSlotCount);
+    // Bucket routing: buckets whose slots are ALL local go to HBM.
+    // Partially-local buckets go to host DDR5 (conservative: avoids
+    // split-memory coherence bug where two ops on different slots in
+    // the same bucket route to different physical memories).
+    hbmBucketCount = hbmSlotCount / ORAM_C;
+    inform("ORAM: %u slots, HBM=%u, host=%u (buckets: HBM=%u, host=%u)",
+           numSlots, hbmSlotCount, numSlots - hbmSlotCount,
+           hbmBucketCount,
+           ((numSlots + ORAM_C - 1) / ORAM_C) - hbmBucketCount);
     if (cpuDriven) {
         inform("ORAM: cpu_driven mode, K=%u clients, cmd_base=0x%lx, "
                "result_buf_base=0x%lx",
@@ -395,6 +402,7 @@ const char* OramDevice::metaRegionTag(Addr a)
     return "BUCKET";
 }
 bool OramDevice::isHostSlot(uint32_t s) { return s >= hbmSlotCount; }
+bool OramDevice::isHostBucket(uint32_t b) { return b >= hbmBucketCount; }
 
 // =============================================================================
 // Tick — the heart of the simulation
@@ -853,9 +861,16 @@ void OramDevice::tick()
         // sel_stash may be 0 if the AR was delayed by stashReadPending
         // gate past the whitelisted FSM state. Use address as ground truth:
         // AXI addr >= 0x10000000 is metadata region (always HBM).
+        // Bucket data: route by BUCKET INDEX (not slot index) so all ops
+        // on the same bucket hit the same physical memory. This prevents
+        // the split-memory coherence bug where two slots sharing a bucket
+        // route to different backing stores.
         bool isMetadataAddr = (s_araddr >= METADATA_REGION_START);
-        bool pcie = (s_sel_stash || s_sel_posmap || isMetadataAddr)
-                    ? false : currentOpIsPcie;
+        bool pcie;
+        if (s_sel_stash || s_sel_posmap || isMetadataAddr)
+            pcie = false;  // metadata always HBM
+        else
+            pcie = isHostBucket((uint32_t)(s_araddr / BUCKET_BYTES));
 
         DPRINTF(Oram, "[%lu] AR: 0x%lx len=%d %s%s%s (sel_st=%d sel_pm=%d)\n",
                 oramCycle, (uint64_t)s_araddr, (int)s_arlen,
@@ -918,10 +933,13 @@ void OramDevice::tick()
     // that arrive before W-LAST can be matched
     if (s_awvalid && s_awready) {
         Addr axiAddr = s_awaddr;
-        // Same metadata routing as AR — see comment above.
+        // Same metadata/bucket routing as AR — see comment above.
         bool isMetadataAddr = (axiAddr >= METADATA_REGION_START);
-        bool pcie = (s_sel_stash || s_sel_posmap || isMetadataAddr)
-                    ? false : currentOpIsPcie;
+        bool pcie;
+        if (s_sel_stash || s_sel_posmap || isMetadataAddr)
+            pcie = false;  // metadata always HBM
+        else
+            pcie = isHostBucket((uint32_t)(axiAddr / BUCKET_BYTES));
 
         DPRINTF(Oram, "[%lu] AW: 0x%lx len=%d %s%s%s (sel_st=%d sel_pm=%d)\n",
                 oramCycle, (uint64_t)axiAddr, (int)s_awlen,
@@ -1102,7 +1120,7 @@ void OramDevice::tick()
             // this address returns it even if the HBM commit lags BRESP.
             {
                 Addr htSlotStart = hbmBase + HT_SLOT_BASE_ADDR;
-                Addr htSlotEnd   = hbmBase + HT_SLOT_BASE_ADDR + 8192 * AXI_DATA_BYTES;
+                Addr htSlotEnd   = hbmBase + HT_SLOT_BASE_ADDR + 4096 * AXI_DATA_BYTES;
                 if (gem5Addr >= htSlotStart && gem5Addr < htSlotEnd &&
                     beatBytes >= AXI_DATA_BYTES) {
                     std::array<uint8_t, 32> e;
@@ -1166,6 +1184,34 @@ void OramDevice::tick()
                     std::array<uint8_t, 32> e;
                     memcpy(e.data(), s_wdata, AXI_DATA_BYTES);
                     htBktNextShadow[gem5Addr] = e;
+                }
+            }
+            // IVT / SLOT_R / BUCKET_META write-shadows: same RAW hazard.
+            // wFifo delays can cause a read to reach the MemCtrl before
+            // the write, returning stale data. IVT is the most critical:
+            // a stale IV → AES-GCM tag mismatch → silent data corruption.
+            {
+                Addr ivtStart  = hbmBase + IVT_BASE_ADDR;
+                Addr ivtEnd    = ivtStart + 65536 * AXI_DATA_BYTES;  // IVT_PHYS_SLOTS
+                Addr srStart   = hbmBase + SLOT_R_BASE_ADDR;
+                Addr srEnd     = srStart  + STASH_DEPTH * AXI_DATA_BYTES;
+                Addr bmStart   = hbmBase + BUCKET_META_BASE_ADDR;
+                Addr bmEnd     = bmStart  + MAX_BUCKETS * AXI_DATA_BYTES;
+                if (gem5Addr >= ivtStart && gem5Addr < ivtEnd &&
+                    beatBytes >= AXI_DATA_BYTES) {
+                    std::array<uint8_t, 32> e;
+                    memcpy(e.data(), s_wdata, AXI_DATA_BYTES);
+                    ivtShadow[gem5Addr] = e;
+                } else if (gem5Addr >= srStart && gem5Addr < srEnd &&
+                           beatBytes >= AXI_DATA_BYTES) {
+                    std::array<uint8_t, 32> e;
+                    memcpy(e.data(), s_wdata, AXI_DATA_BYTES);
+                    slotRShadow[gem5Addr] = e;
+                } else if (gem5Addr >= bmStart && gem5Addr < bmEnd &&
+                           beatBytes >= AXI_DATA_BYTES) {
+                    std::array<uint8_t, 32> e;
+                    memcpy(e.data(), s_wdata, AXI_DATA_BYTES);
+                    bmetaShadow[gem5Addr] = e;
                 }
             }
             if (curFsmState == FSM_DDR_WRITE) {
@@ -1745,8 +1791,19 @@ void OramDevice::checkRtlErrors()
     if (oram->err_bucket_overflow)
         fatal("ORAM RTL: bucket overflow @ cycle %lu", oramCycle);
     if (oram->err_tag_mismatch && !tagMismatchWarned) {
-        warn("ORAM RTL: AES-GCM tag mismatch @ cycle %lu "
-             "(expected on first access to uninitialized data)", oramCycle);
+        warn("ORAM RTL: AES-GCM tag mismatch @ cycle %lu inst=%u "
+             "FSM=%d slot=0x%lx bucket=%u "
+             "found_bkt=%d found_stash=%d same_bkt=%d "
+             "opIsPcie=%d hbmBktCount=%u",
+             oramCycle, instanceId,
+             (int)oram->dbg_oram_state,
+             (uint64_t)oram->client_slot_addr,
+             (unsigned)oram->dbg_req_b,
+             (int)oram->dbg_found_in_bucket,
+             (int)oram->dbg_found_in_stash,
+             (int)oram->dbg_same_bucket,
+             (int)currentOpIsPcie,
+             hbmBucketCount);
         tagMismatchWarned = true;
     }
     if (oram->access_violation & 0x1)
@@ -2587,7 +2644,7 @@ void OramDevice::handleMemResp(PacketPtr pkt)
         {
             Addr pktAddr = pkt->getAddr();
             Addr htSlotStart = hbmBase + HT_SLOT_BASE_ADDR;
-            Addr htSlotEnd   = hbmBase + HT_SLOT_BASE_ADDR + 8192 * AXI_DATA_BYTES;
+            Addr htSlotEnd   = hbmBase + HT_SLOT_BASE_ADDR + 4096 * AXI_DATA_BYTES;
             if (pktAddr >= htSlotStart && pktAddr < htSlotEnd &&
                 ss->totalBeats == 1) {
                 auto it = htSlotShadow.find(pktAddr);
@@ -2689,6 +2746,67 @@ void OramDevice::handleMemResp(PacketPtr pkt)
             }
         }
 
+        // IVT read-your-writes: a stale IV causes AES-GCM decryption
+        // with the wrong IV → tag mismatch → silent data corruption.
+        {
+            Addr pktAddr = pkt->getAddr();
+            Addr ivtStart = hbmBase + IVT_BASE_ADDR;
+            Addr ivtEnd   = ivtStart + 65536 * AXI_DATA_BYTES;
+            if (pktAddr >= ivtStart && pktAddr < ivtEnd &&
+                ss->totalBeats == 1) {
+                auto it = ivtShadow.find(pktAddr);
+                if (it != ivtShadow.end()) {
+                    uint8_t *pd = pkt->getPtr<uint8_t>();
+                    bool differs = (memcmp(pd, it->second.data(), AXI_DATA_BYTES) != 0);
+                    memcpy(pd, it->second.data(), AXI_DATA_BYTES);
+                    if (differs)
+                        DPRINTF(Oram, "[cyc %lu] IVT_FWD at 0x%lx: shadow corrected stale IVT read\n",
+                               oramCycle, pktAddr);
+                }
+            }
+        }
+
+        // SLOT_R read-your-writes: stale slot_r → wrong slot address
+        // for eviction → encrypt/write-back to wrong DDR location.
+        {
+            Addr pktAddr = pkt->getAddr();
+            Addr srStart = hbmBase + SLOT_R_BASE_ADDR;
+            Addr srEnd   = srStart + STASH_DEPTH * AXI_DATA_BYTES;
+            if (pktAddr >= srStart && pktAddr < srEnd &&
+                ss->totalBeats == 1) {
+                auto it = slotRShadow.find(pktAddr);
+                if (it != slotRShadow.end()) {
+                    uint8_t *pd = pkt->getPtr<uint8_t>();
+                    bool differs = (memcmp(pd, it->second.data(), AXI_DATA_BYTES) != 0);
+                    memcpy(pd, it->second.data(), AXI_DATA_BYTES);
+                    if (differs)
+                        DPRINTF(Oram, "[cyc %lu] SLOTR_FWD at 0x%lx: shadow corrected stale SLOT_R read\n",
+                               oramCycle, pktAddr);
+                }
+            }
+        }
+
+        // BUCKET_META read-your-writes: stale fill_count or slot_list
+        // → wrong bucket occupancy → eviction to occupied position or
+        // bucket overflow.
+        {
+            Addr pktAddr = pkt->getAddr();
+            Addr bmStart = hbmBase + BUCKET_META_BASE_ADDR;
+            Addr bmEnd   = bmStart + MAX_BUCKETS * AXI_DATA_BYTES;
+            if (pktAddr >= bmStart && pktAddr < bmEnd &&
+                ss->totalBeats == 1) {
+                auto it = bmetaShadow.find(pktAddr);
+                if (it != bmetaShadow.end()) {
+                    uint8_t *pd = pkt->getPtr<uint8_t>();
+                    bool differs = (memcmp(pd, it->second.data(), AXI_DATA_BYTES) != 0);
+                    memcpy(pd, it->second.data(), AXI_DATA_BYTES);
+                    if (differs)
+                        DPRINTF(Oram, "[cyc %lu] BMETA_FWD at 0x%lx: shadow corrected stale BUCKET_META read\n",
+                               oramCycle, pktAddr);
+                }
+            }
+        }
+
         // First beat (always present)
         bool found = deliverBeat(ss->burstSeq, ss->beatIdx,
                                   pkt->getConstPtr<uint8_t>(), 0,
@@ -2698,7 +2816,7 @@ void OramDevice::handleMemResp(PacketPtr pkt)
         {
             Addr pktAddr = pkt->getAddr();
             Addr htSlotStart = hbmBase + HT_SLOT_BASE_ADDR;
-            Addr htSlotEnd   = hbmBase + HT_SLOT_BASE_ADDR + 8192 * AXI_DATA_BYTES; // 256KB
+            Addr htSlotEnd   = hbmBase + HT_SLOT_BASE_ADDR + 4096 * AXI_DATA_BYTES; // 128KB (direct-indexed)
             if (pktAddr >= htSlotStart && pktAddr < htSlotEnd && ss->totalBeats == 1) {
                 // Single-beat HT SLOT read — verify data via functional
                 auto fReq = std::make_shared<Request>(pktAddr, AXI_DATA_BYTES, 0, reqId);
@@ -3037,8 +3155,35 @@ void OramDevice::initNextSlot()
         static constexpr int BLKS_PER_ORAM = BLOCK_SZ / AES_BLK; // 256
         static constexpr int BEATS_PER_BLK = BLOCK_SZ / AXI_DATA_BYTES; // 128
 
+        // --- Pre-zero IVT BEFORE the DDR fill ---
+        // The DDR fill writes real IVT entries for positions 0..C-1.
+        // Dummy positions (C..Z-1) keep zeros. The zero-fill MUST run
+        // first so the DDR fill's real entries are not overwritten.
+        {
+            int ivtEntries = std::min(totalBuckets, (int)MAX_BUCKETS) * ORAM_Z;
+            inform("[cyc %lu] IVT_FILL: pre-zeroing %d IV/TAG entries (%d KB) base=0x%lx",
+                   oramCycle, ivtEntries, ivtEntries * AXI_DATA_BYTES / 1024,
+                   (uint64_t)ivtBase);
+            for (int i = 0; i < ivtEntries; i++) {
+                Addr addr = ivtBase + (Addr)i * AXI_DATA_BYTES;
+                auto req = std::make_shared<Request>(addr, AXI_DATA_BYTES, 0, reqId);
+                PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
+                uint8_t *buf = new uint8_t[AXI_DATA_BYTES];
+                memset(buf, 0, AXI_DATA_BYTES);
+                pkt->dataDynamic(buf);
+                hbmPort.sendAtomic(pkt);
+                delete pkt;
+            }
+            inform("[cyc %lu] IVT_FILL: pre-zero complete", oramCycle);
+        }
+
         for (int b = 0; b < totalBuckets; b++) {
-            Addr bucketBase = hbmBase + (Addr)b * BUCKET_BYTES;
+            // Route bucket data to HBM or host DDR5 based on bucket index.
+            // Must match the runtime AR/AW routing (isHostBucket) so the
+            // RTL reads bucket data from the same memory it was initialized in.
+            bool hostBkt = isHostBucket((uint32_t)b);
+            Addr bucketBase = hostBkt ? (hostBase + (Addr)b * BUCKET_BYTES)
+                                      : (hbmBase  + (Addr)b * BUCKET_BYTES);
 
             for (int pos = 0; pos < ORAM_Z; pos++) {
                 Addr blockBase = bucketBase + (Addr)pos * BLOCK_SZ;
@@ -3075,7 +3220,7 @@ void OramDevice::initNextSlot()
                         for (int j = 0; j < AES_BLK; j++)
                             cipher_mem[i*AES_BLK + j] = cipher_aes[i*AES_BLK + (AES_BLK-1-j)];
 
-                    // Write encrypted block to HBM (128 beats × 32 bytes)
+                    // Write encrypted block (128 beats × 32 bytes) to correct memory
                     for (int beat = 0; beat < BEATS_PER_BLK; beat++) {
                         Addr addr = blockBase + (Addr)beat * AXI_DATA_BYTES;
                         auto req = std::make_shared<Request>(addr, AXI_DATA_BYTES, 0, reqId);
@@ -3083,7 +3228,8 @@ void OramDevice::initNextSlot()
                         uint8_t *buf = new uint8_t[AXI_DATA_BYTES];
                         memcpy(buf, cipher_mem + beat * AXI_DATA_BYTES, AXI_DATA_BYTES);
                         pkt->dataDynamic(buf);
-                        hbmPort.sendFunctional(pkt);
+                        if (hostBkt) pciePort.sendFunctional(pkt);
+                        else         hbmPort.sendFunctional(pkt);
                         delete pkt;
                     }
 
@@ -3108,23 +3254,49 @@ void OramDevice::initNextSlot()
                     delete ivtPkt;
 
                 } else {
-                    // Dummy position: write zeros
+                    // Dummy position: write zeros to correct memory
                     for (int beat = 0; beat < BEATS_PER_BLK; beat++) {
                         Addr addr = blockBase + (Addr)beat * AXI_DATA_BYTES;
                         auto req = std::make_shared<Request>(addr, AXI_DATA_BYTES, 0, reqId);
                         PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
                         uint8_t *buf = new uint8_t[AXI_DATA_BYTES]();
                         pkt->dataDynamic(buf);
-                        hbmPort.sendFunctional(pkt);
+                        if (hostBkt) pciePort.sendFunctional(pkt);
+                        else         hbmPort.sendFunctional(pkt);
                         delete pkt;
                     }
-                    // IVT for dummy: already zeroed by IVT_FILL below
+                    // IVT for dummy: already zeroed by IVT_FILL above
                 }
             }
         }
 
         inform("[cyc %lu] DDR_FILL: done, %d buckets × %d real slots encrypted",
                oramCycle, totalBuckets, ORAM_C);
+
+        // --- DDR_FILL VERIFICATION: confirm IVT entries survived ---
+        // Read back the IVT entry for bucket 0, pos 0 (physSlot=0) and
+        // verify it's non-zero. If the IVT zero-fill ran AFTER the DDR
+        // fill, this would be all zeros → tag mismatch on first access.
+        {
+            Addr checkAddr = ivtBase;  // physSlot 0
+            uint8_t checkBuf[AXI_DATA_BYTES];
+            auto fReq = std::make_shared<Request>(checkAddr, AXI_DATA_BYTES, 0, reqId);
+            PacketPtr fPkt = new Packet(fReq, MemCmd::ReadReq);
+            fPkt->dataStatic(checkBuf);
+            hbmPort.sendFunctional(fPkt);
+            delete fPkt;
+            bool allZero = true;
+            for (int b = 0; b < AXI_DATA_BYTES; b++)
+                if (checkBuf[b] != 0) { allZero = false; break; }
+            if (allZero)
+                warn("[cyc %lu] DDR_FILL BUG: IVT[0] is all-zero after DDR fill! "
+                     "IVT zero-fill ran AFTER DDR fill and destroyed IV/tag entries.",
+                     oramCycle);
+            else
+                inform("[cyc %lu] DDR_FILL VERIFY: IVT[0] non-zero (%02x%02x%02x%02x...) — "
+                       "init ordering correct",
+                       oramCycle, checkBuf[3], checkBuf[2], checkBuf[1], checkBuf[0]);
+        }
 
         // --- Zero-fill stash data region ---
         // RTL compiled for max STASH_DEPTH entries. At runtime, only
@@ -3174,15 +3346,10 @@ void OramDevice::initNextSlot()
         // side effect from SLOT's sendAtomic on other regions is overwritten
         // by the later sendFunctional writes to HEAD/NEXT).
         {
-            // SLOT hash table: 2048 entries / 4 per beat = 512 beats
-            // Must be written FIRST because sendAtomic through gem5 HBM2 model may
-            // have side effects on nearby addresses — the original order
-            // (HEAD then NEXT then SLOT) caused SLOT's zeroing to corrupt
-            // HEAD back to zero, making every uninserted bucket head look
-            // like stash index 0 (root cause of phantom-chain bug #5).
+            // SLOT table (direct-indexed): 32768 entries / 8 per beat = 4096 beats
             Addr slotHtBase = hbmBase + HT_SLOT_BASE_ADDR;
-            int slotBeats = 8192;
-            inform("[cyc %lu] HT_FILL: zeroing SLOT hash table (%d beats, %d KB)",
+            int slotBeats = 4096;
+            inform("[cyc %lu] HT_FILL: zeroing SLOT table (%d beats, %d KB)",
                    oramCycle, slotBeats, slotBeats * AXI_DATA_BYTES / 1024);
             for (int i = 0; i < slotBeats; i++) {
                 Addr addr = slotHtBase + (Addr)i * AXI_DATA_BYTES;
@@ -3213,31 +3380,7 @@ void OramDevice::initNextSlot()
                (uint64_t)(hbmBase + SLOT_R_BASE_ADDR),
                (uint64_t)(hbmBase + BUCKET_META_BASE_ADDR));
 
-        // --- Initialize IV/TAG region (per-physical-slot) ---
-        // The IVT table is addressed per physical bucket slot
-        // (phys_idx = bucket*Z + pos). Zero the worst-case footprint so any
-        // read of a not-yet-written physical position returns a known value
-        // rather than garbage. Worst case = numBuckets*Z physical slots,
-        // one 32B beat each. We zero up to MAX_BUCKETS*ORAM_Z entries.
-        {
-            Addr ivtBase = hbmBase + IVT_BASE_ADDR;
-            int usedBuckets = ((int)numSlots + ORAM_C - 1) / ORAM_C;
-            int ivtEntries = std::min(usedBuckets, (int)MAX_BUCKETS) * ORAM_Z;
-            inform("[cyc %lu] IVT_FILL: zeroing %d IV/TAG entries (%d KB) base=0x%lx",
-                   oramCycle, ivtEntries, ivtEntries * AXI_DATA_BYTES / 1024,
-                   (uint64_t)ivtBase);
-            for (int i = 0; i < ivtEntries; i++) {
-                Addr addr = ivtBase + (Addr)i * AXI_DATA_BYTES;
-                auto req = std::make_shared<Request>(addr, AXI_DATA_BYTES, 0, reqId);
-                PacketPtr pkt = new Packet(req, MemCmd::WriteReq);
-                uint8_t *buf = new uint8_t[AXI_DATA_BYTES];
-                memset(buf, 0, AXI_DATA_BYTES);
-                pkt->dataDynamic(buf);
-                hbmPort.sendAtomic(pkt);
-                delete pkt;
-            }
-            inform("[cyc %lu] IVT_FILL: IV/TAG region initialized", oramCycle);
-        }
+        // (IVT zero-fill moved to before DDR fill — see above)
 
         // --- Initialize slot_r region (per-stash-entry slot address) ---
         // slot_r is written on insert before being read on eviction, so a

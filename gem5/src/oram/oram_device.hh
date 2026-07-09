@@ -327,10 +327,12 @@ class OramDevice : public ClockedObject
     static constexpr int STASH_DEPTH = 16384;
 
     uint32_t localPct, numSlots, hbmSlotCount;
+    uint32_t hbmBucketCount;    // buckets 0..hbmBucketCount-1 → HBM, rest → host DDR5
     bool currentOpIsPcie;
 
     bool isStashAddr(Addr axiAddr);
     bool isHostSlot(uint32_t slotIdx);
+    bool isHostBucket(uint32_t bucketIdx);
     // Classify an AXI address into a metadata region for debug/accounting.
     // Returns a short tag string; counts the beats into the per-region totals.
     const char* metaRegionTag(Addr axiAddr);
@@ -440,6 +442,19 @@ class OramDevice : public ClockedObject
     // NEXT[idx] = old_head; if a later chain walk reads this before
     // HBM commits, it follows a stale pointer.
     std::map<Addr, std::array<uint8_t, 32>> htBktNextShadow;
+
+    // IVT write-shadow: AES-GCM IV/tag entries. A stale IV read causes
+    // decryption with the wrong IV → tag mismatch → silent data corruption.
+    // Most critical of the three new shadows.
+    std::map<Addr, std::array<uint8_t, 32>> ivtShadow;
+
+    // SLOT_R write-shadow: per-stash-entry slot address (+ bucket).
+    // A stale read returns the wrong slot address for an eviction candidate.
+    std::map<Addr, std::array<uint8_t, 32>> slotRShadow;
+
+    // BUCKET_META write-shadow: per-bucket directory (slot_list + fill_count).
+    // A stale read returns wrong fill count or slot list → bucket corruption.
+    std::map<Addr, std::array<uint8_t, 32>> bmetaShadow;
 
     // Write data FIFO: models the AXI port write data buffer between
     // the RTL and HBM switch. W beats queue here, then drain to HBM
