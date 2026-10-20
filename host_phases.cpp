@@ -5,6 +5,8 @@
 //   each launch is timed like host_doma's query (launch + wait, commands already on the card), and the phase time is
 //   their sum. Every GET is checked against the latest value written (preload or an earlier PUT).
 //   Refuses to run if LAMBDA / ZPOS below differ from ../rtl/oram_params.vh, when that file is present.
+//   DOMA_PHASE_TRACE=1 (a TRACE=1 bitstream): every command also writes a 32-byte record of 16 phase timestamps after
+//   the launch's response data; each phase prints the mean of 12 phases that add up to E2E (see host_ycsb.cpp).
 #include <sstream>
 #include <fstream>
 #include <regex>
@@ -237,7 +239,8 @@ int main(int argc, char** argv) {
     const size_t max_cmds = std::max<size_t>(CMD_SIZE, std::min<size_t>(NBLK, 5000));
     Buffers b;
     b.cmd   = xrt::bo(device, roundup4k(max_cmds * 32) + max_cmds * BLOCKA, krnl.group_id(0));
-    b.resp  = xrt::bo(device, roundup4k((max_cmds + 2) * 32) + max_cmds * BLOCKA, krnl.group_id(1));
+    const bool PTRACE = std::getenv("DOMA_PHASE_TRACE") && std::string(std::getenv("DOMA_PHASE_TRACE")) != "0";
+    b.resp  = xrt::bo(device, roundup4k((max_cmds + 2) * 32) + max_cmds * BLOCKA + (PTRACE ? max_cmds * 32 : 0), krnl.group_id(1));
     b.pages = std::getenv("DOMA_PAGES_HBM") ? xrt::bo(device, pages_bytes, krnl.group_id(2)) : xrt::bo(device, pages_bytes, xrt::bo::flags::host_only, krnl.group_id(2));
     if (!TINY) {
     // DOMA's trusted metadata (position map, 4 bytes per slot) in on-package HBM; DOMA writes all of it at boot
@@ -255,7 +258,7 @@ int main(int argc, char** argv) {
     // DOMA: 10 arguments; Tiny ORAM: cmd, resp, pages, size
     auto launch = [&](uint32_t n) {
         return TINY ? krnl(b.cmd, b.resp, b.pages, n)
-                    : krnl(b.cmd, b.resp, b.pages, n, b.meta, b.brec, b.stash, NBLK, b.pages_hbm, HBMK, POOL);
+                    : krnl(b.cmd, b.resp, b.pages, n | ((PTRACE && n) ? 0x80000000u : 0u), b.meta, b.brec, b.stash, NBLK, b.pages_hbm, HBMK, POOL);   // never flag an init launch (size 0)
     };
 
     // ---- init: boot run, then preload every key (BOLT's init includes loading its dataset)
@@ -335,6 +338,8 @@ int main(int argc, char** argv) {
         const Phase& ph = phases[pi];
         double t = 0; uint64_t cyc = 0, rdb = 0, wrb = 0; uint32_t errs = 0; bool sok = true, traffic = true;
         int bad = 0; size_t launches = 0; std::vector<uint32_t> lv; lv.reserve(ph.n);
+        uint64_t pn = 0, plook = 0, pread = 0, pproc = 0, pwrite = 0, ptail = 0; size_t pzero = 0, pbad = 0;
+        uint64_t tn = 0, te2e = 0, tph[12] = {0}, tovl = 0; size_t tbad = 0;     // phase-trace records
         for (size_t at = 0; at < ph.n; at += chunk) {
             const size_t n = std::min(chunk, ph.n - at);
             std::vector<Cmd> cmds(n);
@@ -349,6 +354,7 @@ int main(int argc, char** argv) {
             auto t1 = std::chrono::system_clock::now();
             t += std::chrono::duration<double>(t1 - t0).count(); launches++;
             Summary s = read_summary(b, n);
+            if (PTRACE) b.resp.sync(XCL_BO_SYNC_BO_FROM_DEVICE, n * 32, b.hr + n * BLOCK);   // the launch's trace records
             cyc += s.total; errs |= s.errors; sok = sok && s.ok && s.done == n; traffic = traffic && s.traffic;
             rdb += s.rd_beats; wrb += s.wr_beats;
             auto resp = b.resp.map<uint8_t*>();
@@ -361,12 +367,31 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 uint32_t l; std::memcpy(&l, h + 8, 4); lv.push_back(l);
+                {   // phase timestamps, header bytes 16-31 (cycles since the request; 0: a bitstream without them)
+                    uint32_t tar, trl, twf, twl;
+                    std::memcpy(&tar, h + 16, 4); std::memcpy(&trl, h + 20, 4); std::memcpy(&twf, h + 24, 4); std::memcpy(&twl, h + 28, 4);
+                    if ((tar | trl | twf | twl) == 0) pzero++;
+                    else if (tar == 0 || tar > trl || trl > twf || twf > twl || twl > l) {
+                        if (pbad++ < 5) std::printf("%s phase, command %zu: phase timestamps out of order (%u %u %u %u, done %u)\n",
+                                                    ph.name.c_str(), at + i, tar, trl, twf, twl, l);
+                    } else { pn++; plook += tar; pread += trl - tar; pproc += twf - trl; pwrite += twl - twf; ptail += l - twl; }
+                }
+                if (PTRACE) {   // 12 phases, as in host_ycsb.cpp (slot 9, the write-back gate state, is unused in arrival mode)
+                    uint16_t v[16]; std::memcpy(v, resp + b.hr + n * BLOCK + i * 32, 32);
+                    const uint32_t ch[12] = {v[0], v[1], v[2], v[4], v[6], v[7], v[8], v[10], v[11], v[12], v[14], l};
+                    bool tok = v[3] != 0 && v[5] != 0;
+                    for (int k = 0; k < 11 && tok; k++) tok = ch[k] != 0 && ch[k] <= ch[k + 1];
+                    if (!tok) { if (tbad++ < 3) { std::printf("%s phase, command %zu: trace record out of order:", ph.name.c_str(), at + i);
+                                                  for (int k = 0; k < 16; k++) std::printf(" %u", v[k]); std::printf(" | done %u\n", l); } }
+                    else { tn++; te2e += l; tph[0] += ch[0]; for (int k = 1; k < 12; k++) tph[k] += ch[k] - ch[k - 1];
+                           tovl += (v[5] < v[4]) ? v[4] - v[5] : 0; }
+                }
                 if (cmds[i].type == T_PUT) std::memcpy(&ref[size_t(key) * VALUE_SIZE], cmds[i].value, VALUE_SIZE);
                 else if (std::memcmp(resp + b.hr + i * BLOCK + off, &ref[size_t(key) * VALUE_SIZE], VALUE_SIZE) != 0)
                     if (bad++ < 5) std::printf("%s phase, command %zu: key %u returned wrong data\n", ph.name.c_str(), at + i, key);
             }
         }
-        const bool ok = bad == 0 && sok && errs == 0;
+        const bool ok = bad == 0 && sok && errs == 0 && pbad == 0 && tbad == 0;
         std::printf("phase %zu: %zu %s in %zu launch%s, %.6f s = %.2f KQPS, %.2f us per command; device %.1f cycles per command, errors 0x%x\n",
                     pi + 1, ph.n, ph.name.c_str(), launches, launches == 1 ? "" : "es", t, ph.n / t / 1e3, 1e6 * t / ph.n,
                     double(cyc) / ph.n, errs);
@@ -377,6 +402,20 @@ int main(int argc, char** argv) {
             std::printf("phase %zu: latency min %u, p50 %u, p90 %u, p99 %u, p99.9 %u, max %u, mean %.1f cycles (%zu commands)\n",
                         pi + 1, lv.front(), pct(0.5), pct(0.9), pct(0.99), pct(0.999), lv.back(), mean, lv.size());
         }
+        if (pn) {
+            auto m = [&](uint64_t x) { return double(x) / pn; };
+            std::printf("phase %zu: phases, mean cycles: lookup %.1f, bucket read %.1f, processing %.1f, bucket write %.1f, after the write %.1f (%zu commands%s)\n",
+                        pi + 1, m(plook), m(pread), m(pproc), m(pwrite), m(ptail), pn, pbad ? "" : ", all in order");
+        } else if (pzero) std::printf("phase %zu: phases not reported by this bitstream\n", pi + 1);
+        if (pbad) std::printf("phase %zu: %zu commands with phase timestamps out of order\n", pi + 1, pbad);
+        if (tn) {
+            static const char* PH[12] = {"handoff", "lookup", "read gate", "bucket read", "decrypt/verify", "operation", "eviction",
+                                         "re-encrypt", "write-back wait", "bucket write", "release gate", "result"};
+            std::printf("phase %zu: trace, mean cycles (sum = E2E):", pi + 1);
+            for (int k = 0; k < 12; k++) std::printf("%s %s %.1f", k ? "," : "", PH[k], double(tph[k]) / tn);
+            std::printf(" = E2E %.1f; decryption overlaps the bucket read by %.1f (%zu records)\n", double(te2e) / tn, double(tovl) / tn, tn);
+        } else if (PTRACE) std::printf("phase %zu: no trace records (is this a TRACE=1 bitstream?)\n", pi + 1);
+        if (tbad) std::printf("phase %zu: %zu trace records out of order\n", pi + 1, tbad);
         if (traffic)
             std::printf("phase %zu: bucket port (pages, off-package) %.0f B read, %.0f B written per command\n",
                         pi + 1, 32.0 * rdb / ph.n, 32.0 * wrb / ph.n);

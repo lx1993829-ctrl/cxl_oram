@@ -45,7 +45,8 @@
 //                  opIdx, slot and beat index, so a stale or misplaced block cannot pass (payload_word aliases:
 //                  0xABCD0000 | i<<8 is the same word for i and i + 256)
 //   YCSB_TRACE=f   write the op sequence: "opIdx slot op w0 w1" (op 1 = write; w0/w1 = payload_word(opIdx, 0/1))
-//   YCSB_CSV=f     per-command results: workload,phase,cmd,opIdx,slot,op,latency_cycles,status
+//   YCSB_CSV=f     per-command results: workload,phase,cmd,opIdx,slot,op,latency_cycles,status, followed by a line
+//                  workload,phase,cmd,phases,AR,lastR,firstW,lastW (cycles since the request, from the header)
 // Build: g++ -std=c++17 -O2 -ffp-contract=off host_ycsb.cpp -I$XILINX_XRT/include -L$XILINX_XRT/lib -lxrt_coreutil -pthread -o host_ycsb
 #include <xrt/xrt_bo.h>
 #include <xrt/xrt_device.h>
@@ -311,6 +312,14 @@ struct PhaseResult {
     double wall = 0; uint64_t cycles = 0; uint32_t errors = 0; bool summary_ok = true; uint32_t done = 0;
     Lat get, put, all;
     uint32_t pass = 0, fail = 0;          // read checks
+    // phases from the response header (bytes 16-31: bucket read request, last read beat, first and last write-back
+    // beat, cycles since the request): sums over the commands that reported them in order
+    uint64_t ph_n = 0, ph_look = 0, ph_read = 0, ph_proc = 0, ph_write = 0, ph_tail = 0, ph_e2e = 0;
+    size_t ph_zero = 0, ph_bad = 0;
+    // phase-trace records (DOMA_PHASE_TRACE=1, a TRACE=1 bitstream): sums of the 16 event times over complete records
+    uint64_t tr_sum[16] = {0}; uint64_t tr_e2e = 0; size_t tr_n = 0, tr_missing = 0;
+    uint64_t tr_ph[12] = {0}; uint64_t tr_overlap = 0;    // the 12 phases (sum = E2E), and decryption before the last beat
+    double ph_mean(uint64_t x) const { return ph_n ? double(x) / ph_n : 0.0; }
 };
 
 static const char* WL_NAMES[] = {"?", "A", "B", "C", "D", "E", "F"};
@@ -343,6 +352,7 @@ int main(int argc, char** argv) {
     if(num_slots<1||num_slots>MAX_SLOTS) {fprintf(stderr,"bad num_slots %d\n",num_slots);return 1;}
     if(init_occ<1||init_occ>num_slots/2) {fprintf(stderr,"bad init_occ %d (must be 1..%d for even-slot layout)\n",init_occ,num_slots/2);return 1;}
     if(scan_len<1||scan_len>num_slots) {fprintf(stderr,"bad scan_len %d\n",scan_len);return 1;}
+    const bool PTRACE = std::getenv("DOMA_PHASE_TRACE") && std::string(std::getenv("DOMA_PHASE_TRACE")) != "0";
     const bool PAD = std::getenv("YCSB_PAD") && std::string(std::getenv("YCSB_PAD")) != "0";
     DATA_GEM5 = std::getenv("YCSB_DATA") && std::string(std::getenv("YCSB_DATA")) == "gem5";
     const double MHZ = std::getenv("DOMA_MHZ") ? std::atof(std::getenv("DOMA_MHZ")) : 300.0;
@@ -421,7 +431,7 @@ int main(int argc, char** argv) {
         auto alloc = [&](const char* name, size_t sz, int arg) { what = name; bytes = sz; return xrt::bo(device, sz, krnl.group_id(arg)); };
         try {
             cmd   = alloc("cmd_input", roundup4k(max_cmds * 32) + max_cmds * BLOCKA, 0);
-            resp  = alloc("resp_output", roundup4k((max_cmds + 2) * 32) + max_cmds * BLOCKA, 1);
+            resp  = alloc("resp_output", roundup4k((max_cmds + 2) * 32) + max_cmds * BLOCKA + (PTRACE ? max_cmds * 32 : 0), 1);
             meta  = alloc("meta", std::max<size_t>(4096, ((size_t(NBLK) + 4) / 5) * 32), 4);
             brec  = alloc("brec", std::max<size_t>(4096, size_t(NB) * 64), 5);
             stash = alloc("stash", roundup4k(size_t(NB) * 64) + roundup4k(size_t(POOL) * 16) + size_t(POOL) * BLOCKA, 6);
@@ -449,13 +459,15 @@ int main(int argc, char** argv) {
                          "(~200K with DOMA_HBM_PCT=50); for up to 1M slots use a CFG=doma_big_hbm.cfg build with DOMA_HBM_PCT=75.\n");
         return 1;
     }
-    auto launch = [&](uint32_t n) { return krnl(cmd, resp, pages, n, meta, brec, stash, NBLK, pages_hbm, HBMK, POOL); };
+    // bit 31 of size asks a TRACE=1 bitstream for trace records; never on an init launch (size 0 must stay 0: that is how
+    // the kernel recognizes a re-boot, and a flagged size-0 launch would be checked as a command launch instead)
+    auto launch = [&](uint32_t n) { return krnl(cmd, resp, pages, n | ((PTRACE && n) ? 0x80000000u : 0u), meta, brec, stash, NBLK, pages_hbm, HBMK, POOL); };
     size_t BLOCK = BLOCKA;
 
     struct Summary { bool ok; uint32_t beats, lat_min, lat_max, errors, done; uint64_t total; };
     auto read_summary = [&](size_t n, bool with_data) {
         const size_t hr = roundup4k((n + 2) * 32);
-        resp.sync(XCL_BO_SYNC_BO_FROM_DEVICE, with_data ? hr + n * BLOCK : (n + 2) * 32, 0);
+        resp.sync(XCL_BO_SYNC_BO_FROM_DEVICE, with_data ? hr + n * BLOCK + (PTRACE ? n * 32 : 0) : (n + 2) * 32, 0);
         const uint8_t* r = resp.map<uint8_t*>() + n * 32;
         Summary s{}; s.ok = (r[0] == T_SUM);
         std::memcpy(&s.beats, r + 4, 4); std::memcpy(&s.total, r + 8, 8); std::memcpy(&s.lat_min, r + 16, 4);
@@ -510,6 +522,38 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 (o.write ? R.put : R.get).add(lat); R.all.add(lat);
+                {   // phase timestamps (0 everywhere: a bitstream without them)
+                    uint32_t tar, trl, twf, twl;
+                    std::memcpy(&tar, h + 16, 4); std::memcpy(&trl, h + 20, 4); std::memcpy(&twf, h + 24, 4); std::memcpy(&twl, h + 28, 4);
+                    if (csv) std::fprintf(csv, "%s,%s,%zu,phases,%u,%u,%u,%u\n", wname, phase, at + i, tar, trl, twf, twl);
+                    if ((tar | trl | twf | twl) == 0) R.ph_zero++;
+                    else if (tar == 0 || tar > trl || trl > twf || twf > twl || twl > lat) {
+                        if (R.ph_bad++ < 5) std::printf("  %s cmd %zu: phase timestamps out of order: AR %u, last R %u, first W %u, last W %u, done %u\n",
+                                                        phase, at + i, tar, trl, twf, twl, lat);
+                    } else {
+                        R.ph_n++; R.ph_look += tar; R.ph_read += trl - tar; R.ph_proc += twf - trl;
+                        R.ph_write += twl - twf; R.ph_tail += lat - twl; R.ph_e2e += lat;
+                    }
+                }
+                if (PTRACE) {   // the command's trace record, after the launch's response data
+                    uint16_t v[16]; std::memcpy(v, rp + hr + n * BLOCK + i * 32, 32);
+                    if (csv) { std::fprintf(csv, "%s,%s,%zu,trace", wname, phase, at + i); for (int k = 0; k < 16; k++) std::fprintf(csv, ",%u", v[k]); std::fprintf(csv, ",%u\n", lat); }
+                    // phases in order (slot 9, the write-back gate state, is not entered in arrival mode; slot 15 is idle):
+                    // handoff 0-s0, lookup s0-s1, read gate s1-s2, bucket read s2-s4, decryption/verification s4-s6,
+                    // operation s6-s7, eviction s7-s8, re-encryption s8-s10, write-back wait s10-s11, bucket write s11-s12,
+                    // release gate s12-s14, result s14-done
+                    const uint32_t ch[13] = {v[0], v[1], v[2], v[4], v[6], v[7], v[8], v[10], v[11], v[12], v[14], lat, 0};
+                    bool ok = v[0] != 0 && v[3] != 0 && v[5] != 0;
+                    for (int k = 0; k < 11 && ok; k++) ok = ch[k] != 0 && ch[k] <= ch[k + 1];
+                    if (!ok) { if (R.tr_missing++ < 3) { std::printf("  %s cmd %zu: trace record out of order:", phase, at + i);
+                                                         for (int k = 0; k < 16; k++) std::printf(" %u", v[k]); std::printf(" | done %u\n", lat); } }
+                    else {
+                        R.tr_n++; R.tr_e2e += lat; for (int k = 0; k < 16; k++) R.tr_sum[k] += v[k];
+                        R.tr_ph[0] += ch[0];
+                        for (int k = 1; k < 12; k++) R.tr_ph[k] += ch[k] - ch[k - 1];
+                        R.tr_overlap += (v[5] < v[4]) ? v[4] - v[5] : 0;
+                    }
+                }
                 if (o.write) continue;
                 if (o.expect == NONE) { R.fail++; std::printf("  read of never-written slot %u (opIdx %u)\n", o.slot, o.opIdx); continue; }
                 fill_block(want.data(), BLOCK, o.expect, o.slot);
@@ -534,6 +578,29 @@ int main(int argc, char** argv) {
         if (R.wall > 0.05) std::printf(" (device cycles / wall time = %.0f MHz)", R.cycles / R.wall / 1e6);
         std::printf("\n  latency, request to done: GET %s\n", R.get.str(MHZ).c_str());
         std::printf("                            PUT %s\n", R.put.str(MHZ).c_str());
+        if (R.ph_n)
+            std::printf("  phases, mean cycles per command: lookup %.1f, bucket read %.1f, processing %.1f, bucket write %.1f, "
+                        "after the write %.1f = E2E %.1f (%zu commands)%s\n",
+                        R.ph_mean(R.ph_look), R.ph_mean(R.ph_read), R.ph_mean(R.ph_proc), R.ph_mean(R.ph_write),
+                        R.ph_mean(R.ph_tail), R.ph_mean(R.ph_e2e), R.ph_n, R.ph_bad ? "" : ", all in order");
+        else if (R.ph_zero) std::printf("  phases: not reported by this bitstream (header bytes 16-31 are zero)\n");
+        if (R.ph_bad) std::printf("  phases: %zu commands with timestamps out of order\n", R.ph_bad);
+        if (PTRACE) {
+            static const char* EV[16] = {"lookup", "read gate", "bucket AR", "first beat", "last beat", "crypto", "operation",
+                                         "eviction", "re-encrypt", "WB gate", "write-back", "first W", "last W", "release gate",
+                                         "result", "idle"};
+            std::printf("  timeline, mean cycle of each event (%zu complete records, %zu incomplete):", R.tr_n, R.tr_missing);
+            for (int k = 0; k < 16; k++) std::printf("%s %s %.1f", k ? "," : "", EV[k], R.tr_n ? double(R.tr_sum[k]) / R.tr_n : 0.0);
+            std::printf(", done %.1f\n", R.tr_n ? double(R.tr_e2e) / R.tr_n : 0.0);
+            if (R.tr_n) {
+                static const char* PH[12] = {"handoff", "lookup", "read gate", "bucket read", "decrypt/verify", "operation", "eviction",
+                                             "re-encrypt", "write-back wait", "bucket write", "release gate", "result"};
+                std::printf("  phases (trace, mean cycles, sum = E2E):");
+                for (int k = 0; k < 12; k++) std::printf("%s %s %.1f", k ? "," : "", PH[k], double(R.tr_ph[k]) / R.tr_n);
+                std::printf(" = E2E %.1f; decryption overlaps the bucket read by %.1f\n", double(R.tr_e2e) / R.tr_n, double(R.tr_overlap) / R.tr_n);
+            }
+            if (R.tr_missing) std::printf("  trace: %zu records out of order or incomplete\n", R.tr_missing);
+        }
         if (R.errors || !R.summary_ok || R.bad_hdr)
             std::printf("  errors 0x%x:%s summary %s, %zu bad responses\n", R.errors, explain(R.errors).c_str(), R.summary_ok ? "ok" : "MISSING", R.bad_hdr);
     };
@@ -564,7 +631,9 @@ int main(int argc, char** argv) {
         if (ok && !P.pad.empty()) { ok = run_phase(wn, "pad", P.pad, row.pad); report("PAD ", row.pad); }
         row.ok = ok && row.load.errors == 0 && row.run.errors == 0 && row.pad.errors == 0 && row.load.bad_hdr == 0
                  && row.run.bad_hdr == 0 && row.pad.bad_hdr == 0 && row.run.fail == 0 && row.pad.fail == 0
-                 && row.run.summary_ok && row.load.summary_ok && row.run.cmds == P.run.size();
+                 && row.run.summary_ok && row.load.summary_ok && row.run.cmds == P.run.size()
+                 && row.load.ph_bad == 0 && row.run.ph_bad == 0 && row.pad.ph_bad == 0
+                 && (!PTRACE || (row.load.tr_missing == 0 && row.run.tr_missing == 0 && row.pad.tr_missing == 0));
         std::printf("verify: %u run-phase reads checked, pass %u, fail %u%s\n", row.run.pass + row.run.fail, row.run.pass, row.run.fail,
                     P.pad.empty() ? "" : (", padding reads pass " + std::to_string(row.pad.pass) + " fail " + std::to_string(row.pad.fail)).c_str());
         // the same line as oram_ycsb.c prints at the end of a gem5 run
@@ -586,6 +655,25 @@ int main(int argc, char** argv) {
                         r.run.cmds / std::max(r.run.wall, 1e-12) / 1e3, r.run.cmds ? double(r.run.cycles) / r.run.cmds : 0.0,
                         r.run.get.mean(), r.run.put.mean(), p99, r.run.all.max(), r.run.all.mean() / MHZ, r.ok ? "PASS" : "FAIL");
         }
+    }
+    bool any_tr = false; for (auto& r : rows) any_tr |= r.run.tr_n > 0;
+    if (any_tr) {
+        std::printf("\nphase trace (run phase, mean cycles per access; the phases add up to E2E)\n");
+        std::printf("wl  handoff  lookup  rd-gate  bkt-read  decrypt  op  evict  re-encr  wb-wait  bkt-write  rel-gate  result      E2E\n");
+        for (auto& r : rows) {
+            const auto& R = r.run; auto m = [&](int k) { return R.tr_n ? double(R.tr_ph[k]) / R.tr_n : 0.0; };
+            std::printf("%-3s %7.1f %7.1f %8.1f %9.1f %8.1f %4.0f %6.1f %8.1f %8.1f %10.1f %9.1f %7.1f %8.1f\n", WL_NAMES[r.w],
+                        m(0), m(1), m(2), m(3), m(4), m(5), m(6), m(7), m(8), m(9), m(10), m(11), R.tr_n ? double(R.tr_e2e) / R.tr_n : 0.0);
+        }
+    }
+    bool any_ph = false; for (auto& r : rows) any_ph |= r.run.ph_n > 0;
+    if (any_ph) {
+        std::printf("\nphases (run phase, mean cycles per access, measured on the bucket port)\n");
+        std::printf("wl   lookup  bucket read  processing  bucket write  after write      E2E\n");
+        for (auto& r : rows)
+            std::printf("%-3s %8.1f %12.1f %11.1f %13.1f %12.1f %8.1f\n", WL_NAMES[r.w], r.run.ph_mean(r.run.ph_look),
+                        r.run.ph_mean(r.run.ph_read), r.run.ph_mean(r.run.ph_proc), r.run.ph_mean(r.run.ph_write),
+                        r.run.ph_mean(r.run.ph_tail), r.run.ph_mean(r.run.ph_e2e));
     }
     std::printf("%s\n", all_ok ? "ALL WORKLOADS PASSED" : "ERRORS FOUND");
     return all_ok ? 0 : 1;
