@@ -6,6 +6,8 @@
 //   each launch is timed like host_doma's query (launch + wait, commands already on the card), and the phase time is
 //   their sum. Every GET is checked against the latest value written (preload or an earlier PUT).
 //   Refuses to run if LAMBDA / ZPOS below differ from ../rtl/oram_params.vh, when that file is present.
+//   DOMA_MEMREPORT=1: print every buffer as allocated by XRT (role, memory, bank, size, address) and the totals;
+//   DOMA_HOLD=<s> then keeps them allocated that long, for an independent check with xrt-smi.
 //   DOMA_PHASE_TRACE=1 (a TRACE=1 bitstream): every command also writes a 32-byte record of 16 phase timestamps after
 //   the launch's response data; each phase prints the mean of 12 phases that add up to E2E (see host_ycsb.cpp).
 #include <sstream>
@@ -39,6 +41,7 @@
 #include <cmath>
 #include <vector>
 #include <chrono>
+#include <thread>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -255,6 +258,30 @@ int main(int argc, char** argv) {
     b.stash = xrt::bo(device, roundup4k(size_t(NB) * 64) + roundup4k(size_t(POOL) * 16) + size_t(POOL) * BLOCKA, krnl.group_id(6));
     // buckets kept in HBM: buckets 0 .. HBMK-1 (DOMA formats them at boot, like pages)
     b.pages_hbm = xrt::bo(device, std::max<size_t>(4096, size_t(HBMK) * stride), krnl.group_id(8));
+    if (std::getenv("DOMA_MEMREPORT")) {   // what XRT actually allocated (bo.size(), bo.address()), by role and memory
+        const bool pages_host = !std::getenv("DOMA_PAGES_HBM");
+        struct M { const char* role; const xrt::bo* bo; int arg; bool host; bool io; };
+        const M m[] = {{"buckets in host memory", &b.pages, 2, pages_host, false}, {"buckets in HBM", &b.pages_hbm, 8, false, false},
+                       {"position map", &b.meta, 4, false, false}, {"bucket records", &b.brec, 5, false, false},
+                       {"stash (heads, entry metadata, data)", &b.stash, 6, false, false},
+                       {"commands (I/O, not ORAM state)", &b.cmd, 0, false, true}, {"responses (I/O, not ORAM state)", &b.resp, 1, false, true}};
+        size_t on = 0, host = 0, io = 0;
+        std::printf("memory report (as allocated by XRT): N=%u records, %u buckets (%u in HBM), stash pool %u entries, %zu-byte blocks\n",
+                    NBLK, NB, HBMK, POOL, size_t(BLOCKA));
+        for (const auto& x : m) {
+            const size_t sz = x.bo->size();
+            std::printf("  %-36s %-5s bank group %2d  %14zu B = %10.2f MiB  at 0x%llx\n", x.role, x.host ? "host" : "HBM",
+                        int(krnl.group_id(x.arg)), sz, sz / 1048576.0, (unsigned long long)x.bo->address());
+            (x.io ? io : x.host ? host : on) += sz;
+        }
+        std::printf("  ORAM state: on-package (HBM) %.2f MiB, host memory %.2f MiB, total %.2f MiB; I/O buffers %.2f MiB (HBM)\n",
+                    on / 1048576.0, host / 1048576.0, (on + host) / 1048576.0, io / 1048576.0);
+        if (const char* hs = std::getenv("DOMA_HOLD")) {
+            std::printf("  holding the buffers for %s s: run 'xrt-smi examine -d <bdf> -r memory' now\n", hs);
+            std::fflush(stdout);
+            std::this_thread::sleep_for(std::chrono::seconds(std::atoi(hs)));
+        }
+    }
     }
     // DOMA: 10 arguments; Tiny ORAM: cmd, resp, pages, size
     auto launch = [&](uint32_t n) {
