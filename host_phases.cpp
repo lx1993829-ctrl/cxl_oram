@@ -1,5 +1,6 @@
 // host_phases.cpp -- host_doma.cpp's boot, preload, staging, launch and checks, with the query replaced by phases.
-//   DOMA_PHASES="put:250000,get:250000" (default): each phase issues that many commands of one type, keys uniform
+//   DOMA_PHASES="put:250000,get:250000" (default): each phase issues that many commands of one type (mix:N: each
+//   command a GET or a PUT with probability 1/2), keys uniform
 //   over the dataset (std::mt19937 seed 1, continued across phases), PUT values random. A phase is split into
 //   launches of at most <commands per launch> (default 65536: the command and response buffers' capacity at 4 KB);
 //   each launch is timed like host_doma's query (launch + wait, commands already on the card), and the phase time is
@@ -324,14 +325,16 @@ int main(int argc, char** argv) {
             auto c = item.find(':');
             std::string k = c == std::string::npos ? "" : item.substr(0, c);
             size_t n = c == std::string::npos ? 0 : std::strtoul(item.c_str() + c + 1, nullptr, 10);
-            uint8_t t = (k == "put" || k == "PUT") ? T_PUT : (k == "get" || k == "GET") ? T_GET : 0;
-            if (!t || n == 0) { std::printf("bad DOMA_PHASES item '%s' (want put:N or get:N, comma-separated)\n", item.c_str()); return 1; }
-            phases.push_back({t, n, t == T_PUT ? "PUT" : "GET"});
+            const uint8_t T_MIX = 0xFF;    // mix:N: each command a GET or a PUT with probability 1/2
+            uint8_t t = (k == "put" || k == "PUT") ? T_PUT : (k == "get" || k == "GET") ? T_GET : (k == "mix" || k == "MIX") ? T_MIX : 0;
+            if (!t || n == 0) { std::printf("bad DOMA_PHASES item '%s' (want put:N, get:N or mix:N, comma-separated)\n", item.c_str()); return 1; }
+            phases.push_back({t, n, t == T_PUT ? "PUT" : t == T_GET ? "GET" : "MIX"});
         }
     }
     std::mt19937 pgen(1);
     std::uniform_int_distribution<uint32_t> pkey(0, NKEYS - 1);
     std::uniform_int_distribution<int> pval(0, 255);
+    std::bernoulli_distribution pmix(0.5);
     const size_t chunk = size_t(CMD_SIZE);
     bool all_ok = true;
     for (size_t pi = 0; pi < phases.size(); pi++) {
@@ -340,11 +343,12 @@ int main(int argc, char** argv) {
         int bad = 0; size_t launches = 0; std::vector<uint32_t> lv; lv.reserve(ph.n);
         uint64_t pn = 0, plook = 0, pread = 0, pproc = 0, pwrite = 0, ptail = 0; size_t pzero = 0, pbad = 0;
         uint64_t tn = 0, te2e = 0, tph[12] = {0}, tovl = 0; size_t tbad = 0;     // phase-trace records
+        uint64_t ng = 0, np = 0, lg = 0, lp = 0;                                  // GET / PUT counts and latency sums
         for (size_t at = 0; at < ph.n; at += chunk) {
             const size_t n = std::min(chunk, ph.n - at);
             std::vector<Cmd> cmds(n);
             for (auto& c : cmds) {
-                c = Cmd{}; c.type = ph.type; c.key = pkey(pgen);
+                c = Cmd{}; c.type = (ph.type == 0xFF) ? (pmix(pgen) ? T_PUT : T_GET) : ph.type; c.key = pkey(pgen);
                 if (c.type == T_PUT) for (int j = 0; j < VALUE_SIZE; j++) c.value[j] = uint8_t(pval(pgen));
             }
             stage(b, cmds);
@@ -367,6 +371,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 uint32_t l; std::memcpy(&l, h + 8, 4); lv.push_back(l);
+                if (cmds[i].type == T_PUT) { np++; lp += l; } else { ng++; lg += l; }
                 {   // phase timestamps, header bytes 16-31 (cycles since the request; 0: a bitstream without them)
                     uint32_t tar, trl, twf, twl;
                     std::memcpy(&tar, h + 16, 4); std::memcpy(&trl, h + 20, 4); std::memcpy(&twf, h + 24, 4); std::memcpy(&twl, h + 28, 4);
@@ -395,6 +400,9 @@ int main(int argc, char** argv) {
         std::printf("phase %zu: %zu %s in %zu launch%s, %.6f s = %.2f KQPS, %.2f us per command; device %.1f cycles per command, errors 0x%x\n",
                     pi + 1, ph.n, ph.name.c_str(), launches, launches == 1 ? "" : "es", t, ph.n / t / 1e3, 1e6 * t / ph.n,
                     double(cyc) / ph.n, errs);
+        if (ph.type == 0xFF)
+            std::printf("phase %zu: mix of %llu GET (mean latency %.1f cycles) and %llu PUT (mean latency %.1f cycles)\n", pi + 1,
+                        (unsigned long long)ng, ng ? double(lg) / ng : 0.0, (unsigned long long)np, np ? double(lp) / np : 0.0);
         if (!lv.empty()) {
             std::sort(lv.begin(), lv.end());
             auto pct = [&](double q) { return lv[std::min(lv.size() - 1, size_t(q * (lv.size() - 1) + 0.5))]; };
