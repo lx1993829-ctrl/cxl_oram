@@ -33,6 +33,12 @@ Changes in the copy (and nothing else):
      changed (a check that the method sees the writes queries to host keys should make).
      queried_keys_location_type: where the position map says each queried key is after the run
      (0 = HBM, 1 = host page; other codes are the kernel's own, e.g. the eviction buffer).
+  6. it also prints
+       MOVES position_map_entries_changed=... get_keys_moved=a/b put_keys_moved=c/d queue_entries_changed=...
+     position_map_entries_changed: entries of the whole position map whose key, location type, slot (or page,
+     for non-HBM entries) differ from initialization. get/put_keys_moved: queried keys whose entry changed,
+     split by operation (each key is queried once). queue_entries_changed: entries of the free-HBM-slot queue
+     that differ (a slot handed back to the queue overwrites an entry).
 """
 import os, re, shutil, sys
 
@@ -105,6 +111,35 @@ CHECK = r'''
                   << " page_counts_changed=" << cnt_changed << " queried_keys_location_type:";
         for (const auto& kv : now) std::cout << " " << kv.first << "=" << kv.second;
         std::cout << " missing=" << missing << std::endl;
+    }
+    {   // added: did the run change position-map entries (remaps) or the free-slot queue?
+        const Attribute* pm = bos[0].map<Attribute*>();             // read back above
+        const Attribute* pm0 = &position_map[0][0];                 // what initialization wrote
+        auto differs = [](const Attribute& a, const Attribute& o) {
+            if (a.key != o.key || a.location_type != o.location_type) return true;
+            if (a.key == (uint32_t)EMPTY_KEY) return false;          // empty entry: other fields unused
+            if (a.location_index != o.location_index) return true;
+            return a.location_type != 0 && a.page_index != o.page_index;   // page_index is unused for HBM entries
+        };
+        size_t pm_changed = 0;
+        for (size_t i = 0; i < (size_t)HASH_SIZE * HBM_CAPACITY; i++) if (differs(pm[i], pm0[i])) pm_changed++;
+        int get_moved = 0, get_n = 0, put_moved = 0, put_n = 0;
+        for (const auto& c : commands) {
+            const uint32_t k = c.tuple.key; const size_t h = k % HASH_SIZE;
+            int j0 = -1, j1 = -1;
+            for (int j = 0; j < HBM_CAPACITY; j++) {
+                if (j0 < 0 && pm0[h * HBM_CAPACITY + j].key == k) j0 = j;
+                if (j1 < 0 && pm[h * HBM_CAPACITY + j].key == k) j1 = j;
+            }
+            const bool moved = j0 < 0 || j1 < 0 || differs(pm[h * HBM_CAPACITY + j1], pm0[h * HBM_CAPACITY + j0]);
+            if (c.type == CMD_PUT) { put_n++; put_moved += moved; } else { get_n++; get_moved += moved; }
+        }
+        bos[2].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        const uint32_t* q = bos[2].map<uint32_t*>();
+        size_t q_changed = 0;
+        for (size_t i = 0; i < (size_t)QUEUE_SIZE; i++) if (q[i] != queue[i]) q_changed++;
+        std::cout << "MOVES position_map_entries_changed=" << pm_changed << " get_keys_moved=" << get_moved << "/" << get_n
+                  << " put_keys_moved=" << put_moved << "/" << put_n << " queue_entries_changed=" << q_changed << std::endl;
     }
 '''.replace("FIELD", field)
 marker = "resp_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);"
