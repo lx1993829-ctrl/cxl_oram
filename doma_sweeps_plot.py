@@ -35,7 +35,8 @@ STYLE = {   # label: (color, marker, linestyle)
     "Tiny ORAM (230 MHz)":  ("#8e6bbf", "^", "-"),
     "BOLT (300 MHz)":       ("#e1812c", "*", "-"),
 }
-LEGEND_SIZE = (3.5, 0.34)          # inches: one legend strip across the column, above both panels
+LEGEND_SIZE = (3.5, 0.46)          # inches: one legend strip across the column, above both panels
+LEGEND_TITLE = "In (a): 64 B values, except DOMA, 4 KB"   # the value size of panel (a)'s lines
 MS, LW = 3.2, 1.0
 # ======================================================================
 
@@ -96,7 +97,7 @@ handles = [Line2D([], [], color=c, marker=m, linestyle=ls, linewidth=LW, markers
                   label=lab) for lab, (c, m, ls) in STYLE.items()]
 f = plt.figure(figsize=LEGEND_SIZE)
 f.legend(handles=handles, loc="center", ncol=3, fontsize=LEGEND_FONT + 0.6, frameon=False, handlelength=2.0,
-         columnspacing=1.0, labelspacing=0.3)
+         columnspacing=1.0, labelspacing=0.3, title=LEGEND_TITLE, title_fontsize=LEGEND_FONT + 0.6)
 for ext in ("pdf", "png"):
     f.savefig(f"doma_sweep_legend.{ext}", dpi=200)
 print("wrote doma_sweep_legend.pdf and doma_sweep_legend.png")
