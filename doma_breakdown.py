@@ -63,7 +63,10 @@ EDGE = ("black", 0.6)
 
 # ---- separate panels, for two subfigures (written in addition to the combined figure) ----
 SEPARATE = True
-SEP_FIGSIZE = (3.4, 2.4)          # inches per panel: two fit side by side across a 7-inch text width
+SEP_FIGSIZE = (1.72, 1.85)        # inches per panel: two side by side in one 3.5-inch column
+SEP_ROTATE = 40                   # tick labels angled (one line each), so five fit in a half-column panel
+SEP_FONT, SEP_TICK_FONT, SEP_VALUE_FONT = 7, 6, 5.5   # fonts at that size (print size: the panel is not scaled)
+SEP_XLABEL = False                # no x-axis title in a panel: the subfigure caption says what the bars are
 SEP_OUT = {"perf": "doma_breakdown_cycles", "mem": "doma_breakdown_memory"}   # -> .pdf and .png each
 SEP_TITLES = False                # no title in a separate panel: the subfigure caption names it
 
@@ -78,7 +81,9 @@ def perf_values():
     return [(label, sum(PHASES[p] for p in members), colour) for label, members, colour in PERF_BARS]
 
 
-def draw(ax, bars, title, ylabel, xlabel):
+def draw(ax, bars, title, ylabel, xlabel, tick_font=None, value_font=None):
+    tick_font = tick_font or TICK_FONT
+    value_font = value_font or VALUE_FONT
     labels = [b[0] for b in bars]
     values = [b[1] for b in bars]
     x = range(len(bars))
@@ -87,15 +92,16 @@ def draw(ax, bars, title, ylabel, xlabel):
         ax.set_yscale("log")
         ax.set_ylim(*YLIM)
     ax.set_xticks(list(x))
-    ax.set_xticklabels(labels, fontsize=TICK_FONT)
-    ax.set_xlabel(xlabel)
+    ax.set_xticklabels(labels, fontsize=tick_font)
+    if xlabel:
+        ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.grid(axis="y", which="major", linewidth=0.4, color="#cccccc", zorder=0)
     if title:
         ax.set_title(title, fontsize=TITLE_FONT, fontweight="bold")
     for j, v in enumerate(values):
         text = f"{round(v):,}" if INTEGER else f"{v:,.1f}"
-        ax.text(j, v * (1.15 if LOG_SCALE else 1.0), text, ha="center", va="bottom", fontsize=VALUE_FONT)
+        ax.text(j, v * (1.15 if LOG_SCALE else 1.0), text, ha="center", va="bottom", fontsize=value_font)
 
 
 def main():
@@ -117,8 +123,14 @@ def main():
     if SEPARATE:
         for key, bars, title, ylabel, xlabel in (("perf", perf, PERF_TITLE, PERF_YLABEL, PERF_XLABEL),
                                                  ("mem", MEM_BARS, MEM_TITLE, MEM_YLABEL, MEM_XLABEL)):
+            plt.rcParams.update({"font.size": SEP_FONT})
             f, ax = plt.subplots(figsize=SEP_FIGSIZE)
-            draw(ax, bars, title.split(". ", 1)[-1] if SEP_TITLES else None, ylabel, xlabel)
+            draw(ax, bars, title.split(". ", 1)[-1] if SEP_TITLES else None, ylabel, xlabel if SEP_XLABEL else None,
+                 SEP_TICK_FONT, SEP_VALUE_FONT)
+            ax.tick_params(axis="both", length=2, pad=1.5)
+            ax.set_xticklabels([b[0].replace("\n", " ") for b in bars], fontsize=SEP_TICK_FONT, rotation=SEP_ROTATE,
+                               ha="right", rotation_mode="anchor")
+            ax.yaxis.labelpad = 1
             f.tight_layout()
             for ext in ("pdf", "png"):
                 f.savefig(f"{SEP_OUT[key]}.{ext}", dpi=200)
