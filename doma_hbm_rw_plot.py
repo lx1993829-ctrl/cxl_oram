@@ -4,13 +4,13 @@
     python3 doma_hbm_rw_plot.py          # -> doma_hbm_rw.pdf / .png
 
 Measured on the card: traced 4 KB bitstream with the last-beat budgets (package 6130badf; layout doma_big2m.cfg:
-HBM buckets on banks 16-31, stash on 12-15), Z = 8, lambda = 6,
-1M records, 500,000 random accesses per point (50% GET / 50% PUT), every GET checked. Mean cycles per access.
+HBM buckets on banks 16-31, stash on 12-15), Z = 8, lambda = 7 (traced v9 bitstream, doma_4096t_l7_v9),
+1M records, 1M random requests per point (50% GET / 50% PUT), every GET checked. Mean cycles per access.
 Everything you may want to change is in the SETTINGS block. Needs matplotlib.
 """
 # =========================== SETTINGS: edit freely ===========================
 HBM_PCT      = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
-BUCKET_READ  = [1493.7, 1448.6, 1419.7, 1385.4, 1348.5, 1311.2, 1276.3, 1246.1, 1232.8, 1202.2, 1171.6]
+BUCKET_READ  = [1492.6, 1459.2, 1428.0, 1393.4, 1356.2, 1325.3, 1297.9, 1264.8, 1235.4, 1204.8, 1172.9]
 BUCKET_WRITE = [1024.0, 1023.9, 1023.8, 1023.7, 1023.6, 1023.5, 1023.4, 1023.3, 1023.2, 1023.1, 1023.0]
 LINES = [("Bucket read", BUCKET_READ, "#4a7fb5", "o"), ("Bucket write", BUCKET_WRITE, "#b9b3dc", "s")]
 TITLE = ""                         # "" for no title
