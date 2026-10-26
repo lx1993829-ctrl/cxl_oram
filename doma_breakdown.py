@@ -25,12 +25,13 @@ PHASES = {
     "release gate": 194.6, "result": 131.0,
 }
 # Bars: (label, phases summed into the bar, colour). Every phase must appear in exactly one bar.
+# Padding = all three fixed-point waits: before the bucket read (read gate), before the write-back, before the response
 PERF_BARS = [
-    ("Lookup",          ["handoff", "lookup", "read gate"],                 LIGHT_BLUE),
+    ("Lookup",          ["lookup"],                                         LIGHT_BLUE),
     ("Bucket\naccess",  ["bucket read", "bucket write"],                    BLUE),
     ("Crypto",          ["decrypt/verify", "re-encrypt"],                   PURPLE),
-    ("Padding",         ["write-back wait"],                                GREY),
-    ("Others",          ["operation", "eviction", "release gate", "result"], GREEN),
+    ("Padding",         ["read gate", "write-back wait", "release gate"],   GREY),
+    ("Others",          ["handoff", "operation", "eviction", "result"],     GREEN),
 ]
 PERF_TITLE = "a. Cycles per access"
 PERF_YLABEL = "Cycles"
