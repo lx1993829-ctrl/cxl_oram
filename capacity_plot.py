@@ -24,74 +24,31 @@ import sys
 import numpy as np
 
 # ======================================================================================================
-# Model (identical in capacity_plot.py, z_choice.py and lambda_choice.py)
+# Model (identical in capacity_plot.py and z_lambda_sweep.py)
 #   metadata = position map + bucket records (slot list, fill, IV/tag) + stash heads; every field sized to what
 #              it addresses (log2 of N, of the bucket count B, of the pool size P) and packed, no word formats
-#   stash    = pool blocks + links; pool size from Claim 1 (bound at 2^-64 per access, any access sequence),
-#              ported from vitis/host_doma.cpp, plus the host's margin (1% of N + 64) or Z + 2 (--margin exact)
+#   stash    = pool blocks + links; pool size = ceil of Claim 1 at 2^-64 per access (any access sequence), from
+#              stash_bound.py, the only place the bound lives (keep it in this script's folder)
+#   N is rounded down to a multiple of lambda, so B = N / lambda as the stash analysis assumes
 # ======================================================================================================
-G64 = 64 * math.log(2.0)
-U_R = np.arange(1, 400) * 0.005
-U_O = np.arange(1, 400) * 0.01
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from stash_bound import claim1          # noqa: E402
+
 RECORD_LAYOUTS = ("per_bucket", "per_slot", "tag_out", "ctr_only")
 ROUND_BITS = False           # True: round each field up to whole bits instead of exact log2 widths
 
 
-def _ln_mgf_A(t, Bk, n):
-    p = 1.0 / Bk
-    lr = np.log1p(-p) + t
-    out = np.empty_like(t)
-    small = np.abs(lr) < 1e-15
-    pos = (lr > 0) & ~small
-    neg = (lr < 0) & ~small
-    out[small] = math.log(p * n + 1.0)
-    lrn = n * lr[pos]
-    with np.errstate(over="ignore", invalid="ignore"):
-        v = np.log(p * np.expm1(lrn) / np.expm1(lr[pos]) + np.exp(lrn))
-    v[lrn > 700] = np.inf
-    out[pos] = v
-    rn = np.exp(n * lr[neg])
-    out[neg] = np.log(p * (1 - rn) / (-np.expm1(lr[neg])) + rn)
-    return out
-
-def _xR(Bk, n, lg, extra_reads=0):
-    # bucket j goes unread for i accesses with prob (1-1/B)^(i(1+k)); remaps into j still arrive at rate 1/B
-    Be = 1.0 / (1.0 - (1.0 - 1.0 / Bk) ** (1 + extra_reads)) if extra_reads else Bk
-    v = _ln_mgf_A(np.expm1(U_R) / Bk, Be, n)
-    ok = np.isfinite(v)
-    if not ok.all():                                  # the C++ loop stops at the first non-finite value
-        first_bad = int(np.argmax(~ok))
-        v, u = v[:first_bad], U_R[:first_bad]
-    else:
-        u = U_R
-    return float(np.min((Bk * v + lg) / u))
-
-def _xO(Bk, lam, Z, lg):
-    kmax = int(lam + 14 * math.sqrt(lam) + 80)
-    k = np.arange(kmax)
-    lt0 = -lam + k * math.log(lam) - np.array([math.lgamma(x + 1.0) for x in k])
-    lt = lt0[None, :] + U_O[:, None] * np.maximum(0, k - Z)[None, :]
-    mx = lt.max(axis=1)
-    lse = mx + np.log(np.exp(lt - mx[:, None]).sum(axis=1))
-    return float(np.min((Bk * lse + lg) / U_O))
-
 @functools.lru_cache(maxsize=None)
-def stash_bound(n, lam, Z, extra_reads=0):
-    """Claim 1: the stash exceeds this many blocks with probability <= 2^-64 per access (any access sequence)."""
-    Bk = math.ceil(n / lam)
-    return min(_xR(Bk, n, G64 - math.log(f), extra_reads) + _xO(Bk, lam, Z, G64 - math.log(1 - f))
-               for f in (0.1, 0.3, 0.5, 0.7, 0.9))
-
-def pool_entries(n, lam, Z, margin="host"):
-    """Pool entries: Claim 1 + the host's provisional margin (1% of n + 64), or + Z + 2 with margin='exact'."""
-    b = math.ceil(stash_bound(n, lam, Z))
-    return min(n, b + (math.ceil(0.01 * n) + 64 if margin == "host" else Z + 2))
+def pool_entries(n, lam, Z):
+    """Pool entries: ceil of Claim 1 at 2^-64 per access (stash_bound.py); n is a multiple of lambda."""
+    return min(n, math.ceil(claim1(n, n // lam, Z, splits=99)))
 
 
 def clog2(x):
     return max(1, math.ceil(math.log2(x)))
 
-def trusted(n, S, lam=8, Z=8, records="per_bucket", margin="host"):
+def trusted(n, S, lam=8, Z=8, records="per_bucket"):
     """On-package bytes by structure for n blocks of S bytes, lambda real blocks per bucket on average, Z positions.
        position map, per block : status (2) + bucket (log2 B) + pool index of a stashed block (log2 P)
        bucket record, per bucket: slot list Z * log2 N + fill log2(Z + 1) + integrity state (records=)
@@ -102,8 +59,9 @@ def trusted(n, S, lam=8, Z=8, records="per_bucket", margin="host"):
               'tag_out'   : a 64-bit write counter per bucket; tags stored with the ciphertext
               'ctr_only'  : as tag_out, and the slot list and fill also travel with the ciphertext
     """
-    B = math.ceil(n / lam)
-    P = pool_entries(n, lam, Z, margin)
+    n = max(lam, n // lam * lam)            # B = n / lambda exactly (the stash analysis assumes it)
+    B = n // lam
+    P = pool_entries(n, lam, Z)
     w = clog2 if ROUND_BITS else (lambda x: math.log2(max(x, 2)))
     SW, BW, FW, PW = w(n), w(B), w(Z + 1), w(P)
     ivtag_bits = {"per_bucket": 96 + 128, "per_slot": Z * (96 + 128), "tag_out": 64, "ctr_only": 64}[records]
@@ -114,7 +72,7 @@ def trusted(n, S, lam=8, Z=8, records="per_bucket", margin="host"):
     links = math.ceil(P * (SW + (PW + 1) + PW) / 8)
     blocks = P * S
     metadata, stash = pm + rec + heads, links + blocks
-    return dict(n=n, S=S, lam=lam, Z=Z, records=records, margin=margin, B=B, P=P, pool_frac=P / n,
+    return dict(n=n, S=S, lam=lam, Z=Z, records=records, B=B, P=P, pool_frac=P / n,
                 pm=pm, rec=rec, ivtag=ivtag, heads=heads, metadata=metadata, links=links, blocks=blocks,
                 stash=stash, total=metadata + stash, data=n * S, ratio=(metadata + stash) / (n * S))
 
@@ -144,34 +102,33 @@ def fmt_block(S):
     return f"{S // 1024} KB" if S >= 1024 and S % 1024 == 0 else f"{S} B"
 
 
-def config_header(lam, Z, records, margin):
+def config_header(lam, Z, records):
     rec_txt = {"per_bucket": "slot list + one 96-bit IV and 128-bit tag per bucket (per-bucket GCM)",
                "per_slot": "slot list + one IV and tag per position (before per-bucket GCM)",
                "tag_out": "slot list + 64-bit write counter per bucket; tags stored with the ciphertext",
                "ctr_only": "64-bit write counter per bucket; slot list and tag stored with the ciphertext"}[records]
     lay_txt = "fields sized to what they address (log2 N, log2 B, log2 P) and packed" + \
         (", whole bits" if ROUND_BITS else "")
-    mar_txt = {"host": "Claim 1 at 2^-64 per access + 1% of N + 64 (host_doma.cpp)",
-               "exact": "Claim 1 at 2^-64 per access + Z + 2"}[margin]
+    mar_txt = "ceil of Claim 1 at 2^-64 per access (stash_bound.py)"
     lines = [f"lambda = {lam}, Z = {Z}: N/lambda buckets of {Z} positions, {Z + 1} eviction candidates per head",
              f"layout: {lay_txt}", f"records: {rec_txt}", f"stash pool: {mar_txt}"]
     return lines
 
 
 # ---------------- table, CSV, LaTeX ----------------
-def make_rows(datas, sizes, lam, Z, records, margin):
+def make_rows(datas, sizes, lam, Z, records):
     rows = []
     for D in datas:
         for S in sizes:
-            r = trusted(blocks_for(D, S), S, lam, Z, records, margin)
+            r = trusted(blocks_for(D, S), S, lam, Z, records)
             r["D"] = D
             rows.append(r)
     return rows
 
 
-def print_table(rows, lam, Z, records, margin, budget_bytes):
+def print_table(rows, lam, Z, records, budget_bytes):
     print()
-    for line in config_header(lam, Z, records, margin):
+    for line in config_header(lam, Z, records):
         print("  " + line)
     fits_hdr = f"fits {fmt(budget_bytes, pad=False)}" if budget_bytes > 0 else ""
     hdr = (f"{'data':>10} {'block':>6} | {'metadata':>10} {'stash':>10} {'(pool)':>8} | {'meta+stash':>10} "
@@ -211,7 +168,7 @@ def print_breakdown(rows, lam, Z):
     print("(bytes per block in parentheses)")
 
 
-CSV_FIELDS = ["lam", "Z", "records", "margin", "data_target_bytes", "block_bytes", "N", "data_bytes", "buckets",
+CSV_FIELDS = ["lam", "Z", "records", "data_target_bytes", "block_bytes", "N", "data_bytes", "buckets",
               "pool_entries", "pool_frac", "posmap_bytes", "records_bytes", "ivtag_bytes", "heads_bytes",
               "metadata_bytes", "stash_links_bytes", "stash_blocks_bytes", "stash_bytes", "total_bytes",
               "trusted_over_data"]
@@ -222,7 +179,7 @@ def write_csv(path, all_rows):
         w = csv.writer(f)
         w.writerow(CSV_FIELDS)
         for r in all_rows:
-            w.writerow([r["lam"], r["Z"], r["records"], r["margin"], int(r["D"]), r["S"], r["n"],
+            w.writerow([r["lam"], r["Z"], r["records"], int(r["D"]), r["S"], r["n"],
                         r["data"], r["B"], r["P"], f"{r['pool_frac']:.6f}", r["pm"], r["rec"], r["ivtag"],
                         r["heads"], r["metadata"], r["links"], r["blocks"], r["stash"], r["total"],
                         f"{r['ratio']:.6f}"])
@@ -326,11 +283,11 @@ def size_color(S, sizes):
     return SERIES[free[others.index(S) % len(free)]] if free else SERIES[others.index(S) % len(SERIES)]
 
 
-def budget_crossing(S, lam, Z, records, margin, budget, lo, hi):
+def budget_crossing(S, lam, Z, records, budget, lo, hi):
     """Data size (bytes) at which the trusted total first reaches the budget (bisection in log D)."""
     def over(lg):
         D = math.exp(lg)
-        return trusted(blocks_for(D, S), S, lam, Z, records, margin)["total"] >= budget
+        return trusted(blocks_for(D, S), S, lam, Z, records)["total"] >= budget
     a, b = math.log(lo), math.log(hi)
     if over(a):
         return lo
@@ -357,7 +314,7 @@ def data_ticks(lo, hi):
         v *= 4
 
 
-def plot_config(path, lam, Z, sizes, records, margin, budget_bytes, drange, figsize=(3.5, 2.6), budget_name="U55C"):
+def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5, 2.6), budget_name="U55C"):
     """One panel: trusted memory / protected data against the protected data size, one line per block size.
     The budget is one curve, trusted = budget, i.e. y = budget / data; each line is solid while it fits and
     dotted beyond, with a diamond (labelled with the data size) where it reaches the budget."""
@@ -374,11 +331,11 @@ def plot_config(path, lam, Z, sizes, records, margin, budget_bytes, drange, figs
     ymax, ends, crossings = 0.0, [], []
 
     def ratio(D, S):
-        return trusted(blocks_for(D, S), S, lam, Z, records, margin)["ratio"]
+        return trusted(blocks_for(D, S), S, lam, Z, records)["ratio"]
 
     for S in sizes:
         col = size_color(S, sizes)
-        dc = budget_crossing(S, lam, Z, records, margin, budget_bytes, lo, hi) if budget_bytes > 0 else None
+        dc = budget_crossing(S, lam, Z, records, budget_bytes, lo, hi) if budget_bytes > 0 else None
         xs = sorted(set(grid + ([dc] if dc is not None else [])))
         ys = [ratio(D, S) for D in xs]
         ymax = max(ymax, max(ys))
@@ -485,8 +442,6 @@ def main(argv=None):
                     help="data sizes for the table, in GB (default 16 64 256 1000; iec: 16 64 256 1024)")
     ap.add_argument("--records", choices=RECORD_LAYOUTS, default="per_bucket",
                     help="integrity state in the bucket records (default per_bucket: one IV and tag per bucket)")
-    ap.add_argument("--margin", choices=("host", "exact"), default="host",
-                    help="stash pool margin: host (1%% of N + 64, as shipped) or exact (Z + 2)")
     ap.add_argument("--round-bits", action="store_true", help="round each field up to whole bits")
     ap.add_argument("--units", choices=("si", "iec"), default="si", help="si: 1 GB = 1e9 B; iec: 1 GiB = 2^30 B")
     ap.add_argument("--budget", type=float, default=16.0,
@@ -501,7 +456,7 @@ def main(argv=None):
     ap.add_argument("--figsize", type=float, nargs=2, default=[3.5, 2.6], metavar=("W", "H"))
     args = ap.parse_args(argv)
     if not 1 <= args.lam <= args.Z:
-        ap.error(f"need 1 <= lambda <= Z (lambda is the average number of real blocks per bucket, Z its positions)")
+        ap.error("need 1 <= lambda <= Z (lambda is the average number of real blocks per bucket, Z its positions)")
     _UNIT = UNITS_ACTIVE = UNITS[args.units]
     ROUND_BITS = args.round_bits
     G = _UNIT[0] ** 3
@@ -510,15 +465,15 @@ def main(argv=None):
     drange = [x * G for x in (args.plot_range or ([1, 4000] if args.units == "si" else [1, 4096]))]
     if min(datas) <= 0 or drange[0] <= 0 or drange[1] <= drange[0]:
         ap.error("data sizes and the plot range must be positive (and LO < HI)")
-    rows = make_rows(datas, args.sizes, args.lam, args.Z, args.records, args.margin)
-    print_table(rows, args.lam, args.Z, args.records, args.margin, budget)
+    rows = make_rows(datas, args.sizes, args.lam, args.Z, args.records)
+    print_table(rows, args.lam, args.Z, args.records, budget)
     if args.breakdown:
         print_breakdown(rows, args.lam, args.Z)
     if args.csv:
         write_csv(args.csv, rows)
     if args.tex:
         write_tex(args.tex, [(args.lam, args.Z)], [rows], budget, args.budget_name)
-    plot_config(args.out, args.lam, args.Z, args.sizes, args.records, args.margin, budget, drange,
+    plot_config(args.out, args.lam, args.Z, args.sizes, args.records, budget, drange,
                 tuple(args.figsize), args.budget_name)
 
 
