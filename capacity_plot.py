@@ -7,7 +7,7 @@ solid while it fits and dotted beyond, with a marker labelled with the most data
 gives metadata, stash and their total for a few data sizes.
 
 Examples
-  python capacity_plot.py                                # lambda 6, Z 8; 32 B .. 4 KB; capacity.pdf + table
+  python capacity_plot.py                                # lambda 7, Z 8; 32 B .. 4 KB; capacity.pdf + table
   python capacity_plot.py --lam 4 --Z 8 --out capacity_l4.pdf
   python capacity_plot.py --data 64 256 1000 --sizes 64 4096 --tex capacity.tex --csv capacity.csv
   python capacity_plot.py --breakdown                    # metadata split into map / records / heads
@@ -314,7 +314,7 @@ def data_ticks(lo, hi):
         v *= 4
 
 
-def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5, 2.6), budget_name="U55C"):
+def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5, 2.8), budget_name="U55C"):
     """One panel: trusted memory / protected data against the protected data size, one line per block size.
     The budget is one curve, trusted = budget, i.e. y = budget / data; each line is solid while it fits and
     dotted beyond, with a diamond (labelled with the data size) where it reaches the budget."""
@@ -325,7 +325,7 @@ def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5
 
     _style(plt)
     fig, ax = plt.subplots(figsize=figsize)
-    fig.subplots_adjust(left=0.135, right=0.85, top=0.9, bottom=0.165)
+    fig.subplots_adjust(left=0.135, right=0.955, top=0.80, bottom=0.145)
     lo, hi = drange
     grid = list(np.geomspace(lo, hi, 80))
     ymax, ends, crossings = 0.0, [], []
@@ -368,18 +368,6 @@ def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5
         # the budget: trusted = budget  <=>  y = budget / data
         bx = np.geomspace(max(lo, budget_bytes / top), hi, 120)
         ax.plot(bx, budget_bytes / bx, color=INK2, lw=0.9, ls=(0, (4, 1.5, 1, 1.5)), zorder=2)
-        yl = top - 0.03                                   # label the curve near the top, where it is steep
-        ann = ax.annotate(f"metadata + stash = {b} ({budget_name})\ndotted: more than {b}\n"
-                          f"      most data that fits in {b}", xy=(budget_bytes / yl, yl),
-                          xytext=(6, 0), textcoords="offset points", ha="left", va="top", fontsize=6.5,
-                          color=INK2, linespacing=1.1, zorder=6)
-        # the marker glyph in front of the third line, drawn as the same marker the lines use
-        fig.canvas.draw()
-        bb = ann.get_window_extent(fig.canvas.get_renderer())
-        mx, my = bb.x0 + 4.5 * fig.dpi / 72, bb.y0 + bb.height / 6
-        ax.plot(*ax.transData.inverted().transform((mx, my)), ls="none", marker="D", ms=3.6, mfc=SURFACE,
-                mec=INK2, mew=1.0, zorder=6, clip_on=False)
-
     # label each budget marker with the data size it protects, on the side with more room
     def label_up(S, D, yc):
         others = [ratio(D, S2) for S2 in sizes if S2 != S] + [1.0]
@@ -395,6 +383,19 @@ def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5
     ax.set_xlabel("data size")
     ax.set_ylabel("(metadata + stash) / protected data")
     ax.set_title(rf"$\lambda={lam}$, $Z={Z}$", loc="left", color=INK, fontsize=8)
+    # legend: what each colour and each line style means
+    from matplotlib.lines import Line2D
+    blank = Line2D([], [], ls="none", label="block size:")
+    size_h = [blank] + [Line2D([], [], color=size_color(S, sizes), lw=1.6, label=fmt_block(S)) for S in sizes]
+    l1 = fig.legend(handles=size_h, loc="upper left", bbox_to_anchor=(0.005, 0.995), ncol=len(size_h), frameon=False,
+                    fontsize=6.4, handlelength=1.6, columnspacing=1.0, handletextpad=0.5, borderaxespad=0.1)
+    fig.add_artist(l1)
+    if budget_bytes > 0:
+        b = fmt(budget_bytes, pad=False)
+        style_h = [Line2D([], [], color=INK2, lw=0.9, ls=(0, (4, 1.5, 1, 1.5)),
+                          label=f"metadata + stash = {b} ({budget_name})")]
+        fig.legend(handles=style_h, loc="upper center", bbox_to_anchor=(0.5, 0.93), ncol=1, frameon=False,
+                   fontsize=6.4, handlelength=1.8, handletextpad=0.45, borderaxespad=0.1)
     # label the "= data" line at the first spot that touches no plotted line or other label
     fig.canvas.draw()
     rend = fig.canvas.get_renderer()
@@ -420,7 +421,6 @@ def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5
             t.remove()
         if n == 0:
             break
-    _spread_labels(ax, ends)
     fig.savefig(path)
     if path.lower().endswith(".pdf"):
         png = path[:-4] + ".png"
@@ -434,7 +434,7 @@ def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5
 def main(argv=None):
     global _UNIT, UNITS_ACTIVE, ROUND_BITS
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--lam", type=int, default=6, help="lambda, average real blocks per bucket (default 6)")
+    ap.add_argument("--lam", type=int, default=7, help="lambda, average real blocks per bucket (default 7)")
     ap.add_argument("--Z", type=int, default=8, help="Z, positions per bucket (default 8)")
     ap.add_argument("--sizes", type=int, nargs="+", default=[32, 64, 256, 4096], metavar="BYTES",
                     help="block sizes in bytes, one line each (default 32 64 256 4096)")
@@ -453,7 +453,7 @@ def main(argv=None):
     ap.add_argument("--out", default="capacity.pdf", help="figure path (.pdf also writes a .png; default capacity.pdf)")
     ap.add_argument("--plot-range", type=float, nargs=2, metavar=("LO", "HI"),
                     help="x-axis data-size range in GB (default 1 4000; iec: 1 4096)")
-    ap.add_argument("--figsize", type=float, nargs=2, default=[3.5, 2.6], metavar=("W", "H"))
+    ap.add_argument("--figsize", type=float, nargs=2, default=[3.5, 2.8], metavar=("W", "H"))
     args = ap.parse_args(argv)
     if not 1 <= args.lam <= args.Z:
         ap.error("need 1 <= lambda <= Z (lambda is the average number of real blocks per bucket, Z its positions)")
