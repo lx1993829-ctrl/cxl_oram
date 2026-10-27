@@ -28,6 +28,15 @@
 // then read a new random block). LAT_RAW_READS=32,4096  LAT_RAW_WRITES=4096,32768  LAT_RAW_GAPS=0,150,300,600
 // (cycles)  LAT_RAW_N=20000  LAT_RAW_NOWAIT=0,1 (0: the read waits for every B, as DOMA does; 1: the read is issued
 // at the last W beat, without waiting for B).
+// Write acknowledgements against size (LAT_WACK=1): one write in flight, as DOMA's write-back is.
+//   LAT_WACK_SIZES=32,256,1024,4096       one burst each: timed directly, AW handshake to B (mode 4, K = 1), with
+//                                         percentiles; LAT_HIST also gets their histograms (kind write_ack)
+//   LAT_WACK_LONG=4096,32768              back-to-back 4 KB bursts (a 32 KB bucket write-back), first AW to the last
+//                                         B. The kernel times only single bursts, so these come from mode 5's run
+//                                         total: each sample is the write, every B awaited, then a 32-byte read;
+//                                         write = (total - 129) / samples - the read - the same per-sample overhead
+//                                         as a no-write run. 4 KB is included to check this against the direct value.
+//   LAT_WACK_N=20000                      samples per long-write run
 // Reads and writes at once (LAT_DUPLEX=1, needs LAT_CU2): one instance reads while the other writes, each
 // compared with its rate alone, for LAT_IND_SIZES and K = 16, 64.
 #include <xrt/xrt_bo.h>
@@ -38,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <numeric>
 #include <random>
 #include <string>
@@ -162,7 +172,8 @@ int main(int argc, char** argv) {
     uint8_t* p = chain.map<uint8_t*>();
 
     const bool rawm = std::getenv("LAT_RAW") != nullptr, dupm = std::getenv("LAT_DUPLEX") != nullptr;
-    if (!std::getenv("LAT_SWEEP") && !rawm && !dupm) {                  // the original three measurements
+    const bool wackm = std::getenv("LAT_WACK") != nullptr;
+    if (!std::getenv("LAT_SWEEP") && !rawm && !dupm && !wackm) {        // the original three measurements
         build_chain(p, lines, 32, 7);
         chain.sync(XCL_BO_SYNC_BO_TO_DEVICE, size_t(lines) * 32, 0);
         Res r0 = measure(krnl, chain, res, n, 0, 2, "dependent 32-byte reads");
@@ -204,6 +215,77 @@ int main(int argc, char** argv) {
     if (const char* hf = std::getenv("LAT_HIST")) {
         HIST = std::fopen(hf, "w");
         if (HIST) std::fprintf(HIST, "kind,bytes,resolution,bin_cycles,bin,lo_cyc,hi_cyc,lo_ns,hi_ns,count,note\n");
+    }
+    if (std::getenv("LAT_WACK")) {                                        // ---- write acknowledgements vs size ----
+        const uint32_t nd = std::max<uint32_t>(1000, n / 5);
+        std::map<uint32_t, double> direct;                                // bytes -> average cycles
+        for (uint32_t S : sizes("LAT_WACK_SIZES", {32, 256, 1024, 4096}, 4096)) {
+            const uint32_t b = S / 32;
+            uint32_t shift = 0; Arg a{nd, 4, b, 1, pow2_floor(span / np2(S)), 11 + b};   // 1-cycle bins, widened if needed
+            Res o = measure_r(krnl, chain, res, a, shift);
+            char name[64]; std::snprintf(name, sizeof name, "write ack %u B", S);
+            report(name, o, shift, 0);
+            const double avg = o.cnt ? double(o.sum) / o.cnt : 0;
+            direct[S] = avg;
+            auto ns = [&](double p) { return pctv(o, shift, p) * 1e3 / MHZ; };
+            std::printf("%-28s ns: avg %.1f  p1 <=%.0f  p10 <=%.0f  p50 <=%.0f  p90 <=%.0f  p99 <=%.0f  (bins of %.1f ns)\n", "",
+                        avg * 1e3 / MHZ, ns(0.01), ns(0.10), ns(0.50), ns(0.90), ns(0.99), (1u << shift) * 1e3 / MHZ);
+            csv("write_ack", 1, S, 1, o, shift, gbps(uint64_t(o.cnt) * S, o.total));
+            if (HIST) {
+                for (uint32_t i = 0; i < 128; i++) if (o.hist[i]) {
+                    const uint32_t lo = i << shift, hi = (i == 127) ? std::max<uint32_t>(o.max, lo) : ((i + 1) << shift) - 1;
+                    std::fprintf(HIST, "write_ack,%u,full,%u,%u,%u,%u,%.1f,%.1f,%u,\n", S, 1u << shift, i, lo, hi,
+                                 lo * 1e3 / MHZ, hi * 1e3 / MHZ, o.hist[i]);
+                }
+                std::fflush(HIST);
+            }
+        }
+        const auto longs = sizes("LAT_WACK_LONG", {4096, 32768}, 32768);
+        if (!longs.empty()) {
+            const uint32_t nw = std::getenv("LAT_WACK_N") ? uint32_t(std::atoi(std::getenv("LAT_WACK_N"))) : 20000u;
+            const double SETUP = 129.0;                                   // run-total cycles outside the samples
+            auto per_sample = [&](const Res& o) { return o.cnt ? (double(o.total) - SETUP) / o.cnt : 0.0; };
+            auto rd_avg = [](const Res& o) { return o.cnt ? double(o.sum) / o.cnt : 0.0; };
+            uint32_t sh0 = 2;                                             // no write: per-sample overhead around the read
+            Arg b0{nw, 5, 1, 0, pow2_floor(span / 32), 501, 0, 0};       // as LAT_RAW's baseline for a 32-byte read
+            Res o0 = measure_r(krnl, chain, res, b0, sh0);
+            const double ovh0 = per_sample(o0) - rd_avg(o0);
+            std::printf("%-28s per sample %.1f cycles = 32-byte read %.1f + %.1f overhead (%u samples)\n",
+                        "long writes, no-write run:", per_sample(o0), rd_avg(o0), ovh0, o0.cnt);
+            std::map<uint32_t, double> derived;
+            for (uint32_t W : longs) {
+                if (W % 4096) { std::printf("LAT_WACK_LONG: %u ignored (a multiple of 4096)\n", W); continue; }
+                uint32_t sh = 2;
+                Arg a{nw, 5, 1, 0, pow2_floor(span / np2(W)), 502 + W / 4096, W / 32, 0};
+                Res o = measure_r(krnl, chain, res, a, sh);
+                const double w = per_sample(o) - rd_avg(o) - ovh0;
+                derived[W] = w;
+                std::printf("%-28s avg %.1f cycles (memory %.1f ns), %u x 4 KB bursts, from the run total (%u samples; "
+                            "read after it %.1f cycles)\n", (std::string("write ack ") + std::to_string(W) + " B").c_str(),
+                            w, w * 1e3 / MHZ, W / 4096, o.cnt, rd_avg(o));
+                auto it = direct.find(W);
+                if (it != direct.end())
+                    std::printf("%-28s check: direct %.1f cycles, from the run total %.1f cycles (%+.1f ns)\n", "",
+                                it->second, w, (w - it->second) * 1e3 / MHZ);
+                if (CSV) {
+                    std::fprintf(CSV, "write_ack_total,1,%u,1,%u,,%.1f,,,,,%llu,%.3f,%.0f,%u,0\n", W, o.cnt, w,
+                                 (unsigned long long)o.total, gbps(uint64_t(o.cnt) * W, uint64_t(w * o.cnt)), MHZ, W);
+                    std::fflush(CSV);
+                }
+            }
+            // the run-total method counts a cycle or two of state changes that the direct timer does not; the 4 KB
+            // pair measures that difference, and the long writes are also given with it removed
+            if (derived.count(4096) && direct.count(4096)) {
+                const double off = derived[4096] - direct[4096];
+                std::printf("%-28s run total vs direct at 4 KB: %+.1f cycles; with that removed:\n", "", off);
+                for (const auto& kv : derived) if (kv.first > 4096)
+                    std::printf("%-28s write ack %u B: %.1f cycles (memory %.1f ns)\n", "", kv.first, kv.second - off,
+                                (kv.second - off) * 1e3 / MHZ);
+            }
+        }
+        if (CSV) std::fclose(CSV);
+        if (HIST) std::fclose(HIST);
+        return 0;
     }
     if (std::getenv("LAT_RAW")) {                                         // ---- read after write ----
         const auto reads = sizes("LAT_RAW_READS", {32, 4096}, 32768), writes = sizes("LAT_RAW_WRITES", {4096, 32768}, 32768);
