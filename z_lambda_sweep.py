@@ -226,8 +226,9 @@ def main(argv=None):
                     help="data size in GB used for the model (default 64; the result barely depends on it)")
     ap.add_argument("--records", choices=RECORD_LAYOUTS, default="per_bucket")
     ap.add_argument("--round-bits", action="store_true", help="round each field up to whole bits")
-    ap.add_argument("--figsize", type=float, nargs=2, default=[3.5, 2.5], metavar=("W", "H"),
-                    help="figure size in inches (default 3.5 2.5: one column, each panel half of it)")
+    ap.add_argument("--figsize", type=float, nargs=2, default=[3.5, 2.2], metavar=("W", "H"),
+                    help="figure size in inches (default 3.5 2.2: one column, each panel half of it)")
+    ap.add_argument("--ymax", type=float, default=100.0, help="top of the y axis in %% (default 100; 0 = automatic)")
     ap.add_argument("--out", default="z_lambda_sweep.pdf", help="figure path (.pdf also writes a .png)")
     args = ap.parse_args(argv)
     lmin = args.lmin if args.lmin is not None else max(1, args.Z // 2)
@@ -265,12 +266,12 @@ def main(argv=None):
 
     _style(plt)
     ymax = max(100 * max(c) for _, c in ca + cb)
-    top = 20 * (int(ymax // 20) + 1)
+    top = args.ymax if args.ymax else 20 * (int(ymax // 20) + 1)
     blk = f"{S // 1024} KB" if S >= 1024 else f"{S} B"
 
     # one column, two half-width panels side by side sharing the y axis; positions in inches
     W, H = args.figsize
-    left, gap_w, right, bot, hdr_h = 0.44, 0.10, 0.05, 0.50, 0.56
+    left, gap_w, right, bot, hdr_h = 0.44, 0.10, 0.05, 0.50, 0.46
     pw, ph = (W - left - gap_w - right) / 2, H - bot - hdr_h
     fig = plt.figure(figsize=(W, H))
     axa = fig.add_axes([left / W, bot / H, pw / W, ph / H])
@@ -302,15 +303,23 @@ def main(argv=None):
     # header: what p is, then the legend on its own row
     handles = [Line2D([], [], color=SERIES[k % len(SERIES)], lw=LW, marker="o", ms=MS, label=f"p = {p:g}%")
                for k, p in enumerate(args.shares)]
-    head = fig.text(left / W, (H - 0.10) / H, f"{blk} blocks; p = share of bucket data on-package;", ha="left",
-                    va="center", color=INK, fontsize=FS_LABEL)
-    # after the header, on the same line: the key for the circled minima
+    # header row: what p is, then the key for the circled minima, centered as one line
+    yh = (H - 0.08) / H
+    head = fig.text(0, yh, f"{blk} blocks; p = share of bucket data on-package;", ha="left", va="center",
+                    color=INK, fontsize=FS_LABEL)
+    key = fig.legend(handles=[Line2D([], [], ls="none", marker="o", ms=MS_MIN, mfc=SURFACE, mec=INK2, mew=1.1,
+                                     label="minimum")], loc="center left", bbox_to_anchor=(0, yh), frameon=False,
+                     fontsize=FS_LABEL, handlelength=1.0, handletextpad=0.3, borderaxespad=0, borderpad=0)
     fig.canvas.draw()
-    x_end = fig.transFigure.inverted().transform(head.get_window_extent(fig.canvas.get_renderer()).p1)[0]
-    fig.legend(handles=[Line2D([], [], ls="none", marker="o", ms=MS_MIN, mfc=SURFACE, mec=INK2, mew=1.1,
-                               label="minimum")], loc="center left", bbox_to_anchor=(x_end + 0.004, (H - 0.10) / H),
-               frameon=False, fontsize=FS_LABEL, handlelength=1.0, handletextpad=0.3, borderaxespad=0, borderpad=0)
-    fig.legend(handles=handles, loc="center left", bbox_to_anchor=(left / W - 0.012, (H - 0.26) / H),
+    rend = fig.canvas.get_renderer()
+    inv = fig.transFigure.inverted()
+    w_head = inv.transform(head.get_window_extent(rend).p1)[0] - inv.transform(head.get_window_extent(rend).p0)[0]
+    w_key = inv.transform(key.get_window_extent(rend).p1)[0] - inv.transform(key.get_window_extent(rend).p0)[0]
+    x0 = 0.5 - (w_head + 0.004 + w_key) / 2
+    head.set_x(x0)
+    key.set_bbox_to_anchor((x0 + w_head + 0.004, yh), transform=fig.transFigure)
+    # legend row, centered
+    fig.legend(handles=handles, loc="center", bbox_to_anchor=(0.5, (H - 0.22) / H),
                ncol=len(handles), frameon=False, fontsize=FS_LABEL, handlelength=1.5, handletextpad=0.4,
                columnspacing=1.0, borderaxespad=0, borderpad=0)
     save(fig, plt, args.out)

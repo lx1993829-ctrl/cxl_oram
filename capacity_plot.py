@@ -314,8 +314,8 @@ def data_ticks(lo, hi):
         v *= 4
 
 
-def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5, 2.35), budget_name="U55C",
-                ymax_axis=1.2):
+def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5, 2.1), budget_name="U55C",
+                ymax_axis=1.0):
     """One panel: trusted memory / protected data against the protected data size, one line per block size.
     The budget is one curve, trusted = budget, i.e. y = budget / data; each line is solid while it fits and
     dotted beyond, with a diamond (labelled with the data size) where it reaches the budget."""
@@ -399,31 +399,6 @@ def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5
                           label=f"metadata + stash = {b} ({budget_name})")]
         fig.legend(handles=style_h, loc="center", bbox_to_anchor=(0.6, 1 - 0.27 / H), ncol=1, frameon=False,
                    fontsize=6.4, handlelength=1.8, handletextpad=0.45, borderaxespad=0.1)
-    # label the "= data" line at the first spot that touches no plotted line or other label
-    fig.canvas.draw()
-    rend = fig.canvas.get_renderer()
-    pts = np.vstack([ax.transData.transform(np.column_stack(l.get_data())) for l in ax.get_lines()
-                     if len(l.get_xdata()) > 1])
-    others = [t.get_window_extent(rend) for t in ax.texts]
-    spots = [((hi, 1.0), (-2, -2), "right", "top", "metadata + stash = data"),
-             ((hi / 6, 1.0), (0, 2), "right", "bottom", "metadata + stash = data"),
-             ((lo, 1.0), (3, 2), "left", "bottom", "metadata + stash\n= data"),
-             ((lo, 1.0), (3, -2), "left", "top", "metadata + stash\n= data")]
-    best = None
-    for xy, off, ha, va, txt in spots:
-        t = ax.annotate(txt, xy=xy, xytext=off, textcoords="offset points", ha=ha, va=va, fontsize=6.5,
-                        color=INK2, linespacing=1.1, zorder=6)
-        bb = t.get_window_extent(rend).expanded(1.04, 1.25)
-        n = int(np.sum((pts[:, 0] >= bb.x0) & (pts[:, 0] <= bb.x1) & (pts[:, 1] >= bb.y0) & (pts[:, 1] <= bb.y1)))
-        n += sum(1 for o in others if bb.overlaps(o))
-        if best is None or n < best[0]:
-            if best is not None:
-                best[1].remove()
-            best = (n, t)
-        else:
-            t.remove()
-        if n == 0:
-            break
     fig.savefig(path)
     if path.lower().endswith(".pdf"):
         png = path[:-4] + ".png"
@@ -456,8 +431,8 @@ def main(argv=None):
     ap.add_argument("--out", default="capacity.pdf", help="figure path (.pdf also writes a .png; default capacity.pdf)")
     ap.add_argument("--plot-range", type=float, nargs=2, metavar=("LO", "HI"),
                     help="x-axis data-size range in GB (default 1 4000; iec: 1 4096)")
-    ap.add_argument("--figsize", type=float, nargs=2, default=[3.5, 2.35], metavar=("W", "H"))
-    ap.add_argument("--ymax", type=float, default=1.2, help="top of the y axis (default 1.2; 0 = automatic)")
+    ap.add_argument("--figsize", type=float, nargs=2, default=[3.5, 2.1], metavar=("W", "H"))
+    ap.add_argument("--ymax", type=float, default=1.0, help="top of the y axis (default 1.0; 0 = automatic)")
     args = ap.parse_args(argv)
     if not 1 <= args.lam <= args.Z:
         ap.error("need 1 <= lambda <= Z (lambda is the average number of real blocks per bucket, Z its positions)")
