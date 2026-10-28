@@ -212,6 +212,30 @@ def label_minima(fig, ax, xs, curves, mins, sym):
         placed.append(best_ann.get_window_extent(rend))
 
 
+def tick_rows(fig, ax, ticks, rows):
+    """Tick labels under the x axis as rows [(name, labels)], each row named just left of the axis."""
+    from matplotlib import transforms
+    import matplotlib.pyplot as plt
+    ax.xaxis.set_major_locator(__import__("matplotlib.ticker", fromlist=["FixedLocator"]).FixedLocator(ticks))
+    ax.tick_params(axis="x", labelbottom=False)
+    base = plt.rcParams["xtick.major.size"] + 2.0                # tick length + the pad used for tick labels
+    firsts = []
+    for i, (name, labels) in enumerate(rows):
+        dy = -(base + i * FS_TICK * 1.3)
+        tr = transforms.offset_copy(ax.get_xaxis_transform(), fig=fig, x=0, y=dy, units="points")
+        texts = [ax.text(x, 0, s, transform=tr, ha="center", va="top", fontsize=FS_TICK, color=INK2)
+                 for x, s in zip(ticks, labels)]
+        firsts.append((name, dy, texts[0]))
+    fig.canvas.draw()
+    rend = fig.canvas.get_renderer()
+    x_axis = ax.get_window_extent(rend).x0
+    x_name = min([x_axis] + [t.get_window_extent(rend).x0 for _, _, t in firsts]) - 2.5 * fig.dpi / 72
+    for name, dy, _ in firsts:
+        y_disp = ax.transAxes.transform((0, 0))[1] + dy * fig.dpi / 72
+        xf, yf = fig.transFigure.inverted().transform((x_name, y_disp))
+        fig.text(xf, yf, name, ha="right", va="top", fontsize=FS_TICK, color=INK)   # row names dark, labels gray
+
+
 def main(argv=None):
     global ROUND_BITS
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -271,7 +295,7 @@ def main(argv=None):
 
     # one column, two half-width panels side by side sharing the y axis; positions in inches
     W, H = args.figsize
-    left, gap_w, right, bot, hdr_h = 0.44, 0.10, 0.05, 0.50, 0.46
+    left, gap_w, right, bot, hdr_h = 0.44, 0.10, 0.05, 0.36, 0.46
     pw, ph = (W - left - gap_w - right) / 2, H - bot - hdr_h
     fig = plt.figure(figsize=(W, H))
     axa = fig.add_axes([left / W, bot / H, pw / W, ph / H])
@@ -281,13 +305,13 @@ def main(argv=None):
     step = 4 if len(za) > 8 else 2
     ticks = [z for z in za if (z - za[0]) % step == 0]
     axa.xaxis.set_major_locator(FixedLocator(ticks))
-    axa.set_xticklabels([f"{z}\n{2 * z * S // 1024} KB" for z in ticks], linespacing=1.25)
-    axa.set_xlabel("Z (top), 2ZS (bottom)", fontsize=FS_LABEL, labelpad=1.5)
+    tick_rows(fig, axa, ticks, [("$Z$", [str(z) for z in ticks]),
+                                ("2ZS", [f"{2 * z * S // 1024} KB" for z in ticks])])
     axa.set_title(rf"(a) $\lambda={lam_a}$, sweep $Z$", loc="left", color=INK, fontsize=FS_LABEL, pad=3)
 
     mins_b = panel(axb, lb, cb)
     axb.xaxis.set_major_locator(FixedLocator(lb))
-    axb.set_xlabel(r"$\lambda$", fontsize=FS_LABEL, labelpad=1.5)
+    axb.set_xlabel(r"$\lambda$", fontsize=FS_LABEL, labelpad=1.5, color=INK)   # dark, like the row names in (a)
     axb.set_title(rf"(b) $Z={Z_b}$ (2ZS = {2 * Z_b * S // 1024} KB), sweep $\lambda$", loc="left", color=INK,
                   fontsize=FS_LABEL, pad=3)
     axb.tick_params(axis="y", labelleft=False, length=0)
