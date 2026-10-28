@@ -314,7 +314,8 @@ def data_ticks(lo, hi):
         v *= 4
 
 
-def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5, 2.8), budget_name="U55C"):
+def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5, 2.35), budget_name="U55C",
+                ymax_axis=1.2):
     """One panel: trusted memory / protected data against the protected data size, one line per block size.
     The budget is one curve, trusted = budget, i.e. y = budget / data; each line is solid while it fits and
     dotted beyond, with a diamond (labelled with the data size) where it reaches the budget."""
@@ -325,7 +326,8 @@ def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5
 
     _style(plt)
     fig, ax = plt.subplots(figsize=figsize)
-    fig.subplots_adjust(left=0.135, right=0.955, top=0.80, bottom=0.145)
+    W, H = figsize
+    fig.subplots_adjust(left=0.135, right=0.955, top=1 - 0.40 / H, bottom=0.36 / H)
     lo, hi = drange
     grid = list(np.geomspace(lo, hi, 80))
     ymax, ends, crossings = 0.0, [], []
@@ -350,7 +352,7 @@ def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5
             ax.plot([dc], [yc], ls="none", marker="D", ms=4.2, mfc=SURFACE, mec=col, mew=1.3, zorder=5)
             crossings.append((yc, dc, S))
         ends.append((ys[-1], fmt_block(S), col, "sq"))
-    top = max(1.4, math.ceil(ymax * 10 + 1) / 10)   # room above 1.0 for the labels
+    top = ymax_axis if ymax_axis else max(1.4, math.ceil(ymax * 10 + 1) / 10)
 
     ax.set_xscale("log")
     ax.set_xlim(lo, hi)
@@ -382,19 +384,20 @@ def plot_config(path, lam, Z, sizes, records, budget_bytes, drange, figsize=(3.5
 
     ax.set_xlabel("data size")
     ax.set_ylabel("(metadata + stash) / protected data")
-    ax.set_title(rf"$\lambda={lam}$, $Z={Z}$", loc="left", color=INK, fontsize=8)
+    # the configuration, left of the budget legend, on the row just above the plot
+    fig.text(0.135, 1 - 0.27 / H, rf"$\lambda={lam}$, $Z={Z}$", ha="left", va="center", color=INK, fontsize=8)
     # legend: what each colour and each line style means
     from matplotlib.lines import Line2D
     blank = Line2D([], [], ls="none", label="block size:")
     size_h = [blank] + [Line2D([], [], color=size_color(S, sizes), lw=1.6, label=fmt_block(S)) for S in sizes]
-    l1 = fig.legend(handles=size_h, loc="upper left", bbox_to_anchor=(0.005, 0.995), ncol=len(size_h), frameon=False,
+    l1 = fig.legend(handles=size_h, loc="upper center", bbox_to_anchor=(0.5, 1 - 0.02 / H), ncol=len(size_h), frameon=False,
                     fontsize=6.4, handlelength=1.6, columnspacing=1.0, handletextpad=0.5, borderaxespad=0.1)
     fig.add_artist(l1)
     if budget_bytes > 0:
         b = fmt(budget_bytes, pad=False)
         style_h = [Line2D([], [], color=INK2, lw=0.9, ls=(0, (4, 1.5, 1, 1.5)),
                           label=f"metadata + stash = {b} ({budget_name})")]
-        fig.legend(handles=style_h, loc="upper center", bbox_to_anchor=(0.5, 0.93), ncol=1, frameon=False,
+        fig.legend(handles=style_h, loc="center", bbox_to_anchor=(0.6, 1 - 0.27 / H), ncol=1, frameon=False,
                    fontsize=6.4, handlelength=1.8, handletextpad=0.45, borderaxespad=0.1)
     # label the "= data" line at the first spot that touches no plotted line or other label
     fig.canvas.draw()
@@ -453,7 +456,8 @@ def main(argv=None):
     ap.add_argument("--out", default="capacity.pdf", help="figure path (.pdf also writes a .png; default capacity.pdf)")
     ap.add_argument("--plot-range", type=float, nargs=2, metavar=("LO", "HI"),
                     help="x-axis data-size range in GB (default 1 4000; iec: 1 4096)")
-    ap.add_argument("--figsize", type=float, nargs=2, default=[3.5, 2.8], metavar=("W", "H"))
+    ap.add_argument("--figsize", type=float, nargs=2, default=[3.5, 2.35], metavar=("W", "H"))
+    ap.add_argument("--ymax", type=float, default=1.2, help="top of the y axis (default 1.2; 0 = automatic)")
     args = ap.parse_args(argv)
     if not 1 <= args.lam <= args.Z:
         ap.error("need 1 <= lambda <= Z (lambda is the average number of real blocks per bucket, Z its positions)")
@@ -474,7 +478,7 @@ def main(argv=None):
     if args.tex:
         write_tex(args.tex, [(args.lam, args.Z)], [rows], budget, args.budget_name)
     plot_config(args.out, args.lam, args.Z, args.sizes, args.records, budget, drange,
-                tuple(args.figsize), args.budget_name)
+                tuple(args.figsize), args.budget_name, args.ymax)
 
 
 if __name__ == "__main__":
