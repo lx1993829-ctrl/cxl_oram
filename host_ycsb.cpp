@@ -65,7 +65,7 @@
 #include <vector>
 
 // ------------------------------------------------------------------ DOMA build constants (as host_doma.cpp)
-static const uint32_t LAMBDA = 6;                    // rtl/oram_params.vh ORAM_C
+static uint32_t LAMBDA = 6;                    // rtl/oram_params.vh ORAM_C; DOMA_LAMBDA=<lambda> for a LAMBDA=7 build (checked at init)
 static const uint32_t ZPOS   = 8;                    // rtl/oram_params.vh ORAM_Z
 static const size_t   MAX_BLOCK = 4096;
 static const uint8_t  T_GET = 0x01, T_PUT = 0x02, T_ACK = 0x10, T_SUM = 0x5A;
@@ -86,28 +86,29 @@ static double stash_xR(double Bk, double n, double lg) {
         if (!std::isfinite(v)) break; best = std::min(best, (Bk * v + lg) / u); }
     return best;
 }
-static double stash_xO(double Bk, double lam, int Z, double lg) {
-    double best = INFINITY; std::vector<double> lt(160);
+static double stash_xO(double Bk, double n, int Z, double lg) {   // per-bucket count Binomial(n, 1/B)
+    double best = INFINITY; std::vector<double> lt(160); const double p = 1.0 / Bk, lp = std::log(p), lq = std::log1p(-p);
     for (int i = 1; i < 400; i++) { const double u = i * 0.01; double mx = -INFINITY, sum = 0;
-        for (int k = 0; k < 160; k++) { lt[k] = -lam + k * std::log(lam) - std::lgamma(k + 1.0) + u * std::max(0, k - Z); mx = std::max(mx, lt[k]); }
+        for (int k = 0; k < 160; k++) { lt[k] = std::lgamma(n + 1) - std::lgamma(k + 1.0) - std::lgamma(n - k + 1) + k * lp + (n - k) * lq
+                                                + u * std::max(0, k - Z); mx = std::max(mx, lt[k]); }
         for (int k = 0; k < 160; k++) sum += std::exp(lt[k] - mx);
         best = std::min(best, (Bk * (mx + std::log(sum)) + lg) / u); }
     return best;
 }
 static double stash_bound(double n, double lam, int Z) {
-    const double Bk = std::ceil(n / lam), G = 64 * std::log(2.0);
+    const double Bk = std::ceil(n / lam), G = 64 * std::log(2.0);   // n is a multiple of lambda (the host rounds it): B = n / lambda
     double best = INFINITY;
     for (double f : {0.1, 0.3, 0.5, 0.7, 0.9})
-        best = std::min(best, stash_xR(Bk, n, G - std::log(f)) + stash_xO(Bk, lam, int(Z), G - std::log(1 - f)));
+        best = std::min(best, stash_xR(Bk, n, G - std::log(f)) + stash_xO(Bk, n, int(Z), G - std::log(1 - f)));
     return best;
 }
 
 // ------------------------------------------------------------------ oram_ycsb.c's generator, unchanged in logic
 // oram_ycsb.c: DEFAULT_N_ITERS 100, DEFAULT_NUM_SLOTS 128, MAX_SLOTS 32768, MAX_ITERS 131072, MAX_RUN_ORAM_OPS 2*MAX_ITERS
 #define DEFAULT_N_ITERS   1000000
-#define DEFAULT_NUM_SLOTS 1048576
+#define DEFAULT_NUM_SLOTS 1048572   // a multiple of lambda = 6 (no rounding), even (the odd/even slot layout), <= 2^20
 #define DEFAULT_SCAN_LEN  10
-#define MAX_SLOTS         1048576
+#define MAX_SLOTS         1048572
 #define MAX_ITERS         1000000
 #define MAX_RUN_ORAM_OPS  (10ull*MAX_ITERS)         // E at the defaults issues up to n_iters * scan_len
 #define WL_A 1
@@ -307,6 +308,19 @@ struct Lat {
     double mean() const { double m = 0; for (uint32_t x : v) m += x; return v.empty() ? 0 : m / v.size(); }
     uint32_t max() const { return v.empty() ? 0 : *std::max_element(v.begin(), v.end()); }
 };
+// two-sample Kolmogorov-Smirnov distance: the largest gap between the two empirical CDFs (inputs sorted; equal values
+// advance both, so ties between the samples count as equal)
+static double ks_distance(const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
+    if (a.empty() || b.empty()) return 0.0;
+    size_t i = 0, j = 0; double d = 0.0;
+    while (i < a.size() && j < b.size()) {
+        const uint32_t x = std::min(a[i], b[j]);
+        while (i < a.size() && a[i] == x) i++;
+        while (j < b.size() && b[j] == x) j++;
+        d = std::max(d, std::fabs(double(i) / a.size() - double(j) / b.size()));
+    }
+    return d;
+}
 struct PhaseResult {
     size_t cmds = 0, gets = 0, puts = 0, bad_hdr = 0;
     double wall = 0; uint64_t cycles = 0; uint32_t errors = 0; bool summary_ok = true; uint32_t done = 0;
@@ -319,12 +333,14 @@ struct PhaseResult {
     // phase-trace records (DOMA_PHASE_TRACE=1, a TRACE=1 bitstream): sums of the 16 event times over complete records
     uint64_t tr_sum[16] = {0}; uint64_t tr_e2e = 0; size_t tr_n = 0, tr_missing = 0;
     uint64_t tr_ph[12] = {0}; uint64_t tr_overlap = 0;    // the 12 phases (sum = E2E), and decryption before the last beat
+    uint64_t tr_wovl = 0; size_t tr_wovl_n = 0;           // re-encryption past the write-back start (two lanes; safe)
     double ph_mean(uint64_t x) const { return ph_n ? double(x) / ph_n : 0.0; }
 };
 
 static const char* WL_NAMES[] = {"?", "A", "B", "C", "D", "E", "F"};
 
 int main(int argc, char** argv) {
+    if (const char* l = std::getenv("DOMA_LAMBDA")) LAMBDA = uint32_t(std::stoul(l));   // the bitstream's lambda (build.sh LAMBDA)
     std::vector<std::string> pos; bool dry = false;
     for (int a = 1; a < argc; a++) { std::string s = argv[a]; if (s == "--dry-run") dry = true; else pos.push_back(s); }
     if (pos.size() < 3) {
@@ -402,10 +418,18 @@ int main(int argc, char** argv) {
     if (BLOCKA < 32 || BLOCKA > MAX_BLOCK || (BLOCKA & (BLOCKA - 1))) { std::printf("DOMA_BLOCK must be a power of two, 32..4096\n"); return 1; }
     uint32_t NBLK = std::getenv("DOMA_N") ? uint32_t(std::stoul(std::getenv("DOMA_N"))) : uint32_t(num_slots);
     if (NBLK < uint32_t(num_slots)) { std::printf("DOMA_N=%u is smaller than num_slots=%d\n", NBLK, num_slots); return 1; }
+    // the stash analysis takes B = n / lambda exactly: round n up to a multiple of lambda (at most lambda - 1 extra
+    // blocks, never requested). (Since v11b the boot places every block at an independent uniform bucket, so the
+    // per-bucket counts are Binomial(n, 1/B) for any n; the rounding is kept, and costs at most lambda - 1 blocks.) The kernel clamps n to its build's maximum: DOMA_NMAX=<that maximum> makes a rounding past it an error.
+    const uint32_t nblk_req = NBLK;
+    NBLK = ((NBLK + LAMBDA - 1) / LAMBDA) * LAMBDA;
+    if (NBLK != nblk_req) std::printf("n: %u blocks rounded up to %u, a multiple of lambda = %u (the extra blocks are never requested)\n", nblk_req, NBLK, LAMBDA);
+    if (std::getenv("DOMA_NMAX") && NBLK > std::stoul(std::getenv("DOMA_NMAX"))) {
+        std::printf("n = %u exceeds the build's maximum %s: the kernel would clamp it to a size that is not a multiple of lambda\n", NBLK, std::getenv("DOMA_NMAX")); return 1; }
     const uint32_t NB = (NBLK + LAMBDA - 1) / LAMBDA;
     const size_t stride = size_t(ZPOS) * BLOCKA;
     const double pool_bnd = stash_bound(double(NBLK), double(LAMBDA), int(ZPOS));
-    uint32_t POOL = uint32_t(std::min<double>(NBLK, std::ceil(pool_bnd) + std::ceil(0.01 * NBLK) + 64));
+    uint32_t POOL = uint32_t(std::min<double>(NBLK, std::ceil(pool_bnd) + 1));
     if (std::getenv("DOMA_POOL")) POOL = uint32_t(std::min<unsigned long>(NBLK, std::stoul(std::getenv("DOMA_POOL"))));
     const unsigned hbm_pct = std::getenv("DOMA_HBM_PCT") ? unsigned(std::stoul(std::getenv("DOMA_HBM_PCT"))) : 0u;
     if (hbm_pct > 100) { std::printf("DOMA_HBM_PCT must be 0..100\n"); return 1; }
@@ -419,7 +443,7 @@ int main(int argc, char** argv) {
 
     std::printf("host_ycsb: oram_ycsb arguments inst=%d n_iters=%d num_slots=%d workload=%s init_occ=%d scan_len=%d%s\n",
                 instance_id, n_iters, num_slots, wls.c_str(), init_occ, scan_len, PAD ? " (with gem5's padding reads)" : "");
-    std::printf("doma_kernel: n=%u blocks in %u buckets (%u in HBM), stash pool %u (Claim 1 bound %.0f), pages in %s%s; "
+    std::printf("doma_kernel: n=%u blocks in %u buckets (%u in HBM), stash pool %u (Claim 1 bound %.1f, rounded up, + 1), pages in %s%s; "
                 "up to %zu commands per launch\n", NBLK, NB, HBMK, POOL, pool_bnd,
                 pages_tag.empty() ? (pages_host ? "host memory" : "device memory") : pages_tag.c_str(),
                 std::getenv("DOMA_PAGES_HBM") ? " [DOMA_PAGES_HBM]" : "", max_cmds);
@@ -464,12 +488,12 @@ int main(int argc, char** argv) {
     auto launch = [&](uint32_t n) { return krnl(cmd, resp, pages, n | ((PTRACE && n) ? 0x80000000u : 0u), meta, brec, stash, NBLK, pages_hbm, HBMK, POOL); };
     size_t BLOCK = BLOCKA;
 
-    struct Summary { bool ok; uint32_t beats, lat_min, lat_max, errors, done; uint64_t total; };
+    struct Summary { bool ok; uint32_t lam, beats, lat_min, lat_max, errors, done; uint64_t total; };
     auto read_summary = [&](size_t n, bool with_data) {
         const size_t hr = roundup4k((n + 2) * 32);
         resp.sync(XCL_BO_SYNC_BO_FROM_DEVICE, with_data ? hr + n * BLOCK + (PTRACE ? n * 32 : 0) : (n + 2) * 32, 0);
         const uint8_t* r = resp.map<uint8_t*>() + n * 32;
-        Summary s{}; s.ok = (r[0] == T_SUM);
+        Summary s{}; s.ok = (r[0] == T_SUM); s.lam = r[1] ? r[1] : 6;   // byte 1: lambda when not 6
         std::memcpy(&s.beats, r + 4, 4); std::memcpy(&s.total, r + 8, 8); std::memcpy(&s.lat_min, r + 16, 4);
         std::memcpy(&s.lat_max, r + 20, 4); std::memcpy(&s.errors, r + 24, 4); std::memcpy(&s.done, r + 28, 4);
         return s;
@@ -542,7 +566,13 @@ int main(int argc, char** argv) {
                     // handoff 0-s0, lookup s0-s1, read gate s1-s2, bucket read s2-s4, decryption/verification s4-s6,
                     // operation s6-s7, eviction s7-s8, re-encryption s8-s10, write-back wait s10-s11, bucket write s11-s12,
                     // release gate s12-s14, result s14-done
-                    const uint32_t ch[13] = {v[0], v[1], v[2], v[4], v[6], v[7], v[8], v[10], v[11], v[12], v[14], lat, 0};
+                    // Two AES lanes: re-encryption runs at the write-back's rate (32 B per cycle), so the write-back, issued at its
+                    // fixed time, may start before the last encrypted beat (slot 10 after slot 11). That is safe: the write
+                    // never catches up (it would halt, axim_wdata_stall). Count the overlap, and end re-encryption at the
+                    // write-back's start so the phases still add up to E2E.
+                    const uint32_t enc_end = (v[11] != 0 && v[10] > v[11]) ? v[11] : v[10];
+                    if (enc_end != v[10]) { R.tr_wovl_n++; R.tr_wovl += v[10] - v[11]; }
+                    const uint32_t ch[13] = {v[0], v[1], v[2], v[4], v[6], v[7], v[8], enc_end, v[11], v[12], v[14], lat, 0};
                     bool ok = v[0] != 0 && v[3] != 0 && v[5] != 0;
                     for (int k = 0; k < 11 && ok; k++) ok = ch[k] != 0 && ch[k] <= ch[k + 1];
                     if (!ok) { if (R.tr_missing++ < 3) { std::printf("  %s cmd %zu: trace record out of order:", phase, at + i);
@@ -571,6 +601,43 @@ int main(int argc, char** argv) {
         }
         return true;
     };
+    // per-request latency distribution of a run (request to done, device cycles), by operation: percentiles, a
+    // Kolmogorov-Smirnov test of GET against PUT, and with DOMA_LAT_HIST=<file> the histogram appended as CSV rows
+    // (workload,op,latency_cycles,count) for plotting and cross-workload tests
+    auto distribution = [&](const char* wname, PhaseResult& R) {
+        std::vector<uint32_t> g = R.get.v, p = R.put.v, a = R.all.v;
+        std::sort(g.begin(), g.end()); std::sort(p.begin(), p.end()); std::sort(a.begin(), a.end());
+        auto line = [&](const char* name, const std::vector<uint32_t>& s) {
+            if (s.empty()) return;
+            auto q = [&](double f) { return s[std::min(s.size() - 1, size_t(f * (s.size() - 1) + 0.5))]; };
+            std::printf("  latency distribution, %-3s (n=%zu, cycles): min %u, p1 %u, p10 %u, p50 %u, p90 %u, p99 %u, "
+                        "p99.9 %u, p99.99 %u, max %u\n", name, s.size(), s.front(), q(0.01), q(0.10), q(0.50), q(0.90),
+                        q(0.99), q(0.999), q(0.9999), s.back());
+        };
+        line("GET", g); line("PUT", p); line("all", a);
+        if (!g.empty() && !p.empty()) {
+            const double d = ks_distance(g, p), n1 = double(g.size()), n2 = double(p.size());
+            const double crit = 1.358 * std::sqrt((n1 + n2) / (n1 * n2));          // 5% significance, two-sided
+            std::printf("  GET vs PUT: Kolmogorov-Smirnov D = %.5f, 5%% critical value %.5f: %s\n", d, crit,
+                        d < crit ? "same distribution" : "DISTRIBUTIONS DIFFER");
+        }
+        if (const char* path = std::getenv("DOMA_LAT_HIST")) {
+            FILE* f = std::fopen(path, "a");
+            if (!f) { std::printf("  cannot append to %s\n", path); return; }
+            std::fseek(f, 0, SEEK_END);
+            if (std::ftell(f) == 0) std::fprintf(f, "workload,op,latency_cycles,count\n");
+            for (int k = 0; k < 2; k++) {
+                const std::vector<uint32_t>& s = k ? p : g;
+                for (size_t i = 0; i < s.size();) {
+                    size_t j = i; while (j < s.size() && s[j] == s[i]) j++;
+                    std::fprintf(f, "%s,%s,%u,%zu\n", wname, k ? "PUT" : "GET", s[i], j - i);
+                    i = j;
+                }
+            }
+            std::fclose(f);
+            std::printf("  latency histogram appended to %s\n", path);
+        }
+    };
     auto report = [&](const char* phase, PhaseResult& R) {
         std::printf("%s: %zu commands (%zu GET, %zu PUT) in %.6f s = %.2f Kops/s; device %llu cycles = %.1f cycles per command",
                     phase, R.cmds, R.gets, R.puts, R.wall, R.cmds / std::max(R.wall, 1e-12) / 1e3,
@@ -598,6 +665,8 @@ int main(int argc, char** argv) {
                 std::printf("  phases (trace, mean cycles, sum = E2E):");
                 for (int k = 0; k < 12; k++) std::printf("%s %s %.1f", k ? "," : "", PH[k], double(R.tr_ph[k]) / R.tr_n);
                 std::printf(" = E2E %.1f; decryption overlaps the bucket read by %.1f\n", double(R.tr_e2e) / R.tr_n, double(R.tr_overlap) / R.tr_n);
+                if (R.tr_wovl_n) std::printf("  trace: re-encryption ends after the write-back start in %zu records, by %.1f cycles on average (safe: the write never catches up)\n",
+                                             R.tr_wovl_n, double(R.tr_wovl) / R.tr_wovl_n);
             }
             if (R.tr_missing) std::printf("  trace: %zu records out of order or incomplete\n", R.tr_missing);
         }
@@ -616,6 +685,19 @@ int main(int argc, char** argv) {
         auto r0 = launch(0u); r0.wait();
         const double tboot = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         Summary s0 = read_summary(0, false);
+        std::printf("boot: %llu device cycles, errors 0x%x%s", (unsigned long long)s0.total, s0.errors, s0.errors ? "" : "\n");
+        if (s0.errors) std::printf(" (halted at boot:%s%s%s)\n",
+            (s0.errors & 0x100) ? " timing overrun" : "", (s0.errors & 0x200) ? " integrity failure" : "", (s0.errors & 0x400) ? " stash overflow" : "");
+        if (s0.errors & 0x8) {   // the controller's halt record (flat_oram_gcm dbg_halt_info), in place of the latency fields
+            static const char* SN[32] = {"S_IDLE", "S_POS_LOOKUP", "S_RD_GATE", "S_DDR_READ", "S_CR_IV", "S_CR_IVW", "S_CR_START", "S_CR_FEED", "S_CR_RECV", "S_CR_TAG", "S_SCAN", "S_OP", "S_CP", "S_COMPACT", "S_COMPACT2", "S_PM_UPD", "S_EVICT", "S_EVICT_CHK", "S_EVICT_DONE", "S_EVICT_WAIT", "S_EA_START", "S_WB_GATE", "S_DDR_WRITE", "S_DONE_GATE", "S_RES_STREAM", "S_FMT_START", "S_FMT_WRITE", "S_FMT_WAIT", "S_HALT", "S_LAYOUT", "S_UNUSED30", "S_UNUSED31"};
+            std::printf("halt record: state %u (%s), access cycle %u, bucket %u (%s), memory-unit errors:%s%s%s%s\n",
+                (s0.lat_max >> 3) & 31, SN[(s0.lat_max >> 3) & 31], s0.lat_min & 0xFFFF, s0.lat_max >> 8, ((s0.lat_max >> 2) & 1) ? "HBM" : "host",
+                ((s0.lat_min >> 19) & 1) ? " position map" : "", ((s0.lat_min >> 18) & 1) ? " bucket records" : "",
+                ((s0.lat_min >> 17) & 1) ? " stash" : "", ((s0.lat_min >> 17) & 7) ? "" : " none");
+        }
+        if (s0.ok && s0.lam != LAMBDA) {   // before any other check: a lambda mismatch also mis-sizes the stash pool
+            std::printf("the bitstream's lambda is %u but the host sized the ORAM for lambda = %u: set DOMA_LAMBDA=%u\n", s0.lam, LAMBDA, s0.lam);
+            return 1; }
         if (!s0.ok || s0.errors) {
             std::printf("init launch failed: summary %s, errors 0x%x:%s\n", s0.ok ? "ok" : "MISSING", s0.errors, explain(s0.errors).c_str());
             return 1;
@@ -627,7 +709,7 @@ int main(int argc, char** argv) {
         Row row{P.workload, {}, {}, {}, true};
         bool ok = run_phase(wn, "load", P.load, row.load);
         report("LOAD", row.load);
-        if (ok) { ok = run_phase(wn, "run", P.run, row.run); report("RUN ", row.run); }
+        if (ok) { ok = run_phase(wn, "run", P.run, row.run); report("RUN ", row.run); distribution(wn, row.run); }
         if (ok && !P.pad.empty()) { ok = run_phase(wn, "pad", P.pad, row.pad); report("PAD ", row.pad); }
         row.ok = ok && row.load.errors == 0 && row.run.errors == 0 && row.pad.errors == 0 && row.load.bad_hdr == 0
                  && row.run.bad_hdr == 0 && row.pad.bad_hdr == 0 && row.run.fail == 0 && row.pad.fail == 0
