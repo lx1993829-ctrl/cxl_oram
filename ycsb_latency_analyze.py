@@ -2,6 +2,7 @@
 """ycsb_latency_analyze.py -- analyze the YCSB per-request latency histograms (Python standard library only).
 
     python3 ycsb_latency_analyze.py ycsb_hist_p1.csv ycsb_hist_p2.csv
+    python3 ycsb_latency_analyze.py --by-op ycsb_hist_p1.csv     # strip data per workload AND operation
 
 Input: the histograms host_ycsb writes with DOMA_LAT_HIST=<file> (rows: workload,op,latency_cycles,count), one file
 per pass, in pass order. Prints:
@@ -177,10 +178,16 @@ def main(paths):
     #    body = BODY_DOTS quantiles up to TAIL_Q (value, or value*repeats); tail = requests beyond TAIL_Q counted in
     #    BIN-cycle bins (bin start*count); max = the largest latency
     print(f"\n== 7. strip-plot data (copy everything from BEGIN to END)")
-    print(f"BEGIN STRIP body={BODY_DOTS} q={TAIL_Q} bin={BIN} files={','.join(paths)}")
-    for w in wl:
-        d = pooled[w]
-        body = [d.q(TAIL_Q * (i + 0.5) / BODY_DOTS) for i in range(BODY_DOTS)]
+    groups = [(w, None) for w in wl]
+    if BY_OP:                                          # one block per workload and operation, 100 quantiles each
+        groups = [(w, op) for w in wl for op in ("GET", "PUT")
+                  if any((k, w, op) in h for k in passes)]
+    nq = 100 if BY_OP else BODY_DOTS
+    print(f"BEGIN STRIP body={nq} q={TAIL_Q} bin={BIN} files={','.join(paths)}{' by-op' if BY_OP else ''}")
+    for w, op in groups:
+        d = pooled[w] if op is None else Dist(merge(*[h[(k, w, op)] for k in passes if (k, w, op) in h]))
+        tag = w if op is None else f"{w}/{op}"
+        body = [d.q(TAIL_Q * (i + 0.5) / nq) for i in range(nq)]
         rle, i = [], 0
         while i < len(body):
             j = i
@@ -193,12 +200,14 @@ def main(paths):
         for x, c in d.items:
             if x > cut:
                 bins[(x // BIN) * BIN] += c
-        print(f"{w} n={d.n} cut={cut} max={d.items[-1][0]}")
-        print(f"{w} body " + " ".join(rle))
-        print(f"{w} tail " + " ".join(f"{x}*{c}" if c > 1 else f"{x}" for x, c in sorted(bins.items())))
+        print(f"{tag} n={d.n} cut={cut} max={d.items[-1][0]}")
+        print(f"{tag} body " + " ".join(rle))
+        print(f"{tag} tail " + " ".join(f"{x}*{c}" if c > 1 else f"{x}" for x, c in sorted(bins.items())))
     print("END STRIP")
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
+    args = [a for a in sys.argv[1:] if a != "--by-op"]
+    BY_OP = "--by-op" in sys.argv[1:]
+    if not args:
         sys.exit(__doc__)
-    main(sys.argv[1:])
+    main(args)
