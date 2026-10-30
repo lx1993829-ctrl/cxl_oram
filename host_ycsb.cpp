@@ -514,7 +514,7 @@ int main(int argc, char** argv) {
     FILE* slow = std::getenv("DOMA_SLOW_DUMP") ? std::fopen(std::getenv("DOMA_SLOW_DUMP"), "a") : nullptr;
     const uint32_t SLOW_CYC = std::getenv("DOMA_SLOW_CYC") ? uint32_t(std::atoi(std::getenv("DOMA_SLOW_CYC"))) : 5400u;
     if (slow) { std::fseek(slow, 0, SEEK_END); if (std::ftell(slow) == 0) std::fprintf(slow,
-        "workload,phase,op,latency,ar,last_r,first_w,last_w,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15\n"); }
+        "workload,phase,op,latency,ar,last_r,first_w,last_w,s0,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12,s13,s14,s15,index,prev_op\n"); }
     if (csv) std::fprintf(csv, "workload,phase,cmd,opIdx,slot,op,latency_cycles,status\n");
 
     // run one phase's ops in launches of max_cmds; check headers and (for reads) the data
@@ -562,7 +562,7 @@ int main(int argc, char** argv) {
                         uint16_t v[16] = {0};
                         if (PTRACE) std::memcpy(v, rp + hr + n * BLOCK + i * 32, 32);
                         for (int k = 0; k < 16; k++) std::fprintf(slow, ",%u", v[k]);
-                        std::fprintf(slow, "\n");
+                        std::fprintf(slow, ",%zu,%s\n", at + i, (at + i > 0) ? (ops[at + i - 1].write ? "PUT" : "GET") : "-");
                     }
                     if ((tar | trl | twf | twl) == 0) R.ph_zero++;
                     else if (tar == 0 || tar > trl || trl > twf || twf > twl || twl > lat) {
