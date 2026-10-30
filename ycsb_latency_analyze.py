@@ -9,9 +9,11 @@ per pass, in pass order. Prints:
   2. the same per pass, to show the two passes agree;
   3. the largest gap between workloads at each percentile, in cycles;
   4. a coarse histogram of every workload side by side (counts per bin of BIN cycles), to show the shape and modes;
-  5. per workload, GET against PUT: percentile differences in cycles and the Kolmogorov-Smirnov distance.
-Writes ycsb_strip_data.txt, a small file with what the strip plot needs (per workload: the body as evenly spaced
-quantiles up to TAIL_Q, and every request beyond TAIL_Q as latency x count). Send that file back for the figure.
+  5. per workload, GET against PUT: percentile differences in cycles and the Kolmogorov-Smirnov distance;
+  6. per workload, GET against PUT split at SPLIT cycles: the share of each in the fast group (with a z-score),
+     and within each group the mean difference and the KS distance.
+  7. the strip plot's data, compact enough to copy from the terminal (per workload: the body as evenly spaced
+     quantiles up to TAIL_Q, and the requests beyond TAIL_Q counted in BIN-cycle bins, with the exact maximum).
 """
 import csv
 import math
@@ -21,9 +23,9 @@ from collections import defaultdict
 WORKLOADS = ["A", "B", "C", "D", "E", "F"]
 PCTS = [0.0001, 0.001, 0.01, 0.10, 0.50, 0.90, 0.99, 0.999, 0.9999]
 BIN = 10                     # cycles per bin of the text histogram
-BODY_DOTS = 400              # strip plot: body quantiles per workload
+BODY_DOTS = 200              # strip plot: body quantiles per workload
 TAIL_Q = 0.999               # strip plot: every request beyond this quantile is kept individually
-OUT = "ycsb_strip_data.txt"
+SPLIT = 4950                 # cycles: requests below are the fast group (on-package buckets), the rest host buckets
 
 
 def load(paths):
@@ -148,25 +150,53 @@ def main(paths):
         print(f"   {w}: GET n={G.n}, PUT n={P.n}; mean {P.mean() - G.mean():+.2f}; {diffs}; "
               f"KS D = {d:.5f} (5% critical {c:.5f}: {'same' if d < c else 'differ'})")
 
-    with open(OUT, "w") as f:
-        f.write(f"# strip-plot data: per workload, body = {BODY_DOTS} quantiles up to q={TAIL_Q} (value or "
-                f"value*repeats), tail = every request beyond it (latency*count); GET+PUT, passes pooled\n")
-        for w in wl:
-            d = pooled[w]
-            body = [d.q(TAIL_Q * (i + 0.5) / BODY_DOTS) for i in range(BODY_DOTS)]
-            rle, i = [], 0
-            while i < len(body):
-                j = i
-                while j < len(body) and body[j] == body[i]:
-                    j += 1
-                rle.append(f"{body[i]}" if j - i == 1 else f"{body[i]}*{j - i}")
-                i = j
-            cut = d.q(TAIL_Q)
-            tail = [f"{x}*{c}" if c > 1 else f"{x}" for x, c in d.items if x > cut]
-            f.write(f"{w} n={d.n} body {' '.join(rle)}\n")
-            f.write(f"{w} tail {' '.join(tail)}\n")
-    print(f"\nwrote {OUT} (send it back for the strip plot)")
+    print(f"\n== 6. GET against PUT, split at {SPLIT} cycles (fast group: on-package buckets), passes pooled")
+    for w in wl:
+        g = [h[(k, w, "GET")] for k in passes if (k, w, "GET") in h]
+        p = [h[(k, w, "PUT")] for k in passes if (k, w, "PUT") in h]
+        if not g or not p:
+            continue
+        G, P = merge(*g), merge(*p)
+        nG, nP = sum(G.values()), sum(P.values())
+        fG = sum(c for x, c in G.items() if x < SPLIT) / nG
+        fP = sum(c for x, c in P.items() if x < SPLIT) / nP
+        f0 = (fG * nG + fP * nP) / (nG + nP)
+        z = (fP - fG) / math.sqrt(f0 * (1 - f0) * (1 / nG + 1 / nP)) if 0 < f0 < 1 else 0.0
+        parts = []
+        for name, keep in (("fast", lambda x: x < SPLIT), ("slow", lambda x: x >= SPLIT)):
+            g2 = {x: c for x, c in G.items() if keep(x)}
+            p2 = {x: c for x, c in P.items() if keep(x)}
+            if g2 and p2:
+                Dg, Dp = Dist(g2), Dist(p2)
+                d, c = ks(Dg, Dp)
+                parts.append(f"{name}: mean {Dp.mean() - Dg.mean():+.2f}, p50 {Dp.q(0.5) - Dg.q(0.5):+d}, "
+                             f"p99 {Dp.q(0.99) - Dg.q(0.99):+d}, KS D = {d:.5f} (crit {c:.5f}: {'same' if d < c else 'differ'})")
+        print(f"   {w}: fast-group share GET {100 * fG:.3f}%, PUT {100 * fP:.3f}% (z = {z:+.1f}); " + "; ".join(parts))
 
+    # 7. the strip plot's data, printed compactly so it can be copied from the terminal:
+    #    body = BODY_DOTS quantiles up to TAIL_Q (value, or value*repeats); tail = requests beyond TAIL_Q counted in
+    #    BIN-cycle bins (bin start*count); max = the largest latency
+    print(f"\n== 7. strip-plot data (copy everything from BEGIN to END)")
+    print(f"BEGIN STRIP body={BODY_DOTS} q={TAIL_Q} bin={BIN} files={','.join(paths)}")
+    for w in wl:
+        d = pooled[w]
+        body = [d.q(TAIL_Q * (i + 0.5) / BODY_DOTS) for i in range(BODY_DOTS)]
+        rle, i = [], 0
+        while i < len(body):
+            j = i
+            while j < len(body) and body[j] == body[i]:
+                j += 1
+            rle.append(f"{body[i]}" if j - i == 1 else f"{body[i]}*{j - i}")
+            i = j
+        cut = d.q(TAIL_Q)
+        bins = defaultdict(int)
+        for x, c in d.items:
+            if x > cut:
+                bins[(x // BIN) * BIN] += c
+        print(f"{w} n={d.n} cut={cut} max={d.items[-1][0]}")
+        print(f"{w} body " + " ".join(rle))
+        print(f"{w} tail " + " ".join(f"{x}*{c}" if c > 1 else f"{x}" for x, c in sorted(bins.items())))
+    print("END STRIP")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
