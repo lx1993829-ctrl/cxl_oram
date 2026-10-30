@@ -15,13 +15,21 @@ Changes in the copy (and nothing else):
   2. the timed batch has BOLT_CMDS commands (environment variable, default CMD_SIZE, at most CMD_SIZE).
      The commands come from BOLT's own generate_uniform_commands(): uniform keys over all entries, each a PUT with
      probability 0.5, seed 1. Its first 5000 commands are exactly the batch of the 5000-command runs.
+     BOLT_SEED (environment variable, default 1 = BOLT's own) sets that generator's seed, so independent runs can
+     use different command sequences. Initialization (keys, values, which keys start in HBM) is unchanged.
   3. the `sudo` drop-caches call in main is commented out                            (no sudo on the server)
   4. after the timed run (so the timing is unaffected), it prints
+       SEED command_seed=...
        TIMED commands=... seconds=... us_per_command=... kqps=...
        RESP acked=<responses of type ACK> of <commands> last_acked_index=...
             every command, GET or PUT, should be answered with ACK; a kernel that stopped early leaves the tail empty
        GET check: <wrong> wrong of <gets> (on keys initialization could not place: <n>)
             each GET must return the latest value written to its key, counting PUTs earlier in the same batch
+       GETERR wrong=... first_index=... stale=... zeros=... other=... no_ack=... key_never_put=... per_100k_commands=...
+            where the wrong replies are (index of the first one, count in each block of 100,000 commands) and what they
+            hold: stale = an older value of the same key, zeros, other = neither; key_never_put = the key had no PUT
+            earlier in the batch. Up to 20 GETERR_SAMPLE lines follow (index, key, class, how many versions back,
+            commands since the key's last PUT and last access, where initialization placed it).
        WORKLOAD commands=... distinct_keys=... repeat_accesses=... gets_after_put_same_key=...
             repeat_accesses: commands whose key an earlier command of the batch already used;
             gets_after_put_same_key: GETs whose key was PUT earlier in the batch (read-after-write cases checked)
@@ -63,6 +71,24 @@ src = re.sub(r'^(\s*)(system\("sync && echo 3 \| sudo tee /proc/sys/vm/drop_cach
 # the value field is "blocks" (32-256 B programs) or "value" (8-16 B programs)
 field = "blocks" if re.search(r"struct KV_TUPLE\s*\{[^}]*\bblocks\b", src) else "value"
 
+# 2b. the command generator's seed from BOLT_SEED (default 1, BOLT's own), in generate_uniform_commands only
+gm = re.search(r"^std::vector<Command_Packet>\s+generate_uniform_commands\s*\(int size", src, flags=re.M)
+assert gm, "no generate_uniform_commands(int size, ...) found"
+SEED_HELPER = r'''
+// ---- added by bolt_cmds_patch.py: seed of the command generator (BOLT_SEED, default 1 = BOLT's own) ----
+static uint32_t bolt_seed() {
+    const char* v = std::getenv("BOLT_SEED");
+    return v ? (uint32_t)std::strtoul(v, nullptr, 10) : 1u;
+}
+// ---- end of addition ----
+
+'''
+gen_end = src.index("\n}\n", gm.start())
+gen = src[gm.start():gen_end]
+gen, n = re.subn(r"^(\s*uint32_t seed\s*=\s*)1(\s*;)", r"\1bolt_seed()\2", gen, count=1, flags=re.M)
+assert n == 1, "generate_uniform_commands has no 'uint32_t seed = 1;'"
+src = src[:gm.start()] + SEED_HELPER + gen + src[gen_end:]
+
 # 2. batch size from BOLT_CMDS, in the timed function only
 m = re.search(r"^void run_init_and_chain_kernel_\w*\(", src, flags=re.M)
 assert m, "no timed run function found"
@@ -91,6 +117,7 @@ assert re.search(r"generate_uniform_commands\s*\(\s*command_size\s*,\s*init_tupl
 CHECK = r'''
     {   // ---- added by bolt_cmds_patch.py: read back after the timed run, so the timing is unaffected ----
         const size_t ncmd = commands.size();
+        std::cout << "SEED command_seed=" << bolt_seed() << std::endl;
         std::cout << "TIMED commands=" << ncmd << " seconds=" << kernel_time_in_sec
                   << " us_per_command=" << kernel_time_in_sec / ncmd * 1e6
                   << " kqps=" << ncmd / kernel_time_in_sec / 1e3 << std::endl;
@@ -213,6 +240,7 @@ assert pos >= 0, "no response read-back in the timed function"
 timed = timed[:pos + len(marker)] + CHECK + timed[pos + len(marker):]
 
 src = head + HELPER + timed
-src = "#include <algorithm>\n#include <cstdlib>\n#include <map>\n#include <unordered_map>\n#include <unordered_set>\n" + src
+src = ("#include <algorithm>\n#include <cstdlib>\n#include <map>\n#include <string>\n#include <unordered_map>\n"
+       "#include <unordered_set>\n#include <vector>\n") + src
 open(out_path, "w").write(src)
 print("wrote", out_path, "from", base, "(value field:", field + ")")
