@@ -334,6 +334,28 @@ int main(int argc, char** argv) {
         if (SUMREC == 5 && at + max_cmds >= preload.size())
             print_debug_records("after the preload", b.resp.map<uint8_t*>() + (part.size() + 2) * 32);
     }
+    // DOMA_DIAG=1 with DOMA_HBM_PCT=100: on-package buckets and the stash pool hold plaintext, so after the preload the
+    // host can look for the preloaded values in device memory. Found: the PUT data reached the ORAM and a wrong GET
+    // loses it on the way out. Not found: the PUT data never reached the stored blocks.
+    if (std::getenv("DOMA_DIAG") && hbm_pct == 100 && !TINY) {
+        b.pages_hbm.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        b.stash.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        const uint8_t* ph = b.pages_hbm.map<uint8_t*>(); const size_t phn = b.pages_hbm.size();
+        const uint8_t* st = b.stash.map<uint8_t*>();     const size_t stn = b.stash.size();
+        auto find = [](const uint8_t* m, size_t n, const uint8_t* v) -> long {
+            const uint8_t* q = (const uint8_t*)memmem(m, n, v, VALUE_SIZE); return q ? long(q - m) : -1; };
+        size_t nph = 0, nst = 0, none = 0, nz = 0;
+        const uint32_t NK = std::min<uint32_t>(NKEYS, 64);
+        for (uint32_t k = 0; k < NK; k++) {
+            const uint8_t* v = &ref[size_t(k) * VALUE_SIZE];
+            long a = find(ph, phn, v), c = find(st, stn, v);
+            if (a >= 0) nph++; if (c >= 0) nst++; if (a < 0 && c < 0) none++;
+            if (k < 4) std::printf("  DIAG preload key %u: value in on-package buckets at %ld, in the stash buffer at %ld (-1: absent)\n", k, a, c);
+        }
+        for (size_t q = 0; q < phn; q++) if (ph[q]) nz++;
+        std::printf("  DIAG after the preload, %u keys: %zu found in the on-package buckets, %zu in the stash buffer, %zu nowhere; "
+                    "on-package buckets %zu of %zu bytes non-zero\n", NK, nph, nst, none, nz, phn);
+    }
     auto init_end = std::chrono::system_clock::now();
     std::printf("init: %.6f s (boot + preload of %u keys), preload errors=0x%x\n",
                 std::chrono::duration<double>(init_end - init_start).count(), NKEYS, pre_err);
