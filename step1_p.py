@@ -33,10 +33,23 @@ def report(name, sel):
     if not off: print(f"{name}: no off-package records"); return
     w = max(off, key=lambda r: r['sx'])
     D = w['sx'] + dmax; P = max(math.ceil(1.1 * D) + 74, 2900); deq = max(0, PEQ - P)
-    top = sorted(off, key=lambda r: -r['sx'])[:5]
+    top = sorted(off, key=lambda r: -r['sx'])[:8]
     print(f"{name}: {len(off)} off-package accesses; worst stash ready {w['sx']} (launch {w['launch']} cmd {w['cmd']}), "
           f"decisions at most {dmax} -> D_max {D}, P = {P}, D_EQ = {deq}, {300e6 / P / 1e3:.1f} KQPS")
-    print("    worst five (launch, cmd, stash ready): " + ', '.join(f"({r['launch']}, {r['cmd']}, {r['sx']})" for r in top))
+    print("    worst (launch, cmd): stash ready sx, arrival tarr, sx - tarr, stash open so, read address ar")
+    for r in top:
+        print(f"      ({r['launch']}, {r['cmd']}): sx {r['sx']}, tarr {r['tarr']}, sx-tarr {r['sx'] - r['tarr']}, so {r['so']}, ar {r['ar']}")
 print(f"decisions' duration on the card (on-package ea - sx): max {dmax}, over {len(dec)} accesses")
 report("all accesses", rows)
 report("without each launch's first command", [r for r in rows if (r['launch'], r['cmd']) not in first])
+
+# the bucket read's duration (address to last beat): overlap step 2 issues one bucket read at a time, so its start spacing
+# must cover the worst read (the next access's read gate is P after this one's)
+for name, cls in (("off package", 0), ("on package", 1)):
+    d = sorted(r['tarr'] - r['ar'] for r in rows if (r['flags'] & 1) == cls and NONE not in (r['tarr'], r['ar']))
+    if not d: continue
+    q = lambda f: d[min(len(d) - 1, int(f * len(d)))]
+    print(f"bucket read, {name}: address to last beat median {q(0.5)}, 99.99% {q(0.9999)}, max {d[-1]} over {len(d)} accesses"
+          f" -> step 2 needs P >= {d[-1]} + a few cycles (P = {max(1500, math.ceil(1.1 * d[-1]) + 74)} with the 10% + 74 rule)")
+d = sorted(r['sx'] - r['tarr'] for r in rows if not (r['flags'] & 1) and NONE not in (r['sx'], r['tarr']))
+if d: print(f"off package, decisions start after the arrival (sx - tarr): median {d[len(d)//2]}, 99.99% {d[min(len(d)-1, int(0.9999*len(d)))]}, max {d[-1]}")
