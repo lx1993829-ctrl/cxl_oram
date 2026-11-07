@@ -10,33 +10,43 @@
 #   bash sweep_rama.sh            (CMDS=1000000 HBM=20 to change)
 set -u
 source /opt/xilinx/xrt/setup.sh > /dev/null
-CMDS=${CMDS:-1000000}; HBM=${HBM:-20}; R=$HOME/sweep_results; mkdir -p "$R"; CSV=$R/sweep.csv
+# CLK=<MHz> (e.g. 200): the 300 MHz builds, each run from a copy of its bitstream with the kernel clock lowered to CLK
+# (set_clock.sh, next to this script or in ~); results in ~/sweep_results_clk<MHz>. MHZ=<MHz>: builds made with
+# build.sh MHZ=<MHz> (folders ~/<build>_<MHz>). Each run line also gives the clock measured on the card.
+CMDS=${CMDS:-1000000}; HBM=${HBM:-20}; MHZ=${MHZ:-300}; SUF=$([ "$MHZ" = 300 ] || echo "_$MHZ")
+SETCLK=$(ls "$(dirname "$0")/set_clock.sh" "$HOME/set_clock.sh" 2>/dev/null | head -1)
+[ -n "${CLK:-}" ] && { [ -n "$SETCLK" ] || { echo "CLK= needs set_clock.sh next to this script or in ~"; exit 1; }; }
+R=$HOME/sweep_results$SUF${CLK:+_clk$CLK}; mkdir -p "$R"; CSV=$R/sweep.csv
 log() { echo "$(date '+%F %T') $*" | tee -a "$R/summary.txt"; }
 [ -f "$CSV" ] || echo "sweep,value_B,block_B,build,N,KQPS,us_per_cmd,device_cycles_per_cmd,get_lat_cyc,put_lat_cyc,p50_cyc,p99_cyc,max_cyc,correct" > "$CSV"
 
 run() {   # run <sweep> <value bytes> <build folder> <N>
-    local sw=$1 val=$2 b=$3 n=$4 d=$HOME/$3/fpga_zcu208/vitis blk name f
+    local sw=$1 val=$2 b=$3$SUF n=$4 d=$HOME/$3$SUF/fpga_zcu208/vitis blk name f
     [ -f "$d/doma_hw.xclbin" ] || { log "$sw value $val B N $n: no bitstream in $d: skipped"; return; }
-    grep -q "PASS: timing closed at 300 MHz" "$HOME/$b/build.log" "$HOME/$b/timing.txt" 2>/dev/null \
-        || { log "$sw value $val B N $n: $b did not close at 300 MHz: skipped"; return; }
+    grep -q "PASS: timing closed at $MHZ MHz" "$HOME/$b/build.log" "$HOME/$b/timing.txt" 2>/dev/null \
+        || { log "$sw value $val B N $n: $b did not close at $MHZ MHz: skipped"; return; }
     cd "$d" || return
     [ -x host_phases ] || g++ -std=c++17 -O2 host_phases.cpp -I"$XILINX_XRT/include" -L"$XILINX_XRT/lib" -lxrt_coreutil -pthread -o host_phases
     blk=$(( $(head -1 "$HOME/$b/build.log" | grep -oE 'block size: [0-9]+ beats' | grep -oE '[0-9]+') * 32 ))
     name=${sw}_v${val}_n${n}; f=$R/$name.log
+    local X=doma_hw.xclbin                  # CLK=<MHz> below the build's clock: a copy with that clock (set_clock.sh)
+    if [ -n "${CLK:-}" ]; then X=$R/xclbin/${b}_${CLK}mhz.xclbin; mkdir -p "$R/xclbin"
+        [ -f "$X" ] || bash "$SETCLK" doma_hw.xclbin "$CLK" "$X" >> "$R/summary.txt" 2>&1 || { log "$sw value $val B N $n: set_clock to $CLK MHz failed"; return; }; fi
     flock "$HOME/.u55c_card.lock" env DOMA_LAMBDA=7 DOMA_NMAX=2097152 DOMA_BLOCK=$blk DOMA_N=$n DOMA_HBM_PCT=$HBM \
-        DOMA_PHASES=mix:$CMDS timeout 3600 ./host_phases doma_hw.xclbin 65536 > "$f" 2>&1
+        DOMA_PHASES=mix:$CMDS timeout 3600 ./host_phases "$X" 65536 > "$f" 2>&1
     local ph mx lt ok kq us cy gl pl p50 p99 mxl
-    ph=$(grep -aE '^phase 1: [0-9]+ mix' "$f"); mx=$(grep -aE '^phase 1: mix of' "$f"); lt=$(grep -aE '^phase 1: latency' "$f")
+    ph=$(grep -aiE '^phase 1: [0-9]+ mix' "$f"); mx=$(grep -aE '^phase 1: mix of' "$f"); lt=$(grep -aE '^phase 1: latency' "$f")
     ok=$(grep -aqE '^ALL PHASES CORRECT' "$f" && echo yes || echo NO)
     kq=$(echo "$ph" | grep -oE '[0-9.]+ KQPS' | cut -d' ' -f1); us=$(echo "$ph" | grep -oE '[0-9.]+ us per' | cut -d' ' -f1)
     cy=$(echo "$ph" | grep -oE 'device [0-9.]+' | cut -d' ' -f2)
     gl=$(echo "$mx" | grep -oE 'GET \(mean latency [0-9.]+' | grep -oE '[0-9.]+$'); pl=$(echo "$mx" | grep -oE 'PUT \(mean latency [0-9.]+' | grep -oE '[0-9.]+$')
     p50=$(echo "$lt" | grep -oE 'p50 [0-9]+' | cut -d' ' -f2); p99=$(echo "$lt" | grep -oE 'p99 [0-9]+' | cut -d' ' -f2); mxl=$(echo "$lt" | grep -oE 'max [0-9]+' | cut -d' ' -f2)
-    log "$sw: value $val B (block $blk B, $b), N $n: ${kq:-?} KQPS, ${us:-?} us/cmd, device ${cy:-?} cycles/cmd; latency GET ${gl:-?} / PUT ${pl:-?} cycles, p50 ${p50:-?} p99 ${p99:-?} max ${mxl:-?}; all correct: $ok"
+    local mc; mc=$(awk -v c="${cy:-0}" -v u="${us:-0}" 'BEGIN{if (u > 0) printf "%.0f", c / u}')
+    log "$sw: value $val B (block $blk B, $b), N $n, clock measured ${mc:-?} MHz: ${kq:-?} KQPS, ${us:-?} us/cmd, device ${cy:-?} cycles/cmd; latency GET ${gl:-?} / PUT ${pl:-?} cycles, p50 ${p50:-?} p99 ${p99:-?} max ${mxl:-?}; all correct: $ok"
     echo "$sw,$val,$blk,$b,$n,$kq,$us,$cy,$gl,$pl,$p50,$p99,$mxl,$ok" >> "$CSV"
 }
 
-log "== sweep 1: N at 64 B blocks, $CMDS commands, 50/50 GET/PUT, $HBM% in HBM"
+log "== kernel clock ${CLK:-$MHZ} MHz$([ -n "${CLK:-}" ] && echo " (300 MHz builds, clock lowered at load)")"; log "== sweep 1: N at 64 B blocks, $CMDS commands, 50/50 GET/PUT, $HBM% in HBM"
 for n in 100000 200000 1000000 2000000; do run N 64 rama_b2 $n; done
 log "== sweep 2: value size at N = 1M, $CMDS commands, 50/50 GET/PUT, $HBM% in HBM"
 run V 16 rama_b1 1000000
