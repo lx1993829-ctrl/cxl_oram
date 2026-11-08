@@ -50,16 +50,19 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "doma_debug.h"                    // v14b: halt record and debug-build records
 
 // must match the hardware build (rtl/oram_params.vh, single-client default)
 // run-time size (DOMA_N=<records>): n blocks in NB = ceil(n / LAMBDA) buckets, passed to the kernel as nblk
 // (the build's maximum is rtl/oram_params.vh ORAM_N; build.sh NMAX=...). Default: 256 blocks, as before.
-static const uint32_t LAMBDA     = 6;                // rtl/oram_params.vh ORAM_C
+static uint32_t LAMBDA     = 6;                // rtl/oram_params.vh ORAM_C; DOMA_LAMBDA=<lambda> for a LAMBDA=7 build (checked at init)
 static const uint32_t ZPOS       = 8;                // rtl/oram_params.vh ORAM_Z
 
 // Stash pool size: Claim 1 of the stash analysis (docs/stash_chain_design.md). The stash exceeds xR + xO with
 // probability at most gamma = 2^-64 per access, for every access sequence (Chernoff bounds over negatively
-// associated per-bucket terms; the best split of gamma between the two terms).
+// associated per-bucket terms; the best split of gamma between the two terms). Per-bucket counts are
+// Binomial(n, 1/B) with B = n / lambda from the start: since v11b the boot places every block at an independent
+// uniform bucket (the excess over Z waits in the stash, nothing else does), and every remap keeps it so.
 static double ln_mgf_A(double t, double Bk, double n) {     // ln E[e^{tA}], P(A >= i) = (1 - 1/B)^i, A capped at n
     const double p = 1.0 / Bk, lr = std::log1p(-p) + t;
     if (std::fabs(lr) < 1e-15) return std::log(p * n + 1.0);
@@ -74,19 +77,20 @@ static double stash_xR(double Bk, double n, double lg) {   // lg = ln(1 / gamma_
         if (!std::isfinite(v)) break; best = std::min(best, (Bk * v + lg) / u); }
     return best;
 }
-static double stash_xO(double Bk, double lam, int Z, double lg) {
-    double best = INFINITY; std::vector<double> lt(160);
+static double stash_xO(double Bk, double n, int Z, double lg) {   // per-bucket count Binomial(n, 1/B)
+    double best = INFINITY; std::vector<double> lt(160); const double p = 1.0 / Bk, lp = std::log(p), lq = std::log1p(-p);
     for (int i = 1; i < 400; i++) { const double u = i * 0.01; double mx = -INFINITY, sum = 0;
-        for (int k = 0; k < 160; k++) { lt[k] = -lam + k * std::log(lam) - std::lgamma(k + 1.0) + u * std::max(0, k - Z); mx = std::max(mx, lt[k]); }
+        for (int k = 0; k < 160; k++) { lt[k] = std::lgamma(n + 1) - std::lgamma(k + 1.0) - std::lgamma(n - k + 1) + k * lp + (n - k) * lq
+                                                + u * std::max(0, k - Z); mx = std::max(mx, lt[k]); }
         for (int k = 0; k < 160; k++) sum += std::exp(lt[k] - mx);
         best = std::min(best, (Bk * (mx + std::log(sum)) + lg) / u); }
     return best;
 }
 static double stash_bound(double n, double lam, int Z) {
-    const double Bk = std::ceil(n / lam), G = 64 * std::log(2.0);
+    const double Bk = std::ceil(n / lam), G = 64 * std::log(2.0);   // n is a multiple of lambda (the host rounds it): B = n / lambda
     double best = INFINITY;
     for (double f : {0.1, 0.3, 0.5, 0.7, 0.9})
-        best = std::min(best, stash_xR(Bk, n, G - std::log(f)) + stash_xO(Bk, lam, int(Z), G - std::log(1 - f)));
+        best = std::min(best, stash_xR(Bk, n, G - std::log(f)) + stash_xO(Bk, n, int(Z), G - std::log(1 - f)));
     return best;
 }
 static uint32_t       NBLK       = 256;              // blocks (slots)
@@ -132,7 +136,7 @@ struct Buffers {
 static void stage(Buffers& b, const std::vector<Cmd>& cmds) {
     size_t n = cmds.size();
     b.hc = roundup4k(n * 32);
-    b.hr = roundup4k((n + 2) * 32);                   // after records [n] (summary) and [n+1] (traffic)
+    b.hr = roundup4k((n + SUMREC) * 32);              // after records [n] (summary), [n+1] (traffic) (and [n+2..n+4], debug)
     auto p = b.cmd.map<uint8_t*>();
     std::memset(p, 0, b.hc + n * BLOCK);
     for (size_t i = 0; i < n; i++) {
@@ -149,15 +153,16 @@ static void stage(Buffers& b, const std::vector<Cmd>& cmds) {
     b.cmd.sync(XCL_BO_SYNC_BO_TO_DEVICE, b.hc + n * BLOCK, 0);
 }
 
-struct Summary { uint64_t total, rd_beats, wr_beats; uint32_t beats, lat_min, lat_max, errors, done; bool ok, traffic;
+struct Summary { uint64_t total, rd_beats, wr_beats; uint32_t lam, beats, lat_min, lat_max, errors, done, dbg; bool ok, traffic;
                  uint32_t geo_n; size_t geo_tree; };   // tinyoram_kernel only: traffic-record bytes 24-27 blocks, 28-31 tree (64-byte bursts)
 
 static Summary read_summary(Buffers& b, size_t n) {
     // at least through the summary record itself (b.hr is 0 before the first stage())
-    b.resp.sync(XCL_BO_SYNC_BO_FROM_DEVICE, std::max(b.hr + n * BLOCK, (n + 2) * size_t(32)), 0);
+    b.resp.sync(XCL_BO_SYNC_BO_FROM_DEVICE, std::max(b.hr + n * BLOCK, (n + SUMREC) * size_t(32)), 0);
     auto r = b.resp.map<uint8_t*>() + n * 32;
     Summary s{};
-    s.ok = (r[0] == T_SUM);
+    s.ok = (r[0] == T_SUM); s.lam = r[1] ? r[1] : 6;   // byte 1: lambda when not 6
+    s.dbg = s.ok ? r[2] : 0;                           // byte 2: debug bitstream flags (doma_debug.h)
     std::memcpy(&s.beats, r + 4, 4);   // block size in beats (0 from bitstreams before this field)
     std::memcpy(&s.total, r + 8, 8);   std::memcpy(&s.lat_min, r + 16, 4); std::memcpy(&s.lat_max, r + 20, 4);
     std::memcpy(&s.errors, r + 24, 4); std::memcpy(&s.done, r + 28, 4);
@@ -184,6 +189,7 @@ static size_t tinyoram_tree_bytes(size_t block, unsigned L) {
 static unsigned tinyoram_depth(size_t blocks) { unsigned L = 6; while ((size_t(4) << L) < blocks) L++; return L; }
 
 int main(int argc, char** argv) {
+    if (const char* l = std::getenv("DOMA_LAMBDA")) LAMBDA = uint32_t(std::stoul(l));   // the bitstream's lambda (build.sh LAMBDA)
     if (argc < 2) { std::printf("usage: %s <xclbin> [commands per launch, default 65536]   (phases: DOMA_PHASES=put:N,get:N,...)\n", argv[0]); return 1; }
     int CMD_SIZE = 65536;                                                  // commands per launch (buffer capacity)
     {   // the constants above must match the RTL this program is used with
@@ -192,8 +198,11 @@ int main(int argc, char** argv) {
             if (std::regex_search(line, m, std::regex("`define ORAM_Z\\s+(\\d+)"))) z = std::stoi(m[1]);
             if (std::regex_search(line, m, std::regex("`define ORAM_C\\s+(\\d+)"))) c = std::stoi(m[1]);
         }
+        std::ifstream bf("../rtl/oram_build_cfg.vh");   // a LAMBDA=7 build sets ORAM_C here, ahead of the default (as in the RTL)
+        while (std::getline(bf, line))
+            if (std::regex_search(line, m, std::regex("`define ORAM_C\\s+(\\d+)"))) c = std::stoi(m[1]);
         if (z >= 0 && c >= 0 && (uint32_t(z) != ZPOS || uint32_t(c) != LAMBDA)) {
-            std::printf("host_phases is built for Z = %u, lambda = %u, but ../rtl/oram_params.vh has Z = %d, lambda = %d: refusing to run\n", ZPOS, LAMBDA, z, c);
+            std::printf("host_phases is built for Z = %u, lambda = %u, but ../rtl (oram_params.vh, oram_build_cfg.vh) has Z = %d, lambda = %d: refusing to run\n", ZPOS, LAMBDA, z, c);
             return 1;
         }
     }
@@ -218,12 +227,19 @@ int main(int argc, char** argv) {
         NKEYS = uint32_t(std::stoul(std::getenv("DOMA_N")));
         NBLK  = (NKEYS + pack_a - 1) / pack_a;
     }
+    // the stash analysis takes B = n / lambda exactly: round n up to a multiple of lambda (at most lambda - 1 extra
+    // blocks, never requested). (Since v11b the boot places every block at an independent uniform bucket, so the
+    // per-bucket counts are Binomial(n, 1/B) for any n; the rounding is kept, and costs at most lambda - 1 blocks.) The kernel clamps n to its build's maximum: DOMA_NMAX=<that maximum> makes a rounding past it an error.
+    const uint32_t nblk_req = NBLK;
+    if (!TINY) NBLK = ((NBLK + LAMBDA - 1) / LAMBDA) * LAMBDA;
+    if (!TINY && NBLK != nblk_req) std::printf("n: %u blocks rounded up to %u, a multiple of lambda = %u (the extra blocks are never requested)\n", nblk_req, NBLK, LAMBDA);
+    if (!TINY && std::getenv("DOMA_NMAX") && NBLK > std::stoul(std::getenv("DOMA_NMAX"))) {
+        std::printf("n = %u exceeds the build's maximum %s: the kernel would clamp it to a size that is not a multiple of lambda\n", NBLK, std::getenv("DOMA_NMAX")); return 1; }
     NB = (NBLK + LAMBDA - 1) / LAMBDA;
     const size_t stride = size_t(ZPOS) * BLOCKA;                              // compact layout: exactly Z blocks per bucket
-    // stash pool: Claim 1's bound at 2^-64 per access, plus a margin for the window effect (PROVISIONAL: 1% of n
-    // + 64, until its formal derivation); never more than n. DOMA_POOL=<entries> overrides it.
+    // stash pool: Claim 1's bound at 2^-64 per access, rounded up, plus one; never more than n. DOMA_POOL=<entries> overrides it.
     const double pool_bnd = stash_bound(double(NBLK), double(LAMBDA), int(ZPOS));
-    uint32_t POOL = uint32_t(std::min<double>(NBLK, std::ceil(pool_bnd) + std::ceil(0.01 * NBLK) + 64));
+    uint32_t POOL = uint32_t(std::min<double>(NBLK, std::ceil(pool_bnd) + 1));
     if (std::getenv("DOMA_POOL")) POOL = uint32_t(std::min<unsigned long>(NBLK, std::stoul(std::getenv("DOMA_POOL"))));
     // Tiny ORAM: its tree for the requested size (the bitstream reports the real one at init; checked below)
     const unsigned tiny_L = tinyoram_depth(NBLK);
@@ -236,7 +252,7 @@ int main(int argc, char** argv) {
                                     : size_t(NB - HBMK) * stride + 4096;      // + up to 4 KB: the kernel rebases by a 4 KB multiple
     if (TINY) std::printf("size: %u blocks, Tiny ORAM tree for L=%u (N=%u), %zu-byte blocks: %zu bytes\n",
                           NBLK, tiny_L, 4u << tiny_L, BLOCKA, pages_bytes);
-    if (!TINY) std::printf("stash pool: %u entries (Claim 1 bound %.0f at 2^-64 per access, + window margin)%s\n", POOL, pool_bnd,
+    if (!TINY) std::printf("stash pool: %u entries (Claim 1 bound %.1f at 2^-64 per access, rounded up, + 1)%s\n", POOL, pool_bnd,
                            std::getenv("DOMA_POOL") ? " [DOMA_POOL]" : "");
     if (TINY) {} else std::printf("size: %u blocks (nblk), %u buckets (%u in HBM = %u%%, %u in pages), buffers sized for %zu-byte blocks\n",
                      NBLK, NB, HBMK, hbm_pct, NB - HBMK, BLOCKA);
@@ -244,7 +260,12 @@ int main(int argc, char** argv) {
     Buffers b;
     b.cmd   = xrt::bo(device, roundup4k(max_cmds * 32) + max_cmds * BLOCKA, krnl.group_id(0));
     const bool PTRACE = std::getenv("DOMA_PHASE_TRACE") && std::string(std::getenv("DOMA_PHASE_TRACE")) != "0";
-    b.resp  = xrt::bo(device, roundup4k((max_cmds + 2) * 32) + max_cmds * BLOCKA + (PTRACE ? max_cmds * 32 : 0), krnl.group_id(1));
+    // DOMA_TRACE_CSV=<file> (with DOMA_PHASE_TRACE=1 on a TRACE=1 bitstream): every phase command's 16 trace timestamps,
+    // one line each (phase, command, G/P, latency, t0 .. t15), for distributions (sim/margins.py). Host side only.
+    FILE* tcsv = (PTRACE && std::getenv("DOMA_TRACE_CSV")) ? std::fopen(std::getenv("DOMA_TRACE_CSV"), "w") : nullptr;
+    if (PTRACE && std::getenv("DOMA_TRACE_CSV") && !tcsv) { std::printf("cannot write %s\n", std::getenv("DOMA_TRACE_CSV")); return 1; }
+    if (tcsv) { std::fprintf(tcsv, "phase,cmd,op,lat"); for (int k = 0; k < 16; k++) std::fprintf(tcsv, ",t%d", k); std::fprintf(tcsv, "\n"); }
+    b.resp  = xrt::bo(device, roundup4k((max_cmds + 5) * 32) + max_cmds * BLOCKA + (PTRACE ? max_cmds * 128 : 0), krnl.group_id(1));   // (debug bitstream: 5 records, 128-byte trace)
     b.pages = std::getenv("DOMA_PAGES_HBM") ? xrt::bo(device, pages_bytes, krnl.group_id(2)) : xrt::bo(device, pages_bytes, xrt::bo::flags::host_only, krnl.group_id(2));
     if (!TINY) {
     // DOMA's trusted metadata (position map, 4 bytes per slot) in on-package HBM; DOMA writes all of it at boot
@@ -284,9 +305,12 @@ int main(int argc, char** argv) {
     }
     }
     // DOMA: 10 arguments; Tiny ORAM: cmd, resp, pages, size
-    auto launch = [&](uint32_t n) {
+    // trace records: every phase launch with DOMA_PHASE_TRACE=1; preload launches only with a debug bitstream (their
+    // records feed the on-package calibration)
+    auto launch = [&](uint32_t n, bool preload_launch = false) {
+        const bool tr = PTRACE && n && (!preload_launch || TRACE64);
         return TINY ? krnl(b.cmd, b.resp, b.pages, n)
-                    : krnl(b.cmd, b.resp, b.pages, n | ((PTRACE && n) ? 0x80000000u : 0u), b.meta, b.brec, b.stash, NBLK, b.pages_hbm, HBMK, POOL);   // never flag an init launch (size 0)
+                    : krnl(b.cmd, b.resp, b.pages, n | (tr ? 0x80000000u : 0u), b.meta, b.brec, b.stash, NBLK, b.pages_hbm, HBMK, POOL);   // never flag an init launch (size 0)
     };
 
     // ---- init: boot run, then preload every key (BOLT's init includes loading its dataset)
@@ -295,6 +319,14 @@ int main(int argc, char** argv) {
     r0.wait();
     {   // the kernel reports its block size; the data layout must match the bitstream
         Summary s0 = read_summary(b, 0);
+        if (!TINY) std::printf("boot: %llu device cycles, errors 0x%x%s", (unsigned long long)s0.total, s0.errors, s0.errors ? "" : "\n");
+        if (!TINY && s0.errors) std::printf(" (halted at boot:%s%s%s)\n",
+            (s0.errors & 0x100) ? " timing overrun" : "", (s0.errors & 0x200) ? " integrity failure" : "", (s0.errors & 0x400) ? " stash overflow" : "");
+        if (s0.errors & 0x8) print_halt_record("boot", s0.lat_min, s0.lat_max);   // in place of the latency fields
+        if (!TINY && s0.ok) { const uint8_t sb[3] = {0, 0, uint8_t(s0.dbg)}; dbg_from_summary(sb); }
+        if (!TINY && s0.ok && s0.lam != LAMBDA) {   // before any other check: a lambda mismatch also mis-sizes the stash pool
+            std::printf("the bitstream's lambda is %u but the host sized the ORAM for lambda = %u: set DOMA_LAMBDA=%u\n", s0.lam, LAMBDA, s0.lam);
+            return 1; }
         if (s0.ok && s0.beats > 0 && s0.beats * 32 <= MAX_BLOCK) BLOCK = size_t(s0.beats) * 32;
         std::printf("block: %zu bytes per slot%s\n", BLOCK, (s0.beats == 0) ? " (bitstream does not report it; assuming 4 KB)" : "");
         if (VALUE_SIZE > BLOCK) { std::printf("VALUE_SIZE %d exceeds the block\n", VALUE_SIZE); return 1; }
@@ -330,14 +362,40 @@ int main(int argc, char** argv) {
         std::memcpy(&ref[size_t(k) * VALUE_SIZE], c.value, VALUE_SIZE);
         preload.push_back(c);
     }
-    uint32_t pre_err = 0;
+    uint32_t pre_err = 0; bool halt_shown = false;
+    Summary last_halt{}; std::string last_where;
+    auto note_halt = [&](const Summary& p, const std::string& where) {   // the first halted launch's record, and the last's
+        if (!(p.errors & 0x8) || TINY) return;
+        if (!halt_shown) { print_halt_record(where.c_str(), p.lat_min, p.lat_max); halt_shown = true; }
+        last_halt = p; last_where = where;
+    };
+    OnpkgStats all_st(true);                                               // every command's core record (debug bitstream)
+    unsigned dbg_wbh = 0, dbg_relh = 0;                                    // the bitstream's on-package budgets (debug records)
+    // the preload's commands are accesses like any other: their records count too (the card halted during the preload)
     for (size_t at = 0; at < preload.size(); at += max_cmds) {             // in batches that fit the buffers
         std::vector<Cmd> part(preload.begin() + at, preload.begin() + std::min(preload.size(), at + max_cmds));
         stage(b, part);
-        auto r1 = launch((uint32_t)part.size());
+        auto r1 = launch((uint32_t)part.size(), true);
         r1.wait();
-        pre_err |= read_summary(b, part.size()).errors;
+        Summary p = read_summary(b, part.size());
+        pre_err |= p.errors;
+        note_halt(p, "preload, launch at key " + std::to_string(at));
+        const size_t n = part.size();
+        if (PTRACE && TRACE64) {
+            const size_t TR = TRACE_B;
+            b.resp.sync(XCL_BO_SYNC_BO_FROM_DEVICE, n * TR, b.hr + n * BLOCK);
+            auto resp = b.resp.map<uint8_t*>();
+            all_st.launch++;
+            for (size_t i = 0; i < n; i++) { const uint8_t* rr = resp + b.hr + n * BLOCK + i * TR;
+                                             all_st.add(i, rr + 32, TR == 128 ? rr + 64 : nullptr); }
+        }
+        if (SUMREC == 5) {
+            const uint8_t* rec = b.resp.map<uint8_t*>() + (n + 2) * 32;
+            dbg_wbh = rd16(rec + 2); dbg_relh = rd16(rec + 4);
+            if (at + max_cmds >= preload.size()) print_debug_records("after the preload", rec);
+        }
     }
+    if (PTRACE && TRACE64) all_st.print("preload", dbg_wbh, dbg_relh);
     auto init_end = std::chrono::system_clock::now();
     std::printf("init: %.6f s (boot + preload of %u keys), preload errors=0x%x\n",
                 std::chrono::duration<double>(init_end - init_start).count(), NKEYS, pre_err);
@@ -370,6 +428,11 @@ int main(int argc, char** argv) {
         int bad = 0; size_t launches = 0; std::vector<uint32_t> lv; lv.reserve(ph.n);
         uint64_t pn = 0, plook = 0, pread = 0, pproc = 0, pwrite = 0, ptail = 0; size_t pzero = 0, pbad = 0;
         uint64_t tn = 0, te2e = 0, tph[12] = {0}, tovl = 0; size_t tbad = 0;     // phase-trace records
+        uint64_t wovl = 0; size_t wovl_n = 0;                                    // re-encryption past the write-back start
+        // the budget check: how long after the bucket's last beat re-encryption ends (trace slot 10 - slot 4), and when
+        // the write-back starts (slot 11 - slot 4, the fixed time AR_WB); a histogram for the tail, the maximum
+        std::vector<uint64_t> eh(65536, 0); uint32_t emax = 0, wmin = 0xffffffffu, wmax = 0; size_t en = 0;
+        OnpkgStats ph_st;                                                        // this phase's core records (debug bitstream)
         uint64_t ng = 0, np = 0, lg = 0, lp = 0;                                  // GET / PUT counts and latency sums
         for (size_t at = 0; at < ph.n; at += chunk) {
             const size_t n = std::min(chunk, ph.n - at);
@@ -385,7 +448,12 @@ int main(int argc, char** argv) {
             auto t1 = std::chrono::system_clock::now();
             t += std::chrono::duration<double>(t1 - t0).count(); launches++;
             Summary s = read_summary(b, n);
-            if (PTRACE) b.resp.sync(XCL_BO_SYNC_BO_FROM_DEVICE, n * 32, b.hr + n * BLOCK);   // the launch's trace records
+            const size_t TR = TRACE_B;                                                      // trace record size
+            if (PTRACE) b.resp.sync(XCL_BO_SYNC_BO_FROM_DEVICE, n * TR, b.hr + n * BLOCK);   // the launch's trace records
+            note_halt(s, ph.name + " phase, launch " + std::to_string(launches));
+            if (SUMREC == 5) { const uint8_t* rec = b.resp.map<uint8_t*>() + (n + 2) * 32; dbg_wbh = rd16(rec + 2); dbg_relh = rd16(rec + 4);
+                               if (s.errors || at + chunk >= ph.n) print_debug_records((ph.name + " phase").c_str(), rec); }
+            if (PTRACE && TRACE64) { all_st.launch++; ph_st.launch = all_st.launch; }
             cyc += s.total; errs |= s.errors; sok = sok && s.ok && s.done == n; traffic = traffic && s.traffic;
             rdb += s.rd_beats; wrb += s.wr_beats;
             auto resp = b.resp.map<uint8_t*>();
@@ -409,8 +477,22 @@ int main(int argc, char** argv) {
                     } else { pn++; plook += tar; pread += trl - tar; pproc += twf - trl; pwrite += twl - twf; ptail += l - twl; }
                 }
                 if (PTRACE) {   // 12 phases, as in host_ycsb.cpp (slot 9, the write-back gate state, is unused in arrival mode)
-                    uint16_t v[16]; std::memcpy(v, resp + b.hr + n * BLOCK + i * 32, 32);
-                    const uint32_t ch[12] = {v[0], v[1], v[2], v[4], v[6], v[7], v[8], v[10], v[11], v[12], v[14], l};
+                    uint16_t v[16]; std::memcpy(v, resp + b.hr + n * BLOCK + i * TR, 32);
+                    if (tcsv) { std::fprintf(tcsv, "%zu,%zu,%c,%u", pi + 1, at + i, cmds[i].type == T_PUT ? 'P' : 'G', l);
+                                for (int k = 0; k < 16; k++) std::fprintf(tcsv, ",%u", v[k]); std::fprintf(tcsv, "\n"); }
+                    if (TRACE64) { const uint8_t* rr = resp + b.hr + n * BLOCK + i * TR, *s2 = (TR == 128) ? rr + 64 : nullptr;
+                                   all_st.add(i, rr + 32, s2); ph_st.add(i, rr + 32, s2); }
+                    // Two AES lanes: re-encryption runs at the write-back's rate (32 B per cycle), so the write-back, issued at its
+                    // fixed time, may start before the last encrypted beat (slot 10 after slot 11). That is safe: the write
+                    // never catches up (it would halt, axim_wdata_stall). Count the overlap, and end re-encryption at the
+                    // write-back's start so the phases still add up to E2E.
+                    const uint32_t enc_end = (v[11] != 0 && v[10] > v[11]) ? v[11] : v[10];
+                    if (enc_end != v[10]) { wovl_n++; wovl += v[10] - v[11]; }
+                    if (v[4] != 0 && v[10] >= v[4] && v[11] >= v[4]) {
+                        const uint32_t e = v[10] - v[4], w = v[11] - v[4];
+                        eh[std::min<uint32_t>(e, 65535)]++; en++; emax = std::max(emax, e); wmin = std::min(wmin, w); wmax = std::max(wmax, w);
+                    }
+                    const uint32_t ch[12] = {v[0], v[1], v[2], v[4], v[6], v[7], v[8], enc_end, v[11], v[12], v[14], l};
                     bool tok = v[3] != 0 && v[5] != 0;
                     for (int k = 0; k < 11 && tok; k++) tok = ch[k] != 0 && ch[k] <= ch[k + 1];
                     if (!tok) { if (tbad++ < 3) { std::printf("%s phase, command %zu: trace record out of order:", ph.name.c_str(), at + i);
@@ -449,14 +531,26 @@ int main(int argc, char** argv) {
             std::printf("phase %zu: trace, mean cycles (sum = E2E):", pi + 1);
             for (int k = 0; k < 12; k++) std::printf("%s %s %.1f", k ? "," : "", PH[k], double(tph[k]) / tn);
             std::printf(" = E2E %.1f; decryption overlaps the bucket read by %.1f (%zu records)\n", double(te2e) / tn, double(tovl) / tn, tn);
+            if (wovl_n) std::printf("phase %zu: re-encryption ends after the write-back start in %zu records, by %.1f cycles on average (safe: the write never catches up)\n",
+                                    pi + 1, wovl_n, double(wovl) / wovl_n);
+            if (en) {
+                auto pct = [&](double q) { uint64_t c = 0, k = uint64_t(std::ceil(q * en)); for (uint32_t x = 0; x < 65536; x++) { c += eh[x]; if (c >= k) return x; } return 65535u; };
+                std::printf("phase %zu: re-encryption ends after the last beat by: p50 %u, p99 %u, p99.9 %u, p99.99 %u, max %u cycles; "
+                            "the write-back starts after it at %u..%u cycles (%zu records)\n",
+                            pi + 1, pct(0.5), pct(0.99), pct(0.999), pct(0.9999), emax, wmin, wmax, en);
+            }
         } else if (PTRACE) std::printf("phase %zu: no trace records (is this a TRACE=1 bitstream?)\n", pi + 1);
         if (tbad) std::printf("phase %zu: %zu trace records out of order\n", pi + 1, tbad);
+        if (PTRACE && TRACE64) ph_st.print((ph.name + " phase").c_str(), dbg_wbh, dbg_relh);
         if (traffic)
             std::printf("phase %zu: bucket port (pages, off-package) %.0f B read, %.0f B written per command\n",
                         pi + 1, 32.0 * rdb / ph.n, 32.0 * wrb / ph.n);
         std::printf("phase %zu: %s\n", pi + 1, ok ? "ALL RESPONSES CORRECT" : "ERRORS FOUND");
         all_ok = all_ok && ok;
     }
+    if (PTRACE && TRACE64) all_st.print("whole run (preload and every phase)", dbg_wbh, dbg_relh);
+    if (halt_shown && last_where.size()) print_halt_record(("last halted launch: " + last_where).c_str(), last_halt.lat_min, last_halt.lat_max);
     std::printf("%s\n", all_ok ? "ALL PHASES CORRECT" : "ERRORS FOUND");
+    if (tcsv) std::fclose(tcsv);
     return all_ok ? 0 : 1;
 }
